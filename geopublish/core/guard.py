@@ -33,6 +33,9 @@
 
 成稿侧（T-14）必须按这个约定写；`facts.json` 里的 `source` 就是填进标记的内容。
 
+标题、摘要、标签里的数字**不查**出处（它们不成句，塞引用毫无意义），但绝对化用语
+和营销句式照查 —— 那几个位置同样印在页面上，是仅次于标题的合规风险位。
+
 ## 为什么词表在 JSON 里而不是配置里
 
 PRD §9.1 定了：R4 规则不进配置层，不给人「临时放宽」的口子。所以词表跟着代码走、
@@ -91,6 +94,7 @@ _ALLOWED_WORDS_KEYS = {"version", "absolute", "marketing"}
 # 元信息命中没有正文位置，用 -1 明确表示「不在正文里」，别假装在第 0 个字
 NO_OFFSET = -1
 _EXCERPT_LIMIT = 80
+_TERM_LIMIT = 24
 
 # ---------------------------------------------------------------- 文本切分
 # 句末标点与换行都算分隔；分隔符归前一句，于是切片是无缝平铺的，
@@ -383,6 +387,22 @@ def _check_numbers(masked: str, segs: _Segments, body_start: int) -> tuple[Hit, 
     return tuple(hits)
 
 
+def _meta_lines(meta: Meta) -> tuple[str, ...]:
+    """标题 + 摘要 + 标签：都是要印在平台页面上的文字，扫词时一起纳入。"""
+    lines: list[str] = []
+    for value in (meta.title, meta.summary, *meta.tags):
+        text = str(value).strip()
+        if text:  # 空摘要、空标签不占一行，也不该产生空命中
+            lines.append(text)
+    return tuple(lines)
+
+
+def _clip(text: str, limit: int = _TERM_LIMIT) -> str:
+    """命中项要能印进日报：太长的截断，别把一整条 100 字的标题塞进去。"""
+    flat = " ".join(text.split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
 def _check_platform_limits(meta: Meta, platform: PlatformConfig) -> tuple[Hit, ...]:
     hits: list[Hit] = []
 
@@ -392,7 +412,7 @@ def _check_platform_limits(meta: Meta, platform: PlatformConfig) -> tuple[Hit, .
             Hit(
                 check="platform_limits",
                 rule="title_max",
-                term=title,
+                term=_clip(title),
                 excerpt=f"标题 {len(title)} 字，平台上限 {platform.title_max} 字",
                 offset=NO_OFFSET,
             )
@@ -458,12 +478,13 @@ def self_check(
     这里**故意不提供** `skip` / `allow` / `**kwargs`：PRD §9.5 把「跳过自检」列为红线。
     """
     wordlist = words if words is not None else load_banned_words()
-    # 标题也是发布出去的文字，绝对化用语/营销句式要一起查（R4 说的是整篇稿件）。
-    # 但标题行不参与数字出处检查，见 _check_numbers 的说明。
-    scan_text = f"{draft.meta.title}\n{draft.body}"
+    # 发布出去的不只正文：标题、摘要、标签都在页面上。绝对化用语/营销句式
+    # 对这些一律查（R4 说的是整篇稿件）；数字出处只查正文，见 _check_numbers。
+    meta_text = "\n".join(_meta_lines(draft.meta))
+    scan_text = f"{meta_text}\n{draft.body}"
     masked = _mask(scan_text)
     segs = _Segments(masked, scan_text)
-    body_start = len(draft.meta.title) + 1
+    body_start = len(meta_text) + 1
 
     body_hits = {
         "absolute": _scan_terms(scan_text, segs, wordlist.absolute, "absolute"),

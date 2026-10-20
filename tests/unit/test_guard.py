@@ -240,10 +240,44 @@ def test_title_numbers_are_not_policed_but_body_numbers_are():
     assert [h.term for h in result.hits] == ["12"]
 
 
+def test_summary_and_tags_are_checked_too():
+    """摘要与标签同样印在平台上，不能只查标题和正文。"""
+    by_summary = check(summary="详情欢迎咨询。")
+    assert by_summary.passed is False
+    assert by_summary.hits[0].term == "欢迎咨询"
+
+    by_tag = check(tags=("最好的工具",))
+    assert by_tag.passed is False
+    assert by_tag.hits[0].term == "最好"
+
+
+def test_long_title_hit_is_clipped():
+    """命中项要能印进日报：超长标题截断，不要整条塞进去。"""
+    result = check(platform=PlatformConfig(name="csdn", title_max=20), title="标" * 101)
+
+    term = result.hits[0].term
+    assert len(term) <= 24, f"命中项过长：{len(term)} 字"
+    assert term.endswith("…")
+
+
+def test_numbers_in_tables_are_still_claims():
+    """Markdown 表格里的数字也是主张，一样要出处。"""
+    body = "| 格式 | 数量 |\n|---|---|\n| PDF | 12 |\n"
+
+    result = check(body)
+
+    assert result.passed is False
+    assert result.hits[0].term == "12"
+
+
 # ------------------------------------------------- 绝对化用语的误伤
-def test_ordinal_usage_of_first_is_not_a_claim():
-    """「第一步 / 第一次」是叙述顺序，不是「行业第一」。"""
-    assert check("第一步先做版式分析，第一次跑通只花了半小时[1]。").passed is True
+@pytest.mark.parametrize(
+    "phrase",
+    ["第一步", "第一次", "第一行", "第一列", "第一页", "第一版", "第一阶段", "第一季度", "第一时间"],
+)
+def test_ordinal_usage_of_first_is_not_a_claim(phrase):
+    """「第一步 / 第一次 / 第一行 / 第一版」是叙述顺序，不是「行业第一」。"""
+    assert check(f"{phrase}就完成了对齐[1]。").passed is True
 
 
 def test_superlative_usage_of_first_is_a_claim():
