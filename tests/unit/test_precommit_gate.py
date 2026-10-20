@@ -131,3 +131,20 @@ def test_run_gates_tolerates_missing_layer(tmp_path):
 
     assert result.returncode == 0
     assert "0 个文件" in result.stdout
+
+
+@pytest.mark.unit
+def test_real_repo_actually_scans_the_adapters_layer():
+    """T-05 之后 adapters 层已存在，门禁必须真扫到文件。
+
+    这条挡的是反向事故：路径被重构/改名后，门禁会安静地退化成「0 个文件」，
+    日志全绿而红线根本没执行。
+    """
+    result = _run_gates(REPO_ROOT)
+
+    assert result.returncode == 0, result.stdout
+    line = next(
+        item for item in result.stdout.splitlines() if item.startswith("[no-naked-selectors]")
+    )
+    assert "→ 0 个文件" not in line, f"选择器门禁没扫到 adapters：{line}"
+    assert "csdn" not in line  # 报的是文件数，别把目录展开成噪音

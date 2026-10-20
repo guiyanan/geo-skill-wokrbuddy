@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>写文章 - CSDN 创作者中心</title>
+</head>
+<body class="mp-editor-page">
+  <!-- 已登录标志：右上角头像。选择器 auth.avatar -->
+  <header class="marketing-nav">
+    <div class="marketing-nav__user">
+      <a class="user-avatar" href="//i.csdn.net/user/personal">
+        <img src="//profile-avatar.csdnimg.cn/placeholder.jpg" alt="拾一米">
+      </a>
+    </div>
+  </header>
+
+  <div class="editor">
+    <div class="article-bar">
+      <!-- 标题：一个输入框。选择器 editor.title -->
+      <input id="article-title" class="article-bar__title"
+             placeholder="请输入文章标题（100 字以内）" maxlength="100" value="">
+    </div>
+
+    <!-- 正文：CodeMirror 容器（结构照抄 6.x 版编辑器）。选择器 editor.content -->
+    <div class="editor__inner">
+      <div class="CodeMirror CodeMirror-wrap cm-s-default">
+        <div class="CodeMirror-scroll">
+          <div class="CodeMirror-sizer">
+            <div class="CodeMirror-code" role="presentation">
+              <pre class=" CodeMirror-line" role="presentation"><span role="presentation"
+                    contenteditable="true" style="padding-right: 0.1px;"></span></pre>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="editor__bottom">
+      <button class="btn btn-publish" type="button">发布文章</button>
+      <button class="btn btn-save-draft" type="button">存草稿</button>
+    </div>
+
+    <div class="editor__panel">
+      <div class="panel-item">
+        <label class="panel-item__label" for="category">分类专栏</label>
+        <select id="category" class="panel-item__select">
+          <option value="0">请选择专栏</option>
+          <option value="123">技术分享</option>
+        </select>
+      </div>
+
+      <div class="panel-item">
+        <label class="panel-item__label" for="tag-input">添加标签</label>
+        <div class="tag-area">
+          <input id="tag-input" class="tag-input" placeholder="最多添加 5 个标签">
+        </div>
+      </div>
+
+      <div class="panel-item">
+        <label class="panel-item__label" for="summary">摘要</label>
+        <textarea id="summary" class="panel-item__textarea" maxlength="100"
+                  placeholder="可选，100 字以内"></textarea>
+      </div>
+
+      <div class="panel-item">
+        <label class="checkbox">
+          <input type="checkbox" id="original-declaration"> 原创声明
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" id="ai-declaration"> AI 辅助生成
+        </label>
+      </div>
+
+      <div class="panel-item">
+        <input type="file" id="cover-upload" class="cover-upload" accept="image/*">
+        <img class="cover-thumbnail" alt="" src="">
+      </div>
+    </div>
+  </div>
+</body>
+</html>
