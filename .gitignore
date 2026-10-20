@@ -30,3 +30,7 @@ htmlcov/
 
 # 本机真实配置（含收件邮箱等），只提交 example
 config/geopublish.json
+
+# 构建产物（pip wheel / setuptools 生成）
+build/
+dist/
