@@ -132,6 +132,7 @@ geo-publish/
 | # | 工单 | 需求 | 依赖 | 阶段 |
 |---|---|---|---|---|
 | T-01 | 骨架 + 测试框架 + 配置 | — | — | P0 |
+| T-01b | 配置加载 + CLI（补 T-01 遗留） | — | T-01 | P0 |
 | T-02 | 数据模型与幂等状态机 | R9 | T-01 | P0 |
 | T-03 | 自检引擎（纯逻辑） | R4 | T-01 | P0 |
 | T-04 | 现场包与快照存档 | — | T-01 | P0 |
@@ -158,7 +159,8 @@ geo-publish/
 
 **P0 · 打通**
 ```
-- [ ] T-01  骨架 + 测试框架 + 配置        ← 仍有遗留：cli.py / config.py
+- [x] T-01  骨架 + 测试框架 + 配置        ← 配置/CLI 由 T-01b 补齐
+- [x] T-01b 配置加载 + CLI
 - [x] T-02  数据模型与幂等状态机
 - [ ] T-03  自检引擎（纯逻辑）
 - [ ] T-04  现场包与快照存档
@@ -222,6 +224,48 @@ geo-publish/
 
 ---
 
+### T-01b 配置加载 + CLI（补 T-01 遗留）
+
+**为什么单独开一张**：T-01 当时只落了骨架、测试分层和 CI，`cli.py` 与 `core/config.py`
+没落地，UT-01-01/02 无从执行、T-01 的 DoD 也不满足。补齐动作独立成单，回滚边界清楚。
+
+**交付**：`core/config.py`、`cli.py`、`__main__.py`、`config/geopublish.example.json`
+
+**配置边界**（按 PRD §9.1 的 L1/L3 划分）
+| 进配置 | 不进配置（写死代码） |
+|---|---|
+| 闸门模式 `gate`、平台白名单与启停、`daily_limit`、错峰 `publish_at`、字数/标题/标签上限、`retry_max`、`refresh_days`、`data_dir`、日报 `report.email` | R4 自检规则、R13 风控 —— 不设「跳过」开关 |
+
+**校验规则**
+| 字段 | 规则 | 理由 |
+|---|---|---|
+| 缺失项 | `gate` / `platforms` / `report.email` 一次报全 | 别让人改三轮才过 |
+| 未知键 | 报错并列出键名（`_` 开头视为注释） | 拼错 `gates` / `daily_limits` 静默忽略最坑 |
+| `daily_limit` | ≥ 1 | R14 阈值不能是 0 或负数 |
+| `retry_max` | 0 ≤ x ≤ 2 | 架构 §3.6 的全局硬上限，配置只能往小改 |
+| `publish_at` | `HH:MM` | R16 错峰排期 |
+| `word_min/word_max` | 1 ≤ min < max | R3 字数区间 |
+| `refresh_days` | ≥ 1 | R17 翻新周期 |
+| `report.email` | 含本地部分与域名、无空格 | R18 日报收件人 |
+
+**单元测试**：UT-01-01（缺字段带名字、缺多项一次报全、未知顶层键/平台键）、
+UT-01-02（daily_limit 0/-1/-100、retry_max -1/3、gate 非法、平台重复、字数反序、
+时间格式、title_max/tags_max、空 data_dir）、UT-01-03（clock，见 `test_clock.py`）、
+CLI 冒烟（`--version`、`python -m geopublish`、`check-config` 正常/非法/缺文件/不抛 traceback）、
+示例配置自身合法。
+
+**DoD**：`pytest -m unit` 全绿；`geopublish --version` 与 `python -m geopublish --version` 均可执行；
+`core/config.py` 与 `cli.py` 语句+分支覆盖 100%
+
+**交付记录（2026-10-20 完成）**：132 条 unit+contract 全绿，全包语句+分支 **100%**；
+`geopublish check-config config/geopublish.example.json` 实测输出摘要。
+退出码约定：`0` 成功 / `1` 用法错误 / `2` 需重新授权 / `3` 配置错误 —— 后续 publish 复用。
+
+**已知失败模式**：配置文件只在第一次发布时才报错（没有 `check-config` 这层）→
+定时任务每天早上静默失败。所以 CLI 里留了这个入口，建议挂进 cron 前置步骤。
+
+---
+
 ### T-02 数据模型与幂等状态机
 
 **交付**：`core/models.py`（Draft/Meta/Receipt/LogEntry）、`core/state.py`
@@ -259,8 +303,8 @@ pending → submitting → published
 | 日志 | 追加一行 = 一次 write(整行)+fsync；字段缺失/多余/状态非法 → `IncompleteLogEntry`，文件零字节变化 |
 | 顺带修 | 红线门禁 `solve_` → `\bsolve_`（裸子串误伤 `resolve_*`，见 `tests/unit/test_precommit_gate.py`） |
 
-**T-01 遗留（未勾选，需补课）**：`geopublish/cli.py`（`--version`）与 `core/config.py` 当时未落地，
-UT-01-01/02 无从执行。T-02 只补了 clock，T-01 的 DoD（`geopublish --version` 可执行）目前仍不满足。
+**T-01 遗留（已由 T-01b 收掉，2026-10-20）**：`cli.py` 与 `core/config.py` 当时未落地，
+T-02 只补了 clock；T-01b 补齐后 UT-01-01/02 可执行，`geopublish --version` 实测可用。
 
 **门禁现状（需决策）**：`.pre-commit-config.yaml` 写了但本机没装 `pre-commit`，CI 也只跑 pytest、
 不跑两个静态门禁 —— 也就是说「禁裸选择器」和「禁验证码代码」这两条红线**目前处于无人执行状态**。
