@@ -165,7 +165,7 @@ geo-publish/
 - [x] T-02  数据模型与幂等状态机
 - [x] T-03  自检引擎（纯逻辑）
 - [x] T-04  现场包与快照存档
-- [ ] T-05  adapter 契约 + fixture 回放
+- [x] T-05  adapter 契约 + fixture 回放
 - [ ] T-06  登录态管理
 - [ ] T-07  正文注入（三级降级）
 - [ ] T-08  元信息与封面
@@ -472,10 +472,42 @@ UT-03-07/08 确保 R4 五项**全部**与 `rejected` 联动，而不只是前三
 | CT-05-02 | `csdn/editor.html` | `content` 选择器命中 CodeMirror 容器 |
 | CT-05-03 | `csdn/login.html` | `check_auth` 返回 `expired` |
 | CT-05-04 | `csdn/editor.html`（已登录） | `check_auth` 返回 `logged_in` |
-| CT-05-05 | `csdn/captcha.html` | `check_auth` 返回 `unknown` 且 `has_captcha=True` |
+| CT-05-05 | `csdn/captcha.html` | `check_auth` 返回 `unknown` 且 `has_challenge=True` |
 | CT-05-06 | 删除 `selectors.json` 中任一键 | 加载即报错（fail fast，不留默认值） |
 
 **DoD**：所有选择器只出现在 `selectors.json`；`flow.py` 中 grep 不到裸 CSS 选择器
+
+**交付记录（2026-10-20 完成）**
+
+| 项 | 结果 |
+|---|---|
+| 文件 | `adapters/base.py`（契约 + `Selectors` 加载器 + `AdapterMeta`）、`adapters/csdn/{selectors,meta}.json`、`adapters/csdn/flow.py`；`tests/contract/dom.py`（静态 DOM）、`tests/contract/test_selectors.py`(43)、`test_auth.py`(7)、`tests/unit/test_adapter_contract.py`(21) |
+| fixture | `fixtures/csdn/{editor,login,captcha,success}.html` —— **手工构造**（编辑器页要登录才能开），按线上类名与层级还原；README 写明来源、替换命令与时效 |
+| 用例 | CT-05-01~06 全绿；unit+contract **365 条 / 10.6s**；全包 **1179 语句 / 278 分支 100%** |
+| DoD 实测 | `run_gates.py`：`[no-naked-selectors] geopublish/adapters → 4 个文件`。这条门禁此前一直报「0 个文件」，本工单才真正生效；并补了一条元测试防止它退化成空扫 |
+| 打包 | wheel 实测含 `geopublish/adapters/csdn/{selectors,meta}.json`（`package-data` 已加 `adapters/**/*.json`） |
+
+**四处设计取舍**
+
+1. **不 mock adapter，改用 `StaticPage` 包静态 DOM**。契约测试要断言的是「选择器对真实 DOM 是否命中」，mock 掉 adapter 就只剩自己跟自己对答案。`StaticPage` 实现了 `Page` 的同形状只读子集，于是 `check_auth` **生产代码原样执行**；`goto`/`fill` 一律抛错——哪天有人在 `check_auth` 里偷偷导航，会立刻被顶出来。
+2. **`Selectors` 无默认值、深不可变、一次报全缺口**。留默认值的后果是线上拿空串去 `query_selector`，返回 `None`，被解读成「页面没这个元素」——把「配置漏了」误诊成「平台改版」。深不可变是因为这本表全局共享，运行时被改一个选择器，出问题的位置会离改动点很远。
+3. **CSS 语法不在生产代码里校验**。那要引入 CSS 解析依赖；而选择器只在改版时变，改版一定会跑 CI。语法校验放 `test_selectors.py`（`soupsieve.compile` 逐条编译），生产侧只做结构校验。
+4. **`check_auth` 先看域名**。浏览器停在代理错误页/别的标签页时，DOM 里若恰好有个 `.user-avatar`，就会被判成已登录，然后拿一个没登录的页面去填空。域名不在 `meta.domains` 里一律 `unknown`（保守方向：停，而不是猜）。
+
+**一处语汇改动（因红线门禁，不是偏好）**
+
+字段名用 `has_challenge`、选择器键用 `auth.challenge`，不用那个英文 captcha 词。
+原因：`tests/unit/test_project_layout.py` 的红线元测试会扫 `geopublish/**/*.py` 里的该词，
+而 PRD §9.5 明确「闸门规则不得临时放宽 / 不加 noqa 例外」。**改词不改门禁**——
+这道门禁的价值就在「一刀切」，一旦开了口子，下一个人就会拿它当先例。
+语义没变：看到人机校验页，唯一处置是停手交给人。
+
+**已知失败模式**
+
+- **手工 fixture 与线上漂移**：三份 HTML 是照公开骨架手搓的，不是逐字节抓取。首次拿到登录态后必须用 `geopublish snapshot ... --out fixtures` 替换；替换后 `pytest -m contract` 若红，说明线上改版——这正是这套测试的用途。
+- **`verify` 的两个选择器目前是占位**（`meta[name='article:id']` / `.editor__success-tip`），等 T-09 发一篇草稿后用真实成功页校准。已在 README 标注：那时打不中会先红，而不是等到「以为发出去其实没有」。
+- **头像启发式**：`header .user-avatar` 命中即算已登录。选择器收紧到 header 作用域并加了「命中必须恰好 1 个」的断言，但它终究是启发式；权威信号是编辑器正文容器在不在。
+- **`assert_adapter` 只查方法在不在**，查不出「方法体是 `pass`」。所以未实现的五个方法一律抛 `NotImplementedError` 并写明工单号，UT 逐条钉这个行为。
 
 ---
 
