@@ -306,9 +306,11 @@ pending → submitting → published
 **T-01 遗留（已由 T-01b 收掉，2026-10-20）**：`cli.py` 与 `core/config.py` 当时未落地，
 T-02 只补了 clock；T-01b 补齐后 UT-01-01/02 可执行，`geopublish --version` 实测可用。
 
-**门禁现状（需决策）**：`.pre-commit-config.yaml` 写了但本机没装 `pre-commit`，CI 也只跑 pytest、
-不跑两个静态门禁 —— 也就是说「禁裸选择器」和「禁验证码代码」这两条红线**目前处于无人执行状态**。
-建议把两个脚本挂进 CI 的 unit job（几十毫秒），别只靠本机钩子。
+**门禁现状（已解决，2026-10-20）**：原缺口是两条红线只在未安装的 `pre-commit` 里、CI 不跑。
+现改为统一入口 `.precommit/run_gates.py`（打印每个门禁的文件数，空目录显式 notice，不假绿）：
+- CI：`unit` job 里排在 `pytest -m unit` **之前**（<1s，红得越早越省事）
+- 本地：`.pre-commit-config.yaml` 的两个细碎 hook 合并为一个 `static-gates`，指向同一脚本
+- 门禁本身也有测试：CI 顺序、captcha 违规红、裸选择器违规红、空目录通过但报 0 个文件
 
 ---
 
