@@ -40,6 +40,11 @@ jobs:
             echo "has_integration=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # 红线门禁：禁验证码处理代码、禁裸选择器。便宜（<1s）且拦的是不可逆后果，
+      # 排在单元测试前面 —— 红得越早越省事。
+      - name: Static gates (red lines)
+        run: python .precommit/run_gates.py
+
       - name: Unit tests
         run: pytest -m unit
 

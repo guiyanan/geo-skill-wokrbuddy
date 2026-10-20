@@ -1,5 +1,9 @@
 # 本地提交前门禁：保证推上去的 commit 一定是绿的
 # 安装： pip install pre-commit && pre-commit install
+#
+# 注意：CI（.github/workflows/test.yml）跑的是同一个 .precommit/run_gates.py。
+# 别在这里各写一份 find/glob —— 两边一旦漂移，就会出现「本地过、CI 挂」，
+# 更糟的是 CI 一直在检查空目录：日志全绿，红线其实没执行。
 
 repos:
   - repo: local
@@ -11,16 +15,9 @@ repos:
         pass_filenames: false
         stages: [pre-commit]
 
-      - id: no-naked-selectors
-        name: no bare CSS selectors outside selectors.json
-        entry: python .precommit/check_no_naked_selectors.py
+      - id: static-gates
+        name: static gates (no captcha code / no naked selectors)
+        entry: python .precommit/run_gates.py
         language: system
-        pass_filenames: true
-        files: ^geopublish/adapters/.*\.py$
-
-      - id: no-captcha-code
-        name: no captcha handling code (red line)
-        entry: python .precommit/check_no_captcha_code.py
-        language: system
-        pass_filenames: true
-        files: ^geopublish/.*\.py$
+        pass_filenames: false
+        stages: [pre-commit]
