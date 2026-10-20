@@ -5,7 +5,7 @@
 """
 
 import json
-import time
+from datetime import time
 from pathlib import Path
 
 import pytest
@@ -157,7 +157,7 @@ def test_load_config_reads_json(tmp_path):
     path = tmp_path / "geopublish.json"
     path.write_text(json.dumps(payload()), encoding="utf-8")
 
-    assert load_config(path).platform("csdn").name == "CSDN"
+    assert load_config(path).platform("csdn").name == "csdn"
 
 
 def test_load_config_missing_file(tmp_path):
@@ -192,3 +192,80 @@ def test_platform_config_is_frozen():
 
     with pytest.raises(Exception):
         cfg.platforms[0].daily_limit = 9  # type: ignore[misc]
+
+
+# ------------------------------------------------- 直接构造时的守门（绕过 JSON 的路径）
+def test_direct_construction_validates_gate():
+    with pytest.raises(ConfigError) as exc:
+        Config(gate="draft", platforms=(PlatformConfig(name="csdn"),), report_email="a@b.c")
+
+    assert "gate" in str(exc.value)
+
+
+def test_direct_construction_rejects_string_publish_at():
+    with pytest.raises(ConfigError) as exc:
+        PlatformConfig(name="csdn", publish_at="10:00")  # type: ignore[arg-type]
+
+    assert "publish_at" in str(exc.value)
+
+
+def test_direct_construction_rejects_non_bool_enabled():
+    with pytest.raises(ConfigError) as exc:
+        PlatformConfig(name="csdn", enabled="yes")  # type: ignore[arg-type]
+
+    assert "enabled" in str(exc.value)
+
+
+def test_from_dict_accepts_time_object():
+    cfg = PlatformConfig.from_dict({"name": "csdn", "publish_at": time(9, 30)}, "p")
+
+    assert cfg.publish_at == time(9, 30)
+
+
+def test_from_dict_requires_platform_name():
+    with pytest.raises(ConfigError) as exc:
+        PlatformConfig.from_dict({"daily_limit": 1}, "platforms[0]")
+
+    assert "name" in str(exc.value)
+
+
+def test_non_integer_retry_max_is_rejected():
+    with pytest.raises(ConfigError) as exc:
+        Config.from_dict(payload(retry_max="2"))
+
+    assert "整数" in str(exc.value)
+
+
+def test_root_must_be_object():
+    with pytest.raises(ConfigError) as exc:
+        Config.from_dict(["gate"])  # type: ignore[arg-type]
+
+    assert "对象" in str(exc.value)
+
+
+def test_report_must_be_object():
+    with pytest.raises(ConfigError) as exc:
+        Config.from_dict(payload(report="shiyimi@joto.example"))
+
+    assert "report" in str(exc.value)
+
+
+def test_platforms_must_be_array():
+    with pytest.raises(ConfigError) as exc:
+        Config.from_dict(payload(platforms="csdn"))
+
+    assert "platforms" in str(exc.value)
+
+
+def test_platform_item_must_be_object():
+    with pytest.raises(ConfigError) as exc:
+        Config.from_dict(payload(platforms=["csdn"]))
+
+    assert "platforms[0]" in str(exc.value)
+
+
+def test_comment_keys_are_ignored():
+    """JSON 写不了注释，约定 _ 开头的键跳过校验。"""
+    cfg = Config.from_dict(payload(_comment="给人看的说明"))
+
+    assert cfg.platform("csdn")

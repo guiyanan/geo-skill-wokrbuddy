@@ -9,6 +9,9 @@ description = "GEO 内容自动分发引擎"
 requires-python = ">=3.11"
 dependencies = []
 
+[project.scripts]
+geopublish = "geopublish.cli:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
@@ -29,3 +32,8 @@ markers = [
     "integration: 真浏览器 + 本地假站点，分钟级",
     "e2e: 真平台真账号，仅里程碑验收手动触发",
 ]
+
+[tool.coverage.run]
+branch = true
+# __main__.py 只由 test_cli 的子进程用例执行，进程内覆盖率抓不到它
+omit = ["geopublish/__main__.py"]

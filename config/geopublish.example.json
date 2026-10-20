@@ -1,0 +1,22 @@
+{
+  "_comment": "复制为 config/geopublish.json 后按需修改；改完跑 geopublish check-config 验证",
+  "gate": "draft",
+  "platforms": [
+    {
+      "name": "csdn",
+      "enabled": true,
+      "daily_limit": 1,
+      "publish_at": "10:00",
+      "word_min": 3000,
+      "word_max": 5000,
+      "title_max": 100,
+      "tags_max": 5
+    }
+  ],
+  "report": {
+    "email": "you@example.com"
+  },
+  "data_dir": "data",
+  "retry_max": 2,
+  "refresh_days": 30
+}

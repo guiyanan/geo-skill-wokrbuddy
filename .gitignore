@@ -26,3 +26,6 @@ venv/
 .pytest_tmp/
 .coverage
 htmlcov/
+
+# 本机真实配置（含收件邮箱等），只提交 example
+config/geopublish.json
