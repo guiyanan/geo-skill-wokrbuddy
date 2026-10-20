@@ -23,6 +23,10 @@ dev = [
 [tool.setuptools.packages.find]
 include = ["geopublish*"]
 
+# R4 自检词表是运行时数据，不是源码；不打包进去，装完就找不到文件
+[tool.setuptools.package-data]
+geopublish = ["references/*.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --strict-markers"

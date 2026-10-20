@@ -54,6 +54,8 @@ class Status(str, Enum):
     PUBLISHED = "published"
     FAILED = "failed"
     NEEDS_HUMAN = "needs_human"
+    # T-03 增补（PRD R4）：自检未过的稿子停在这儿，不进发布队列
+    REJECTED = "rejected"
 
     def __str__(self) -> str:  # 日志和报错里直接看到 pending，而不是 Status.PENDING
         return self.value
@@ -64,12 +66,17 @@ class Status(str, Enum):
 
 
 ALLOWED_TRANSITIONS: dict[Status, frozenset[Status]] = {
-    Status.PENDING: frozenset({Status.SUBMITTING, Status.FAILED, Status.NEEDS_HUMAN}),
+    Status.PENDING: frozenset(
+        {Status.SUBMITTING, Status.FAILED, Status.NEEDS_HUMAN, Status.REJECTED}
+    ),
     Status.SUBMITTING: frozenset({Status.PUBLISHED, Status.FAILED, Status.NEEDS_HUMAN}),
     # failed 可以重试（次数由 T-11 控制），也可以直接转人工
     Status.FAILED: frozenset({Status.SUBMITTING, Status.PENDING, Status.NEEDS_HUMAN}),
     # 人工处理完把稿子放回队列，只能回到起点，不能跳到 published
     Status.NEEDS_HUMAN: frozenset({Status.PENDING}),
+    # rejected（R4 自检未过）改稿后回队列，且必须重新自检 —— PRD：改过没重新自检不得发布。
+    # 因此这里只开一个出口：回 pending，不许直接跳 submitting/published。
+    Status.REJECTED: frozenset({Status.PENDING}),
     Status.PUBLISHED: frozenset(),
 }
 

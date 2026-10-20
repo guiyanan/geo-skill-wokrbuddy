@@ -25,11 +25,13 @@ pytestmark = pytest.mark.unit
 CSDN_URL = "https://blog.csdn.net/joto_ai/article/details/145012345"
 
 # 规格白名单：pending→submitting→published / failed / needs_human
+# T-03 增补 rejected（PRD R4：自检未过即拒，改稿后只能回 pending 重走自检）
 EXPECTED_TRANSITIONS = {
-    Status.PENDING: {Status.SUBMITTING, Status.FAILED, Status.NEEDS_HUMAN},
+    Status.PENDING: {Status.SUBMITTING, Status.FAILED, Status.NEEDS_HUMAN, Status.REJECTED},
     Status.SUBMITTING: {Status.PUBLISHED, Status.FAILED, Status.NEEDS_HUMAN},
     Status.FAILED: {Status.PENDING, Status.SUBMITTING, Status.NEEDS_HUMAN},
     Status.NEEDS_HUMAN: {Status.PENDING},
+    Status.REJECTED: {Status.PENDING},
     Status.PUBLISHED: set(),
 }
 
@@ -158,8 +160,22 @@ def test_needs_human_never_jumps_straight_to_published():
 # ------------------------------------------------- 状态机辅助面（覆盖补齐）
 def test_only_published_is_terminal():
     assert Status.PUBLISHED.is_terminal
-    for status in (Status.PENDING, Status.SUBMITTING, Status.FAILED, Status.NEEDS_HUMAN):
+    for status in (
+        Status.PENDING,
+        Status.SUBMITTING,
+        Status.FAILED,
+        Status.NEEDS_HUMAN,
+        Status.REJECTED,
+    ):
         assert not status.is_terminal, f"{status} 不应是终态"
+
+
+def test_rejected_cannot_jump_back_into_the_queue():
+    """改稿后可回 pending，但不许一步跳到 submitting / published（绕过重检）。"""
+    assert transition(Status.REJECTED, Status.PENDING) is Status.PENDING
+    for target in (Status.SUBMITTING, Status.PUBLISHED, Status.FAILED, Status.NEEDS_HUMAN):
+        with pytest.raises(IllegalTransition):
+            transition(Status.REJECTED, target)
 
 
 def test_status_str_is_the_log_value():
