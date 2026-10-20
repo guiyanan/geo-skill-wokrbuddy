@@ -71,10 +71,11 @@ data/incidents/<ts>_<ticket>_<stage>/
 
 ```bash
 # 1. 只跑这一个现场，得到确定性失败
-pytest --replay data/incidents/20261021_100312_T-07_inject/
+./data/incidents/20261021_100312_T-07_inject/repro.sh      # 退 4 = 已复现
+#   （等价于 `geopublish incident replay <dir>`；`pytest --replay` 是 T-12 的插件参数）
 
 # 2. 确认稳定复现（连跑 5 次，5 次全红才算复现成功）
-pytest --replay data/incidents/xxx/ --repeat 5
+for i in 1 2 3 4 5; do ./data/incidents/xxx/repro.sh; done
 
 # 3. 修完再跑，转绿后固化为永久回归用例
 pytest --promote data/incidents/xxx/ -> tests/regression/test_T07_xxx.py
@@ -163,7 +164,7 @@ geo-publish/
 - [x] T-01b 配置加载 + CLI
 - [x] T-02  数据模型与幂等状态机
 - [x] T-03  自检引擎（纯逻辑）
-- [ ] T-04  现场包与快照存档
+- [x] T-04  现场包与快照存档
 - [ ] T-05  adapter 契约 + fixture 回放
 - [ ] T-06  登录态管理
 - [ ] T-07  正文注入（三级降级）
@@ -415,6 +416,45 @@ UT-03-07/08 确保 R4 五项**全部**与 `rejected` 联动，而不只是前三
 | UT-04-04 | 目录名含 ticket 号与失败阶段，便于检索 |
 
 **DoD**：手动制造一次失败，产出包能被 `--replay` 加载
+
+**交付记录（2026-10-20 完成）**
+
+| 项 | 结果 |
+|---|---|
+| 文件 | `core/incident.py`、`core/snapshot.py`、`core/fs.py`（原子落盘，两者共用）；`cli.py` 新增 `snapshot` / `incident replay`；`tests/unit/test_incident.py`（33 条）、`test_snapshot.py`（24 条）、`test_cli.py` 补 7 条、`tests/integration/test_t04_flow.py`（2 条） |
+| 用例 | UT-04-01~04 全绿；unit+contract 合计 **293 条，6.7s**；integration 2 条 2.6s |
+| 覆盖率 | `incident.py` 165 语句 / 46 分支、`snapshot.py` 88 / 16、`fs.py` 20 / 4 —— 全包 991 语句 / 238 分支 **100%**（语句 + 分支） |
+| 七件套 | `bundle.json` / `page.html` / `screenshot.png` / `network.har` / `console.log` / `input.json` / `repro.sh`，顺序即 `bundle.json` 里的 `files` 字段，改顺序 = 改格式（有用例钉住） |
+| 目录名 | `<YYYYmmdd_HHMMSS>_<ticket>_<stage>`，如 `20261021_100012_T-07_inject`；同一秒同一阶段冲突时加 `_2` 后缀，绝不覆盖 |
+| DoD 实测 | 真 chromium 抓本地页 → 造 `InjectFailed` → 打包 → 跑 `repro.sh` → **退出码 4**、stderr 含 `T-07 / inject`，即 `tests/integration/test_t04_flow.py::test_real_failure_bundle_replays_with_exit_4` |
+| 退出码 | 新增 `4 = 现场已复现`（预期结果）、`5 = 环境不可用`；`0/1/2/3` 含义不变 |
+
+**四处设计取舍**
+
+1. **脱敏在构造期完成，不是写出时**。`Incident.payload` / `error` 在 `__post_init__` 里就被洗过，之后无论谁拿去写文件、打日志、发日报都拿不到原文。写在「写出时」迟早会有人加第二条出口（飞书通知、邮件）然后忘了洗。
+2. **缺件即失败，且不留半成品**。`fs.staged_dir()` 先在同级临时目录里写全、校验通过再 `rename`；失败则整个临时目录删掉。半个现场包比没有更糟——`--replay` 能加载它，但复现出来的是另一个失败。唯一允许为空的是 `console.log`：页面没打日志是正常情况，为此拒收整个包等于把真正的失败也丢了。
+3. **`repro.sh` 自己判环境**。脚本先跑 `geopublish --version` 探活，失败就退 **5** 并说「geopublish 不可用」。这条是纪律的支点：**复现不出来就不许改代码**，如果「环境坏了」也表现为「没复现」，这条纪律就退化成看谁嘴硬。
+4. **`snapshot` 的浏览器入口可注入**（`Driver` Protocol）。单测用假 driver（毫秒级、无浏览器），真 chromium 只在 integration 里验一次接线；`PlaywrightDriver` 的完整流程（含 HAR 必须在 `context.close()` 之后才落盘这个坑）用假 playwright 对象走了一遍。
+
+**与方案的偏差（须知）**
+
+- §2.2 写的复现命令是 `pytest --replay <dir>`，那需要 T-12 的 pytest 插件。当前 `repro.sh` 调的是等价的 `geopublish incident replay <dir>`（退出码 4），**`--replay` 的插件参数留给 T-12**，届时只换脚本里那一行，包的格式不变。
+- `snapshot` 默认写到 `data/snapshots/`（已进 `.gitignore`）；要入库的 fixture 用 `--out fixtures` 显式指定，避免手滑把运行时产物提交上去。
+
+**已知失败模式**
+
+- **手机号形状的数字会误伤**：`样本 13812345678 条` 会被当成手机号盖掉中间四位。判定只看形状（`1[3-9]` 开头 11 位）——宁可多盖一个统计数字，也不漏一个真实号码。
+- **`payload` 里放 `Path` / `datetime` 是常态**，`json.dumps` 会直接 TypeError。所以 `scrub()` 顺带做类型转换（`Path→str`、`datetime→isoformat`、`bytes→<N bytes>`、不认识的对象 `str()` 兜底），转换后再过脱敏——**在出事的路径上再抛一个异常，等于把唯一能用的证据弄丢**。
+- **目录名里的中文保留**（`工单7_注入` 而不是 `unknown`），但截断到 64 字：`ENAMETOOLONG` 是真的会炸的。
+- **`repro.sh` 内嵌了生成时的解释器与仓库路径**，跨机器跑要先设 `GEOPUBLISH_PY`；不设就退 5 提示，不会假装复现失败。
+
+**验收补记（写完后的对抗性探测，修了三处）**
+
+| # | 问题 | 处置 |
+|---|---|---|
+| 1 | payload 里放 `Path`/`datetime` → 打包抛 `TypeError`（真实失败钩子一定会传这两种） | `scrub()` 构造期转成字符串/ISO，二进制只留长度 |
+| 2 | `out_dir` 是文件时抛 `PermissionError: EEXIST`，把原因指错了 | 显式判 `不是目录`，`incident` 与 `snapshot` 各一条用例 |
+| 3 | 500 字 ticket 撞 `ENAMETOOLONG` | 目录段截断到 64 字，同时保留可读前缀 |
 
 ---
 
