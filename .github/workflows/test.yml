@@ -14,6 +14,8 @@ jobs:
   unit:
     name: unit + contract
     runs-on: ubuntu-latest
+    outputs:
+      has_integration: ${{ steps.detect.outputs.has_integration }}
     steps:
       - uses: actions/checkout@v4
 
@@ -27,16 +29,36 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      # 判断集成测试是否已存在，决定 integration job 是否运行
+      - name: Detect test layers
+        id: detect
+        run: |
+          n=$(find tests/integration -name 'test_*.py' 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$n" -gt 0 ]; then
+            echo "has_integration=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_integration=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Unit tests
         run: pytest -m unit
 
+      # 空集合时 pytest 返回 5（no tests collected），属正常状态而非失败。
+      # 仅在「确实没有测试文件」时容忍；有文件却收集不到 → 仍然红。
       - name: Contract tests (DOM fixtures, no network)
-        run: pytest -m contract
+        run: |
+          n=$(find tests/contract -name 'test_*.py' 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$n" -eq 0 ]; then
+            echo "::notice::tests/contract 暂无测试（T-05 前属正常状态）"
+            exit 0
+          fi
+          pytest -m contract
 
   integration:
     name: integration (real browser, fake site)
     runs-on: ubuntu-latest
     needs: unit
+    if: ${{ needs.unit.outputs.has_integration == 'true' }}
     steps:
       - uses: actions/checkout@v4
 
