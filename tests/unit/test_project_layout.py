@@ -50,6 +50,23 @@ def test_required_dirs_exist():
 
 
 @pytest.mark.unit
+def test_ci_tolerates_empty_test_layer():
+    """回归：pytest 在无匹配用例时返回 5，CI 必须区分「无文件」与「收集失败」。
+
+    事故记录：run #1 中 unit 绿、contract 红——因为 T-05 前 tests/contract
+    尚无可收集用例，exit 5 被 CI 当成失败。
+    修复要求：不能无条件忽略退出码，必须先用 find 判断是否存在 test_*.py。
+    """
+    import re
+
+    wf = (REPO_ROOT / ".github/workflows/test.yml").read_text(encoding="utf-8")
+    assert "find tests/contract" in wf, "CI 缺少 contract 空集合检测"
+    assert re.search(r'if \[ "\$n" -eq 0 \]', wf), \
+        "必须显式判断「无测试文件」，不能无条件 exit 0"
+    assert "find tests/integration" in wf, "CI 缺少 integration 存在性检测"
+
+
+@pytest.mark.unit
 def test_secrets_not_committed():
     """凭据目录必须在 .gitignore 中，且不得存在被追踪的凭据文件。"""
     gi = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
