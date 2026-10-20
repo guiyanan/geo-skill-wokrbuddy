@@ -158,8 +158,8 @@ geo-publish/
 
 **P0 · 打通**
 ```
-- [ ] T-01  骨架 + 测试框架 + 配置
-- [ ] T-02  数据模型与幂等状态机
+- [ ] T-01  骨架 + 测试框架 + 配置        ← 仍有遗留：cli.py / config.py
+- [x] T-02  数据模型与幂等状态机
 - [ ] T-03  自检引擎（纯逻辑）
 - [ ] T-04  现场包与快照存档
 - [ ] T-05  adapter 契约 + fixture 回放
@@ -247,6 +247,24 @@ pending → submitting → published
 **DoD**：状态机 100% 分支覆盖；UT-02-04 是防重复发文的关键，必须绿
 
 **已知失败模式**：忘记在提交前落盘 `submitting` → 崩溃后重发一篇。UT-02-04 就是钉这个的。
+
+**交付记录（2026-10-20 完成）**
+| 项 | 结果 |
+|---|---|
+| 文件 | `core/state.py`、`core/models.py`、`core/clock.py`（补 T-01 遗留）、`tests/unit/test_state_machine.py`、`test_models.py`、`test_clock.py` |
+| 用例 | UT-02-01~06 全绿；unit+contract 合计 91 条，全套 1.6s |
+| 覆盖率 | `state.py` 89 语句 / 16 分支，`models.py` 141 语句 / 34 分支 —— 语句+分支 **100%** |
+| 状态机白名单 | pending→{submitting,failed,needs_human}；submitting→{published,failed,needs_human}；failed→{submitting,pending,needs_human}；needs_human→{pending}；published→∅；同态视为幂等空操作 |
+| 幂等键 | `sha256(platform\|account\|slug\|content_sha)`，字段先 strip+lower，分隔符用 `\x1f` 防拼接歧义 |
+| 日志 | 追加一行 = 一次 write(整行)+fsync；字段缺失/多余/状态非法 → `IncompleteLogEntry`，文件零字节变化 |
+| 顺带修 | 红线门禁 `solve_` → `\bsolve_`（裸子串误伤 `resolve_*`，见 `tests/unit/test_precommit_gate.py`） |
+
+**T-01 遗留（未勾选，需补课）**：`geopublish/cli.py`（`--version`）与 `core/config.py` 当时未落地，
+UT-01-01/02 无从执行。T-02 只补了 clock，T-01 的 DoD（`geopublish --version` 可执行）目前仍不满足。
+
+**门禁现状（需决策）**：`.pre-commit-config.yaml` 写了但本机没装 `pre-commit`，CI 也只跑 pytest、
+不跑两个静态门禁 —— 也就是说「禁裸选择器」和「禁验证码代码」这两条红线**目前处于无人执行状态**。
+建议把两个脚本挂进 CI 的 unit job（几十毫秒），别只靠本机钩子。
 
 ---
 
