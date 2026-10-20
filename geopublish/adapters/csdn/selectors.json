@@ -1,0 +1,30 @@
+{
+  "version": "2026-10-21.1",
+  "auth": {
+    "login_form": "#loginForm, .login-box form",
+    "challenge": "#captchaImg, img.captcha-img",
+    "avatar": "header .user-avatar, .marketing-nav .user-avatar"
+  },
+  "editor": {
+    "title": "#article-title",
+    "content": ".editor__inner .CodeMirror",
+    "content_editable": ".CodeMirror-code [contenteditable='true']",
+    "publish_button": ".editor__bottom .btn-publish",
+    "save_draft_button": ".editor__bottom .btn-save-draft"
+  },
+  "meta": {
+    "category": "#category",
+    "tags": "#tag-input",
+    "summary": "#summary",
+    "original_declaration": "#original-declaration",
+    "ai_declaration": "#ai-declaration"
+  },
+  "cover": {
+    "upload_input": "#cover-upload",
+    "thumbnail": ".cover-thumbnail"
+  },
+  "verify": {
+    "article_id": "meta[name='article:id']",
+    "success_marker": ".editor__success-tip"
+  }
+}

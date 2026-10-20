@@ -1,0 +1,12 @@
+{
+  "name": "csdn",
+  "display_name": "CSDN",
+  "domains": [
+    "mp.csdn.net",
+    "blog.csdn.net",
+    "editor.csdn.net",
+    "passport.csdn.net"
+  ],
+  "editor_url": "https://mp.csdn.net/mp_blog/creation/editor",
+  "_note": "字数/标题/标签上限只在 config/geopublish.json（PlatformConfig）里，这里不许再写一份：两处都写就是两份真相，改了一处忘了另一处，guard 拦的和平台实际限制会对不上。"
+}
