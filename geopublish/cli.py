@@ -6,6 +6,10 @@
 
 退出码约定（后续 publish 复用）：
   0 成功 / 1 用法错误 / 2 需重新授权 / 3 配置错误
+
+「1 用法错误」包括**没给子命令**：cron 里跑 `geopublish` 忘写子命令如果退 0，
+监控会当成「今天跑过了」，第二天才发现一篇都没发。argparse 默认对解析失败退 2，
+这里统一映射到 1（`_ArgumentParser.error`），子解析器也走同一个类，不漏。
 """
 
 from __future__ import annotations
@@ -24,8 +28,22 @@ EXIT_AUTH = 2
 EXIT_CONFIG_ERROR = 3
 
 
+class _ArgumentParser(argparse.ArgumentParser):
+    """把 argparse 默认的「解析失败退出 2」归到约定里的 EXIT_USAGE（1）。
+
+    退出码是给 cron 和 CI 看的：它们只判断「0 还是非 0」，所以只要非 0 都算拦住了。
+    但对人来说 1 和 2 得有稳定含义，否则写监控规则时要翻代码。子解析器也必须继承
+    同一个行为（`add_subparsers(parser_class=...)`），不然子命令拼错会漏回 2。
+    """
+
+    def error(self, message: str) -> None:  # type: ignore[override]
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: 用法错误：{message}", file=sys.stderr)
+        raise SystemExit(EXIT_USAGE)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _ArgumentParser(
         prog="geopublish",
         description="GEO 内容自动分发引擎",
     )
@@ -34,7 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="version",
         version=f"geopublish {__version__}",
     )
-    sub = parser.add_subparsers(dest="command")
+    sub = parser.add_subparsers(dest="command", parser_class=_ArgumentParser)
     check = sub.add_parser("check-config", help="校验配置文件并打印摘要")
     check.add_argument(
         "path",
@@ -52,8 +70,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "check-config":
         return _check_config(Path(args.path))
 
-    parser.print_help()
-    return EXIT_OK
+    # 没给子命令不是「打印帮助然后成功」，是用法错了。
+    # 退 0 会让 cron 以为今天跑过了 —— 静默成功比报错危险得多。
+    parser.print_help(sys.stderr)
+    return EXIT_USAGE
 
 
 def _check_config(path: Path) -> int:

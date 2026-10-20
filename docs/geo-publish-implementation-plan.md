@@ -264,6 +264,24 @@ CLI 冒烟（`--version`、`python -m geopublish`、`check-config` 正常/非法
 **已知失败模式**：配置文件只在第一次发布时才报错（没有 `check-config` 这层）→
 定时任务每天早上静默失败。所以 CLI 里留了这个入口，建议挂进 cron 前置步骤。
 
+**退出码补记（2026-10-20 晚，T-03 验收时发现）**：原实现里 `geopublish` 不带子命令
+会打印 help 后**退出 0**，与上面约定的「1 用法错误」不符 —— 而且当时的用例
+（`test_no_args_shows_help`）把 `== EXIT_OK` 断言住了，等于把错的锁成了对的。
+现改为：无子命令 / 未知开关 / 未知子命令 / 子命令参数错误 → **1**，且走 stderr；
+`--version` 与 `--help` 仍为 0（那是求救不是犯错），配置错误仍为 3。
+argparse 默认退 2，已通过 `_ArgumentParser.error` + `add_subparsers(parser_class=...)`
+统一到 1，子解析器不漏。
+
+实测退出码矩阵（`python -m geopublish <args>`，子进程真跑）：
+
+| 调用 | 退出码 |
+|---|---|
+| 无参数 | 1 |
+| `--version` / `--help` | 0 |
+| `check-config <合法>` | 0 |
+| `check-config <缺文件/非法>` | 3 |
+| `check-config --nope` / `publish` / `--nope` | 1 |
+
 ---
 
 ### T-02 数据模型与幂等状态机
