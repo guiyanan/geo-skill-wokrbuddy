@@ -16,7 +16,7 @@ from geopublish.core.state import (
     IllegalTransition,
     Status,
     idem_key,
-    resolve_interrupted,
+    recover_status,
     transition,
 )
 
@@ -106,7 +106,7 @@ def test_ut_02_03_published_is_terminal():
 @pytest.mark.parametrize("url", ["", "   ", None])
 def test_ut_02_04_submitting_without_url_goes_needs_human(url):
     """崩溃恢复：submitting 且没拿到 URL → 必须交人工，绝不回 pending 重发。"""
-    recovered = resolve_interrupted(Status.SUBMITTING, url=url)
+    recovered = recover_status(Status.SUBMITTING, url=url)
 
     assert recovered is Status.NEEDS_HUMAN
     assert recovered is not Status.PENDING
@@ -114,16 +114,16 @@ def test_ut_02_04_submitting_without_url_goes_needs_human(url):
 
 # ---------------------------------------------------------------- UT-02-05
 def test_ut_02_05_submitting_with_url_is_published():
-    assert resolve_interrupted(Status.SUBMITTING, url=CSDN_URL) is Status.PUBLISHED
+    assert recover_status(Status.SUBMITTING, url=CSDN_URL) is Status.PUBLISHED
 
 
 @pytest.mark.parametrize("status", [Status.PENDING, Status.FAILED, Status.NEEDS_HUMAN])
-def test_resolve_interrupted_leaves_other_states_untouched(status):
-    assert resolve_interrupted(status, url="") is status
+def test_recover_status_leaves_other_states_untouched(status):
+    assert recover_status(status, url="") is status
 
 
-def test_resolve_interrupted_keeps_published_published():
-    assert resolve_interrupted(Status.PUBLISHED, url=CSDN_URL) is Status.PUBLISHED
+def test_recover_status_keeps_published_published():
+    assert recover_status(Status.PUBLISHED, url=CSDN_URL) is Status.PUBLISHED
 
 
 # ------------------------------------------------- 状态机全矩阵（100% 分支）
@@ -153,3 +153,66 @@ def test_transition_accepts_str_status():
 def test_needs_human_never_jumps_straight_to_published():
     with pytest.raises(IllegalTransition):
         transition(Status.NEEDS_HUMAN, Status.PUBLISHED)
+
+
+# ------------------------------------------------- 状态机辅助面（覆盖补齐）
+def test_only_published_is_terminal():
+    assert Status.PUBLISHED.is_terminal
+    for status in (Status.PENDING, Status.SUBMITTING, Status.FAILED, Status.NEEDS_HUMAN):
+        assert not status.is_terminal, f"{status} 不应是终态"
+
+
+def test_status_str_is_the_log_value():
+    """日志里落的是 pending 这种裸值，不是 Status.PENDING。"""
+    assert str(Status.NEEDS_HUMAN) == "needs_human"
+    assert Status("submitting") is Status.SUBMITTING
+
+
+def test_missing_log_reads_as_empty(tmp_path):
+    from geopublish.core.state import PublishLog
+
+    log = PublishLog(tmp_path / "nope" / "publish-log.csv")
+
+    assert log.entries() == []
+    assert log.last_status("a" * 64) is None
+
+
+def test_status_history_in_order(tmp_path):
+    """状态轨迹要能读出来：submitting 有没有落盘，是排障第一现场。"""
+    from geopublish.core.state import PublishLog
+
+    log = PublishLog(tmp_path / "publish-log.csv")
+    log.append(make_entry(status=Status.PENDING))
+    log.append(make_entry(status=Status.SUBMITTING))
+    log.append(make_entry(status=Status.PUBLISHED))
+
+    assert list(log.statuses("a" * 64)) == [
+        Status.PENDING,
+        Status.SUBMITTING,
+        Status.PUBLISHED,
+    ]
+
+
+def test_append_row_accepts_plain_dict(tmp_path):
+    """编排层直接给 dict 也要能写（内部先校验再落盘）。"""
+    from geopublish.core.state import PublishLog
+
+    log = PublishLog(tmp_path / "publish-log.csv")
+    log.append_row(make_entry(status=Status.SUBMITTING).to_row())
+
+    assert log.entries()[0].status is Status.SUBMITTING
+
+
+def make_entry(*, status: Status):
+    from datetime import datetime, timezone
+
+    from geopublish.core.models import LogEntry
+
+    return LogEntry(
+        ts=datetime(2026, 10, 21, 10, 0, tzinfo=timezone.utc),
+        platform="csdn",
+        account="joto_ai",
+        slug="deepparser-table-extraction",
+        idem_key="a" * 64,
+        status=status,
+    )

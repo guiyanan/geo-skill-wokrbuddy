@@ -251,3 +251,97 @@ def test_log_append_is_readable_by_other_process(tmp_path):
 
     assert "submitting" in path.read_text(encoding="utf-8")
     assert PublishLog(path).entries()[0].status is Status.SUBMITTING
+
+
+# ------------------------------------------------- 拒绝路径（时间与时区）
+def test_log_entry_requires_aware_datetime():
+    """不带时区的时间会让跨时区排序出错，直接拒绝。"""
+    from datetime import datetime as dt
+
+    with pytest.raises(ValueError) as exc:
+        make_entry(ts=dt(2026, 10, 21, 10, 0))
+
+    assert "时区" in str(exc.value)
+
+
+def test_log_entry_rejects_non_datetime_ts():
+    with pytest.raises(ValueError) as exc:
+        make_entry(ts="2026-10-21T10:00:00+08:00")
+
+    assert "datetime" in str(exc.value)
+
+
+def test_log_entry_rejects_naive_indexed_at():
+    from datetime import datetime as dt
+
+    with pytest.raises(ValueError):
+        make_entry(status=Status.PUBLISHED, indexed_at=dt(2026, 10, 22, 9, 0))
+
+
+def test_log_entry_rejects_unknown_status_value():
+    with pytest.raises(IncompleteLogEntry) as exc:
+        make_entry(status="pubished")
+
+    assert "status" in str(exc.value)
+
+
+def test_from_row_rejects_blank_ts():
+    row = make_entry().to_row()
+    row["ts"] = "  "
+
+    with pytest.raises(IncompleteLogEntry) as exc:
+        LogEntry.from_row(row)
+
+    assert "ts" in str(exc.value)
+
+
+def test_from_row_rejects_unknown_status():
+    row = make_entry().to_row()
+    row["status"] = "done"
+
+    with pytest.raises(IncompleteLogEntry) as exc:
+        LogEntry.from_row(row)
+
+    assert "done" in str(exc.value)
+
+
+def test_meta_from_json_requires_slug_and_title():
+    with pytest.raises(ValueError) as exc:
+        Meta.from_json({"slug": "a-b"})
+
+    assert "title" in str(exc.value)
+
+
+def test_meta_from_json_accepts_minimal_payload():
+    meta = Meta.from_json({"slug": "a-b", "title": "标题"})
+
+    assert meta.tags == ()
+    assert meta.platforms == ("csdn",)
+
+
+def test_receipt_rejects_naive_indexed_at():
+    from datetime import datetime as dt
+
+    with pytest.raises(ValueError):
+        Receipt(
+            url="https://blog.csdn.net/joto_ai/article/details/145012345",
+            article_id="145012345",
+            published_at=TS,
+            screenshot="runs/20261021/after.png",
+            content_sha="b" * 64,
+            indexed_at=dt(2026, 10, 22, 9, 0),
+        )
+
+
+def test_receipt_only_exists_for_published():
+    with pytest.raises(ValueError) as exc:
+        Receipt(
+            url="https://blog.csdn.net/joto_ai/article/details/145012345",
+            article_id="145012345",
+            published_at=TS,
+            screenshot="runs/20261021/after.png",
+            content_sha="b" * 64,
+            status=Status.NEEDS_HUMAN,
+        )
+
+    assert "published" in str(exc.value)
