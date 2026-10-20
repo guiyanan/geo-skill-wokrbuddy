@@ -10,9 +10,11 @@ PRD R13 规定遇验证码只停不绕。本检查在 git 提交时拦截违规�
 import re
 import sys
 
-# 拆词拼接，避免本文件自匹配
+# 拆词拼接，避免本文件自匹配。
+# 注意 solve_ 必须带词边界：裸子串会把 resolve_xxx / absolve_xxx 一起误伤
+# （T-02 提交时 recover_status 的前身就因为 re|solve_ 被拦下）。
 _TOKENS = ["captcha", "geetest", "yidun", "slider", "slide_", "verify_code",
-           "verifycode", "bypass", "crack", "solve_", "anti_bot", "antibot",
+           "verifycode", "bypass", "crack", r"\bsolve_", "anti_bot", "antibot",
            "yolo", "ddddocr", "muggle_ocr"]
 
 _BANNED = re.compile("|".join(_TOKENS), re.IGNORECASE)
