@@ -1,0 +1,26 @@
+# 本地提交前门禁：保证推上去的 commit 一定是绿的
+# 安装： pip install pre-commit && pre-commit install
+
+repos:
+  - repo: local
+    hooks:
+      - id: pytest-unit-contract
+        name: pytest unit + contract (fast gate)
+        entry: pytest -m "unit or contract"
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: no-naked-selectors
+        name: no bare CSS selectors outside selectors.json
+        entry: python .precommit/check_no_naked_selectors.py
+        language: system
+        pass_filenames: true
+        files: ^geopublish/adapters/.*\.py$
+
+      - id: no-captcha-code
+        name: no captcha handling code (red line)
+        entry: python .precommit/check_no_captcha_code.py
+        language: system
+        pass_filenames: true
+        files: ^geopublish/.*\.py$

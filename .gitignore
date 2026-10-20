@@ -1,0 +1,25 @@
+# WorkBuddy 项目数据（非源码，不入库）
+.workbuddy/
+
+# 凭据与登录态 —— 绝不入库
+.geo-publish/
+*.profile/
+**/profiles/
+data/secrets/
+
+# 运行产物
+data/runs/
+data/incidents/
+data/reports/
+data/publish-log.csv
+
+# 产品库原始资料（可能含未公开信息）
+data/products/*/raw/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/

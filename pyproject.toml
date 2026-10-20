@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geopublish"
+version = "0.1.0"
+description = "GEO 内容自动分发引擎"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-repeat>=0.9",
+    "playwright>=1.44",
+]
+
+[tool.setuptools.packages.find]
+include = ["geopublish*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "unit: 纯函数逻辑，无浏览器无网络，秒级",
+    "contract: 对 DOM 快照断言选择器可命中，无浏览器无网络",
+    "integration: 真浏览器 + 本地假站点，分钟级",
+    "e2e: 真平台真账号，仅里程碑验收手动触发",
+]
