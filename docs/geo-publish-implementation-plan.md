@@ -162,7 +162,7 @@ geo-publish/
 - [x] T-01  骨架 + 测试框架 + 配置        ← 配置/CLI 由 T-01b 补齐
 - [x] T-01b 配置加载 + CLI
 - [x] T-02  数据模型与幂等状态机
-- [ ] T-03  自检引擎（纯逻辑）
+- [x] T-03  自检引擎（纯逻辑）
 - [ ] T-04  现场包与快照存档
 - [ ] T-05  adapter 契约 + fixture 回放
 - [ ] T-06  登录态管理
@@ -298,7 +298,7 @@ pending → submitting → published
 | 文件 | `core/state.py`、`core/models.py`、`core/clock.py`（补 T-01 遗留）、`tests/unit/test_state_machine.py`、`test_models.py`、`test_clock.py` |
 | 用例 | UT-02-01~06 全绿；unit+contract 合计 91 条，全套 1.6s |
 | 覆盖率 | `state.py` 89 语句 / 16 分支，`models.py` 141 语句 / 34 分支 —— 语句+分支 **100%** |
-| 状态机白名单 | pending→{submitting,failed,needs_human}；submitting→{published,failed,needs_human}；failed→{submitting,pending,needs_human}；needs_human→{pending}；published→∅；同态视为幂等空操作 |
+| 状态机白名单 | pending→{submitting,failed,needs_human}；submitting→{published,failed,needs_human}；failed→{submitting,pending,needs_human}；needs_human→{pending}；published→∅；同态视为幂等空操作（T-03 追加 rejected，见该工单交付记录） |
 | 幂等键 | `sha256(platform\|account\|slug\|content_sha)`，字段先 strip+lower，分隔符用 `\x1f` 防拼接歧义 |
 | 日志 | 追加一行 = 一次 write(整行)+fsync；字段缺失/多余/状态非法 → `IncompleteLogEntry`，文件零字节变化 |
 | 顺带修 | 红线门禁 `solve_` → `\bsolve_`（裸子串误伤 `resolve_*`，见 `tests/unit/test_precommit_gate.py`） |
@@ -339,6 +339,30 @@ T-02 只补了 clock；T-01b 补齐后 UT-01-01/02 可执行，`geopublish --ver
 
 **DoD**：任何一条不满足即拒；**不存在 `skip` 参数**（PRD §9.5 红线）；
 UT-03-07/08 确保 R4 五项**全部**与 `rejected` 联动，而不只是前三项
+
+**交付记录（2026-10-20 完成）**
+
+| 项 | 结果 |
+|---|---|
+| 文件 | `core/guard.py`、`references/banned-words.json`、`tests/unit/test_guard.py`；`state.py` 增补 `Status.REJECTED`；`pyproject.toml` 补 package-data（词表是运行时数据，不打包就会装完找不到） |
+| 用例 | UT-03-01~08 全绿，`test_guard.py` 共 58 条；unit+contract 合计 **213 条，3.0s** |
+| 覆盖率 | `guard.py` 206 语句 / 52 分支 —— 语句+分支 **100%**（全包 656 语句 / 164 分支同样 100%） |
+| 检查项 | `non_empty`（前置）+ R4 五项 = 6 个 check，顺序固定，`selfcheck.json` 按此顺序落盘 |
+| 状态联动 | 过 → `pending`（可入队）；不过 → `rejected`。`REJECTED` 只开一个出口：→ `pending`（改稿重走自检），不许直接跳 `submitting` / `published` |
+| 无开关 | `self_check` 签名被元测试钉死：不许出现 skip/force/allow/ignore/bypass 类参数，也不许 `**kwargs` 偷传 |
+| 词表 | 24 条绝对化用语 + 12 条营销句式，外置 JSON；PRD R4 点名的 9 + 5 个词在 `test_default_wordlist_is_loadable_and_covers_prd_terms` 里逐字核对 |
+
+**三条设计取舍（都记了理由，不是随手决定）**
+
+1. **标题也在检查范围内**。R4 说的是「整篇稿件」，而标题是最显眼的合规风险位（「最好的…」）。实现上把 `标题 + \n + 正文` 拼成一个坐标空间扫词，命中偏移仍是一条数轴。
+2. **数字主张按「同句」判定出处**。四种写法都认：`[1]` / `（来源：…）` / `[来源：…]` / `【出处：…】`。引用写在下一句不算——否则一句「数据来自报告」就能给全文免责。代价是一句话里多个数字共用一条出处，这是有意的（一句一个 claim 是成稿侧的事）。
+3. **标题里的数字不查出处**。100 字标题塞引用既不美观也不现实，那属于 T-14 的写作约束；闸门只拦正文。这一点写进了 `_check_numbers` 的 docstring，避免以后被当成 bug 改回去。
+
+**已知失败模式**
+
+- **中文绝对化用语误伤**：「第一次 / 第一步 / 第一阶段」不是「行业第一」。词表支持 `{label, pattern}` 对象条目，`第一` 用负向前查排除序数用法；UT 里有正反两个用例（`test_ordinal_usage_of_first_is_not_a_claim` / `test_superlative_usage_of_first_is_a_claim`）钉住。剩下 `最高 / 最大` 这类与规格描述冲突的词（「最高支持 100 页」）**故意没收进词表**，理由写在 JSON 的 `_comment` 里。
+- **掩码漏了就会误报**：代码块、行内代码、URL、小标题/列表序号里的数字都不是「数字类主张」。掩码是等长替换（保留换行），所以掩码前后的偏移量一致，摘录不会错位。
+- **词表是合规口径**，改它等于改红线 → 跟代码走、进评审，不做运行时开关（PRD §9.5）。
 
 ---
 
