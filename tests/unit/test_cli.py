@@ -12,7 +12,14 @@ from pathlib import Path
 import pytest
 
 import geopublish
-from geopublish.cli import EXIT_CONFIG_ERROR, EXIT_OK, EXIT_USAGE, main
+from geopublish.cli import (
+    EXIT_CONFIG_ERROR,
+    EXIT_ENV,
+    EXIT_OK,
+    EXIT_REPRODUCED,
+    EXIT_USAGE,
+    main,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -135,3 +142,123 @@ def test_check_config_missing_file(tmp_path, capsys):
 def test_check_config_never_raises(config_file):
     """CLI 的错误一律转成退出码，别把 traceback 丢给定时任务。"""
     assert main(["check-config", str(config_file(platforms=[]))]) == EXIT_CONFIG_ERROR
+
+
+# ------------------------------------------------- T-04：snapshot / incident
+
+from geopublish.core.clock import FakeClock  # noqa: E402
+from geopublish.core.incident import Capture, Incident, archive  # noqa: E402
+
+
+class _StubDriver:
+    name = "stub"
+
+    def fetch(self, url):
+        return Capture(page_html="<html><body>ok</body></html>", screenshot=b"\x89PNG ok",
+                       network_har="{}", console_log="")
+
+
+def _bundle(tmp_path):
+    incident = Incident(
+        ticket="T-07", stage="inject", adapter="csdn",
+        adapter_version="0.1.0", selectors_version="2026-10-21.1",
+        prd_refs=("R12",), error="InjectFailed: 三级注入全失败",
+        payload={"slug": "x-y"},
+        capture=Capture(page_html="<html></html>", screenshot=b"\x89PNG", network_har="{}",
+                        console_log=""),
+    )
+    return archive(incident, tmp_path / "incidents", clock=FakeClock("2026-10-21T10:00:00+08:00"))
+
+
+def test_snapshot_command_writes_fixture(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("geopublish.cli.PlaywrightDriver", _StubDriver)
+    out = tmp_path / "shots"
+
+    code = main(["snapshot", "https://mp.csdn.net/edit", "csdn/editor", "--out", str(out)])
+
+    assert code == EXIT_OK
+    assert (out / "csdn" / "editor" / "page.html").exists()
+    assert "csdn/editor" in capsys.readouterr().out
+
+
+def test_snapshot_bad_name_is_a_usage_error(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("geopublish.cli.PlaywrightDriver", _StubDriver)
+
+    code = main(["snapshot", "https://x.test/", "../etc/passwd", "--out", str(tmp_path)])
+
+    assert code == EXIT_USAGE
+    assert "name" in capsys.readouterr().err
+
+
+def test_snapshot_missing_driver_exits_5(tmp_path, monkeypatch, capsys):
+    """缺浏览器依赖不是「用法错」，cron 要能据此报「环境没装好」。"""
+
+    class _Boom:
+        name = "boom"
+
+        def fetch(self, url):
+            from geopublish.core.snapshot import DriverUnavailable
+
+            raise DriverUnavailable("没装: pip install playwright")
+
+    monkeypatch.setattr("geopublish.cli.PlaywrightDriver", _Boom)
+
+    code = main(["snapshot", "https://x.test/", "csdn/editor", "--out", str(tmp_path)])
+
+    assert code == EXIT_ENV
+    assert "pip install playwright" in capsys.readouterr().err
+
+
+def test_incident_replay_command_exits_4(tmp_path, capsys):
+    """repro.sh 调的就是这条；退出码 4 = 现场已复现（预期失败）。"""
+    path = _bundle(tmp_path)
+
+    code = main(["incident", "replay", str(path)])
+
+    captured = capsys.readouterr()
+    assert code == EXIT_REPRODUCED
+    assert "T-07" in captured.err and "inject" in captured.err
+
+
+def test_incident_replay_missing_bundle_is_a_usage_error(tmp_path, capsys):
+    code = main(["incident", "replay", str(tmp_path / "nope")])
+
+    assert code == EXIT_USAGE
+    assert "现场包" in capsys.readouterr().err
+
+
+def test_snapshot_empty_page_is_an_env_error(tmp_path, monkeypatch, capsys):
+    """页面抓回来是空的（登录墙/跳转失败）：环境问题，不是用法错。"""
+
+    class _Blank:
+        name = "blank"
+
+        def fetch(self, url):
+            return Capture(page_html="", screenshot=b"\x89PNG", network_har="{}")
+
+    monkeypatch.setattr("geopublish.cli.PlaywrightDriver", _Blank)
+
+    code = main(["snapshot", "https://x.test/", "csdn/editor", "--out", str(tmp_path)])
+
+    assert code == EXIT_ENV
+    assert "空" in capsys.readouterr().err
+
+
+def test_snapshot_bad_url_is_a_usage_error(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("geopublish.cli.PlaywrightDriver", _StubDriver)
+
+    code = main(["snapshot", "ftp://x.test/a", "csdn/editor", "--out", str(tmp_path)])
+
+    assert code == EXIT_USAGE
+    assert "http" in capsys.readouterr().err
+
+
+def test_incident_replay_broken_bundle_is_an_env_error(tmp_path, capsys):
+    """包在但坏了：不能报「复现成功」(4)，否则 repro.sh 会假装拿到了证据。"""
+    path = _bundle(tmp_path)
+    (path / "bundle.json").write_text("{ 坏掉了", encoding="utf-8")
+
+    code = main(["incident", "replay", str(path)])
+
+    assert code == EXIT_ENV
+    assert "bundle.json" in capsys.readouterr().err
