@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 import geopublish
-from geopublish.cli import EXIT_CONFIG_ERROR, EXIT_OK, main
+from geopublish.cli import EXIT_CONFIG_ERROR, EXIT_OK, EXIT_USAGE, main
 
 pytestmark = pytest.mark.unit
 
@@ -56,9 +56,55 @@ def test_version_runs_as_module():
     assert geopublish.__version__ in result.stdout
 
 
-def test_no_args_shows_help(capsys):
-    assert main([]) == EXIT_OK
-    assert "check-config" in capsys.readouterr().out
+def test_no_args_is_a_usage_error(capsys):
+    """无子命令 = 用法错误，退出码必须是 1。
+
+    cron 里跑 `geopublish`（忘了写子命令）如果退 0，监控系统会当成「今天跑成功了」，
+    第二天才发现一篇都没发 —— 静默成功比直接报错危险得多。
+    """
+    assert main([]) == EXIT_USAGE
+    assert "check-config" in capsys.readouterr().err, "用法错误走 stderr，别污染 stdout"
+
+
+def test_unknown_flag_is_a_usage_error():
+    """argparse 默认是退出 2，这里统一到约定的 1。"""
+    with pytest.raises(SystemExit) as exc:
+        main(["--nope"])
+
+    assert exc.value.code == EXIT_USAGE
+
+
+def test_unknown_subcommand_is_a_usage_error():
+    """子命令拼错也要是 1（子解析器必须继承同一个 error 行为）。"""
+    with pytest.raises(SystemExit) as exc:
+        main(["publish"])
+
+    assert exc.value.code == EXIT_USAGE
+
+
+def test_no_args_exit_code_is_visible_to_the_shell():
+    """真正跑一遍 `python -m geopublish`：退出码要能被 shell 看到。"""
+    result = subprocess.run(
+        [sys.executable, "-m", "geopublish"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == EXIT_USAGE
+
+
+def test_help_still_exits_zero():
+    """`--help` 是求救不是犯错，别一起打成 1。"""
+    with pytest.raises(SystemExit) as exc:
+        main(["--help"])
+
+    assert exc.value.code == EXIT_OK
+
+    with pytest.raises(SystemExit) as exc2:
+        main(["check-config", "--help"])
+
+    assert exc2.value.code == EXIT_OK
 
 
 def test_check_config_ok_prints_summary(config_file, capsys):
