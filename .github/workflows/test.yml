@@ -59,6 +59,12 @@ jobs:
           fi
           pytest -m contract
 
+      # 覆盖门禁：unit 与 contract 合并统计（adapters 的生产代码主要由 contract 覆盖）。
+      # 定死 100%：不加这道，覆盖率只会悄悄退化 —— 前面几张工单的教训是
+      # 「全绿 + 100%」仍可能藏着没被断言的行为，但掉了 100% 一定是真漏了。
+      - name: Coverage gate (unit + contract, 100%)
+        run: pytest -m "unit or contract" --cov=geopublish --cov-fail-under=100
+
   integration:
     name: integration (real browser, fake site)
     runs-on: ubuntu-latest

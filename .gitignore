@@ -34,3 +34,7 @@ config/geopublish.json
 # 构建产物（pip wheel / setuptools 生成）
 build/
 dist/
+.mut-lab/
+.test-out.txt
+.coverage.*
+.coverage.*
