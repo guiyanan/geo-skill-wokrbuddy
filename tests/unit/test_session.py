@@ -21,6 +21,7 @@ from geopublish.core.session import (
     AuthRequired,
     BrowserUnavailable,
     SessionConfig,
+    SessionError,
     check_login,
     ensure_profile_dir,
     login,
@@ -336,3 +337,214 @@ def test_cli_login_reports_missing_browser_as_env_error(monkeypatch, capsys):
 
     assert cli.main(["login", "csdn"]) == cli.EXIT_ENV == 5
     assert "playwright" in capsys.readouterr().err
+
+
+def test_cli_login_success_tells_where_the_profile_lives(monkeypatch, capsys, tmp_path):
+    from geopublish import cli
+
+    captured: dict = {}
+
+    def _fake_login(adapter, config, **kwargs):
+        captured["config"] = config
+        return AuthResult(AuthState.LOGGED_IN, reason="看到头像")
+
+    monkeypatch.setattr(cli, "login", _fake_login)
+
+    code = cli.main(["login", "csdn", "--profile-root", str(tmp_path)])
+
+    assert code == cli.EXIT_OK
+    out = capsys.readouterr().out
+    assert "登录成功" in out
+    assert str(tmp_path) in out, "得告诉人登录态存在哪，否则下次想清掉都找不到"
+    assert captured["config"].channel == "chrome", "本地默认复用系统 Chrome"
+
+
+def test_cli_login_accepts_bundled_channel(monkeypatch, tmp_path):
+    from geopublish import cli
+
+    captured: dict = {}
+
+    def _fake_login(adapter, config, **kwargs):
+        captured["config"] = config
+        return AuthResult(AuthState.LOGGED_IN)
+
+    monkeypatch.setattr(cli, "login", _fake_login)
+
+    assert cli.main(["login", "csdn", "--channel", "bundled", "--profile-root", str(tmp_path)]) == 0
+
+    assert captured["config"].channel is None, "bundled = 不传 channel，用 playwright 自带 chromium"
+
+
+def test_cli_login_unknown_platform_is_a_usage_error(capsys):
+    from geopublish import cli
+
+    assert cli.main(["login", "zhihu"]) == cli.EXIT_USAGE
+    assert "未知平台" in capsys.readouterr().err
+
+
+# ------------------------------------------------------- 边角：报错要能看懂
+
+def test_ut_06_03b_adapter_without_editor_url_is_reported(tmp_path):
+    """没有 editor_url 就没法确认登录是否生效 —— 宁可当场报，也别假装成功。"""
+    adapter = _AuthStub(AuthState.LOGGED_IN)
+
+    with pytest.raises(SessionError) as exc:
+        login(
+            adapter,
+            SessionConfig(profile_root=tmp_path / "profiles"),
+            launcher=_FakeLauncher(),
+            wait_for_user=lambda prompt: None,
+        )
+
+    assert "editor_url" in str(exc.value)
+
+
+def test_permission_failure_is_reported_not_swallowed(tmp_path, monkeypatch):
+    """chmod 失败必须报出来：静默留着 755 的凭据目录，比报错难查得多。"""
+
+    def _deny(path, mode):
+        raise PermissionError("operation not permitted")
+
+    monkeypatch.setattr(session_mod.os, "chmod", _deny)
+
+    with pytest.raises(SessionError) as exc:
+        ensure_profile_dir(tmp_path / "profiles" / "csdn")
+
+    assert "700" in str(exc.value)
+
+
+def test_relative_profile_path_is_rejected(tmp_path, monkeypatch):
+    """相对路径 = 当前目录，而这里第一个动作就是 chmod 700 —— 不能拿 cwd 冒险。"""
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(SessionError) as exc:
+        ensure_profile_dir("csdn")
+
+    assert "绝对路径" in str(exc.value)
+    assert not (tmp_path / "csdn").exists(), "被拒之前不许留下目录"
+
+
+def test_profile_path_occupied_by_a_file_says_so(tmp_path):
+    """mkdir 撞到同名文件报的是 EEXIST/PermissionError，读起来像权限问题，其实是「这是个文件」。"""
+    occupied = tmp_path / "profiles" / "csdn"
+    occupied.parent.mkdir(parents=True)
+    occupied.write_text("我不是目录", encoding="utf-8")
+
+    with pytest.raises(SessionError) as exc:
+        ensure_profile_dir(occupied)
+
+    assert "文件" in str(exc.value) and "csdn" in str(exc.value)
+
+
+def test_filesystem_root_is_refused(tmp_path):
+    """`--profile-root /` 如果放过去，下一步就是 chmod / 成 700。"""
+    with pytest.raises(SessionError) as exc:
+        ensure_profile_dir(Path("/"))
+
+    assert "根目录" in str(exc.value)
+
+
+def test_never_hardens_the_filesystem_root(monkeypatch):
+    """直接挂在根下的 profile（/csdn）不能让父目录 "/" 被 chmod。"""
+    hardened: list[Path] = []
+    monkeypatch.setattr(session_mod.Path, "mkdir", lambda *args, **kwargs: None)
+    monkeypatch.setattr(session_mod, "_harden", lambda path: hardened.append(Path(path)))
+
+    session_mod.ensure_profile_dir(Path("/csdn"))
+
+    assert hardened == [Path("/csdn")]
+
+
+def test_unwritable_parent_is_reported_with_the_path(monkeypatch, tmp_path):
+    def _deny(*args, **kwargs):
+        raise OSError(30, "Read-only file system")
+
+    monkeypatch.setattr(session_mod.Path, "mkdir", _deny)
+
+    with pytest.raises(SessionError) as exc:
+        ensure_profile_dir(tmp_path / "profiles" / "csdn")
+
+    assert "建不出来" in str(exc.value) and "csdn" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"timeout_ms": 0}, {"viewport": (0, 900)}, {"viewport": (100,)}],
+)
+def test_session_config_rejects_nonsense(kwargs):
+    with pytest.raises(SessionError):
+        SessionConfig(**kwargs)
+
+
+def test_default_launcher_hands_back_playwright():
+    assert callable(session_mod._default_launcher())
+
+
+def test_missing_playwright_module_says_how_to_fix(monkeypatch):
+    """playwright 没装时给的是修复命令，不是一句 ImportError。"""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", None)
+
+    with pytest.raises(BrowserUnavailable) as exc:
+        session_mod._default_launcher()
+
+    assert "pip install playwright" in str(exc.value)
+
+
+def test_wait_for_enter_prints_the_prompt(monkeypatch, capsys):
+    monkeypatch.setattr("builtins.input", lambda: "")
+
+    session_mod._wait_for_enter("请扫码")
+
+    assert "请扫码" in capsys.readouterr().out
+
+
+def test_wait_for_enter_in_a_pipeline_says_it_needs_a_terminal(monkeypatch):
+    """cron / 管道里跑 login：stdin 没有可等的东西，别甩一句 EOFError 回溯。"""
+
+    def _eof():
+        raise EOFError("EOF when reading a line")
+
+    monkeypatch.setattr("builtins.input", _eof)
+
+    with pytest.raises(SessionError) as exc:
+        session_mod._wait_for_enter("请扫码")
+
+    assert "终端" in str(exc.value)
+
+
+def test_session_falls_back_to_a_new_page_when_context_has_none(tmp_path):
+    """持久 context 里没有现成页面时（新 profile 的首启）要自己开一张。"""
+    context = _FakeContext()
+    context.pages = []
+
+    class _Launcher(_FakeLauncher):
+        def __call__(self):
+            return self
+
+        def __enter__(self):
+            return self.pw
+
+    launcher = _Launcher()
+
+    def _no_pages(**kwargs):
+        return context
+
+    launcher.pw.chromium.launch_persistent_context = _no_pages
+
+    with session_mod.PersistentBrowser(
+        SessionConfig(profile_root=tmp_path / "profiles"), launcher=launcher
+    ).open("csdn") as page:
+        pass
+
+    assert page.timeout == SessionConfig().timeout_ms
+
+
+def test_csdn_adapter_exposes_its_login_page():
+    from geopublish.adapters.csdn.flow import CsdnAdapter
+
+    adapter = CsdnAdapter()
+
+    assert adapter.login_url.startswith("https://passport.csdn.net")
+    assert adapter.login_url != adapter.editor_url, "登录页和编辑器页不是一回事"

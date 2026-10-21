@@ -256,6 +256,9 @@ class AdapterMeta:
     name: str
     domains: tuple[str, ...]
     editor_url: str
+    # 登录页地址。不给就退回 editor_url（很多平台后台页会自己跳登录）。
+    # 放这里而不是 core 里：换平台不该改主程序。
+    login_url: str = ""
 
     @classmethod
     def load(cls, path: str | Path) -> AdapterMeta:
@@ -274,6 +277,15 @@ class AdapterMeta:
         if not isinstance(editor_url, str) or not editor_url.startswith(("https://", "http://")):
             raise SelectorError(f"editor_url 必须是 http(s) 地址（{path}）")
 
+        login_url = data.get("login_url", "")
+        if not isinstance(login_url, str):
+            raise SelectorError(f"login_url 必须是字符串（{path}）")
+        login_url = login_url.strip()
+        if login_url and not login_url.startswith(("https://", "http://")):
+            # 写错协议（passport.csdn.net/login 少了 https://）不报出来的话，
+            # 登录会打到一条相对路径上，人看到的是一个 404 空白页
+            raise SelectorError(f"login_url 必须是 http(s) 地址（{path}）")
+
         domains = data.get("domains")
         if (
             not isinstance(domains, list)
@@ -286,6 +298,7 @@ class AdapterMeta:
             name=str(data.get("name") or path.parent.name),
             domains=tuple(item.strip() for item in domains),
             editor_url=editor_url.strip(),
+            login_url=login_url,
         )
 
 

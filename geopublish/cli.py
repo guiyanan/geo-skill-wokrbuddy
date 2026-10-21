@@ -3,6 +3,7 @@
 子命令：
 - `geopublish --version`：部署脚本与 CI 的探活点
 - `geopublish check-config [PATH]`：**发布之前**把配置问题暴露出来
+- `geopublish login <platform>`：扫码登录，登录态写进持久 profile（T-06）
 - `geopublish snapshot <url> <name>`：把页面存成 fixture（T-04）
 - `geopublish incident replay <dir>`：回放现场包（T-04，repro.sh 调的就是它）
 
@@ -28,6 +29,15 @@ from typing import Sequence
 from . import __version__
 from .core.config import DEFAULT_CONFIG_PATH, Config, ConfigError, load_config
 from .core.incident import BundleNotFound, IncidentError, describe_failure, load
+from .core.session import (
+    DEFAULT_PROFILE_ROOT,
+    AuthRequired,
+    BrowserUnavailable,
+    SessionConfig,
+    SessionError,
+    login,
+    profile_path,
+)
 from .core.snapshot import (
     DriverUnavailable,
     EmptyCapture,
@@ -80,6 +90,19 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"配置文件路径（默认 {DEFAULT_CONFIG_PATH}）",
     )
 
+    login_cmd = sub.add_parser("login", help="扫码登录，把登录态存进持久 profile")
+    login_cmd.add_argument("platform", help="平台名，如 csdn")
+    login_cmd.add_argument(
+        "--channel",
+        default="chrome",
+        help="浏览器来源：chrome=复用系统 Chrome（默认）；bundled=用 playwright 自带 chromium（CI/无 Chrome 时）",
+    )
+    login_cmd.add_argument(
+        "--profile-root",
+        default=None,
+        help=f"profile 根目录（默认 {DEFAULT_PROFILE_ROOT}）",
+    )
+
     shot = sub.add_parser("snapshot", help="把一个页面存成 fixture（DOM/截图/元信息）")
     shot.add_argument("url", help="页面地址（http/https/file）")
     shot.add_argument("name", help="fixture 名字，如 csdn/editor")
@@ -103,6 +126,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "check-config":
         return _check_config(Path(args.path))
+    if args.command == "login":
+        return _login(args)
     if args.command == "snapshot":
         return _snapshot(args)
     if args.command == "incident":
@@ -112,6 +137,46 @@ def main(argv: Sequence[str] | None = None) -> int:
     # 退 0 会让 cron 以为今天跑过了 —— 静默成功比报错危险得多。
     parser.print_help(sys.stderr)
     return EXIT_USAGE
+
+
+def _login(args: argparse.Namespace) -> int:
+    """扫码登录。退出码就是 R6 的验收：没登上退 2，环境坏退 5。
+
+    注意这里**不重试**：重试逻辑一旦写进来，扫码失败就会变成反复撞登录页。
+    """
+    try:
+        adapter = _adapter_for(args.platform)
+        channel = None if str(args.channel).strip().lower() in {"bundled", "none", ""} else args.channel
+        config = SessionConfig(
+            profile_root=Path(args.profile_root) if args.profile_root else DEFAULT_PROFILE_ROOT,
+            channel=channel,
+        )
+        result = login(adapter, config)
+    except AuthRequired as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_AUTH
+    except BrowserUnavailable as exc:
+        print(f"环境不可用：{exc}", file=sys.stderr)
+        return EXIT_ENV
+    except SessionError as exc:
+        print(f"登录失败：{exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    where = profile_path(adapter.name, profile_root=config.profile_root)
+    print(f"登录成功：{adapter.name}（{result.reason}）")
+    print(f"登录态已保存：{where}（权限 700，不进 git）")
+    return EXIT_OK
+
+
+def _adapter_for(platform: str) -> object:
+    """平台名 → adapter。目前只有 csdn；新增平台在这里登记一行。"""
+    from .adapters.csdn.flow import CsdnAdapter
+
+    registry = {"csdn": CsdnAdapter}
+    key = str(platform).strip().lower()
+    if key not in registry:
+        raise SessionError(f"未知平台：{platform}（可用：{', '.join(sorted(registry))}）")
+    return registry[key]()
 
 
 def _snapshot(args: argparse.Namespace) -> int:

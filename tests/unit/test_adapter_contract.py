@@ -235,6 +235,43 @@ def test_meta_rejects_non_https_editor_url(tmp_path):
     assert "editor_url" in str(exc.value)
 
 
+def test_meta_login_url_must_be_absolute_http(tmp_path):
+    """少写 `https://` 的登录页地址会打到一条相对路径上，人看到的是 404 空白页。"""
+    path = tmp_path / "meta.json"
+    path.write_text(
+        json.dumps(
+            {
+                "editor_url": "https://mp.csdn.net/x",
+                "domains": ["mp.csdn.net"],
+                "login_url": "passport.csdn.net/login",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SelectorError) as exc:
+        CsdnAdapter(meta_path=path)
+    assert "login_url" in str(exc.value)
+
+
+def test_meta_login_url_must_be_a_string(tmp_path):
+    path = tmp_path / "meta.json"
+    path.write_text(
+        json.dumps(
+            {
+                "editor_url": "https://mp.csdn.net/x",
+                "domains": ["mp.csdn.net"],
+                "login_url": 123,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SelectorError) as exc:
+        CsdnAdapter(meta_path=path)
+    assert "login_url" in str(exc.value)
+
+
 def test_auth_state_values_are_stable_strings():
     """状态值会进日志/现场包，改字符串等于改日志语义。"""
     assert {s.value for s in AuthState} == {"logged_in", "expired", "unknown"}

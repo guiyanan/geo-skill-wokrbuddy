@@ -59,6 +59,11 @@ class CsdnAdapter:
         return self._meta.editor_url
 
     @property
+    def login_url(self) -> str:
+        """登录页。`geopublish login` 先把人放到这一页再等扫码。"""
+        return self._meta.login_url
+
+    @property
     def domains(self) -> tuple[str, ...]:
         return self._meta.domains
 
