@@ -18,6 +18,7 @@ from geopublish.adapters.base import (
     REQUIRED_SELECTORS,
     SelectorError,
     Selectors,
+    SubmitMode,
     assert_adapter,
 )
 from geopublish.adapters.csdn.flow import META_PATH, SELECTORS_PATH, CsdnAdapter
@@ -110,24 +111,24 @@ def test_protocol_is_runtime_checkable():
 
 
 @pytest.mark.parametrize(
-    "method, ticket, args",
+    "call, ticket, method",
     [
-        ("submit", "T-09", (object(),)),
-        ("verify", "T-09", (object(),)),
+        (lambda a: a.submit(object(), mode="publish"), "T-10", "submit"),
+        (lambda a: a.submit(object(), mode=SubmitMode.PUBLISH), "T-10", "submit"),
     ],
 )
-def test_unimplemented_methods_name_their_ticket(method, ticket, args):
+def test_unimplemented_modes_name_their_ticket(call, ticket, method):
     """没实现就要**说出来属于哪张工单**。
 
     最危险的是写个 `pass` —— 流程会一路绿到「发布成功」，然后线上什么都没有。
-    （fill_meta / upload_cover 已在 T-08 落地，本表只剩 T-09 两个。）
+    （T-09 之后只剩真实发布这一段：`submit(mode=publish)` 归 T-10。）
     """
     adapter = CsdnAdapter()
     with pytest.raises(NotImplementedError) as exc:
-        getattr(adapter, method)(*args)
+        call(adapter)
 
     assert ticket in str(exc.value), f"{method} 的报错必须指出 {ticket}"
-    assert method in str(exc.value)
+    assert "publish" in str(exc.value)
 
 
 # --------------------------------------------------- open_editor
@@ -275,6 +276,40 @@ def test_meta_cover_spec_is_loaded():
     spec = CsdnAdapter()._meta.cover
     assert spec is not None
     assert spec.width > 0 and spec.height > 0 and spec.max_bytes > 0
+
+
+def test_meta_draft_list_url_is_loaded():
+    """verify 的兜底页地址必须读得到（UT-09-02 靠它）。"""
+    assert CsdnAdapter()._meta.draft_list_url == "https://mp.csdn.net/mp_blog/manage/article"
+
+
+def _meta_file_with_draft_list(tmp_path, value):
+    path = tmp_path / "meta.json"
+    path.write_text(
+        json.dumps(
+            {
+                "editor_url": "https://mp.csdn.net/x",
+                "domains": ["mp.csdn.net"],
+                "draft_list_url": value,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_meta_draft_list_url_must_be_a_string(tmp_path):
+    with pytest.raises(SelectorError) as exc:
+        CsdnAdapter(meta_path=_meta_file_with_draft_list(tmp_path, 123))
+    assert "draft_list_url" in str(exc.value)
+
+
+def test_meta_draft_list_url_must_be_absolute_http(tmp_path):
+    """兜底页写错协议的话，verify 会 goto 到相对路径、拿到 404，
+    然后报「草稿列表里没找到」—— 一个地址笔误被误诊成「稿子没发出去」。"""
+    with pytest.raises(SelectorError) as exc:
+        CsdnAdapter(meta_path=_meta_file_with_draft_list(tmp_path, "mp.csdn.net/manage/article"))
+    assert "draft_list_url" in str(exc.value)
 
 
 def _meta_file(tmp_path, cover):

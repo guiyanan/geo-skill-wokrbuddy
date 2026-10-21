@@ -1,19 +1,20 @@
 """CSDN 适配器。
 
 已实现：`check_auth` / `open_editor`（T-05）、`fill_content`（T-07 三级降级注入）、
-`fill_meta` / `upload_cover`（T-08）。
+`fill_meta` / `upload_cover`（T-08）、`submit`（T-09，仅草稿）/ `verify`（T-09）。
 
-其余两个方法**故意**抛 `NotImplementedError` 并写明归属工单：
+`submit(mode=publish)` **故意**抛 `NotImplementedError` 并写明归属工单 T-10：
 写 `pass` 是最危险的做法——流程会一路绿到「发布成功」，然后线上什么都没有。
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 from ..base import (
     AdapterMeta,
@@ -25,7 +26,10 @@ from ..base import (
     MetaError,
     Page,
     Selectors,
+    SubmitBlocked,
+    SubmitMode,
     SubmitResult,
+    SubmitState,
     VerifyResult,
 )
 from ..imageinfo import ImageInfoError, image_size
@@ -50,6 +54,14 @@ SEGMENT_SIZE = 500
 TYPING_DELAY_MS = 5.0
 # UT-08-04：上传后缩略图的等待上限（毫秒）。
 THUMBNAIL_TIMEOUT_MS = 10_000
+# 点「存草稿」后等一个确认信号的上限。等不到不算失败（存草稿常常只弹个会消失的
+# toast、URL 也不变），只是把判定权交给 verify —— 见 submit 的返回语义。
+SUBMIT_TIMEOUT_MS = 15_000
+
+# article_id 藏在哪儿：CSDN 的草稿地址是 .../creation/editor/<id>，详情页是
+# /article/details/<id>，另一些路径会用查询参数。三种都认，顺序无关。
+_ARTICLE_ID_KEYS = ("articleId", "article_id", "articleid")
+_ARTICLE_ID_PATH_RE = re.compile(r"/(?:article/details|creation/editor|editor)/(\d+)")
 
 # 选择器一律经参数传入（[sel, text] / [sel, editableSel]），代码里不出现裸选择器——
 # .precommit/check_no_naked_selectors.py 盯着这个目录。
@@ -137,13 +149,37 @@ _CATEGORY_OPTIONS_JS = """/* op=categories */
 """
 
 
+def _article_id_from_url(url: str) -> str:
+    """从地址里挖 article_id：查询参数优先，再退到路径。
+
+    挖不到返回空串而不是 None：调用方（verify）要做的是「有没有」，空串在
+    日志里也好读——`article_id=""` 比 `article_id=None` 少一次类型判断。
+    """
+    parts = urlsplit(str(url or ""))
+    query = parse_qs(parts.query)
+    for key in _ARTICLE_ID_KEYS:
+        values = query.get(key)
+        if values:
+            # parse_qs 默认就丢掉空值，这里只需要去首尾空白
+            return str(values[0]).strip()
+    hit = _ARTICLE_ID_PATH_RE.search(parts.path)
+    return hit.group(1) if hit else ""
+
+
 class EditorReadError(RuntimeError):
     """注入后回读不到编辑器内容。读不出来就不能当成功。"""
 
 
 def read_editor_text(page: Page, content_sel: str, editable_sel: str) -> str:
-    """从 CodeMirror 实例回读正文；实例拿不到时退回编辑区 innerText。"""
-    outcome = page.evaluate(_READBACK_JS, [content_sel, editable_sel])
+    """从 CodeMirror 实例回读正文；实例拿不到时退回编辑区 innerText。
+
+    页面层的任何异常（页面已销毁、浏览器崩了）都折算成 EditorReadError：
+    调用方要回答的只有「读没读出来」，不该被迫区分浏览器的一百种死法。
+    """
+    try:
+        outcome = page.evaluate(_READBACK_JS, [content_sel, editable_sel])
+    except Exception as exc:
+        raise EditorReadError(f"编辑器回读失败：{type(exc).__name__}: {exc}") from exc
     if not isinstance(outcome, Mapping) or not outcome.get("ok"):
         reason = outcome.get("reason") if isinstance(outcome, Mapping) else "回读脚本无返回"
         raise EditorReadError(f"编辑器回读失败：{reason}")
@@ -196,6 +232,10 @@ class CsdnAdapter:
         self._meta = AdapterMeta.load(Path(meta_path) if meta_path else META_PATH)
         # 注入超时判定走注入时钟（确定性三约束：时间可注入），测试用 FakeClock。
         self._clock = clock if clock is not None else SystemClock()
+        # 最近一次注入成功的正文长度。**这是提交前复核的唯一依据**（R7 红线）：
+        # 记录在 adapter 上而不是让调用方再传一遍，是因为「注入了多少」只有这里知道，
+        # 传参等于允许调用方和事实不一致。
+        self._injected_len: int | None = None
 
     # ----------------------------------------------------------- 只读属性
 
@@ -273,6 +313,9 @@ class CsdnAdapter:
 
         顺序不能反：先 `goto` 再等选择器。反过来就是在上一页等，必然超时。
         """
+        # 新开一页 = 上一次的注入记录作废。不在这里清，就会出现「换了稿子、
+        # 复核却拿旧长度通过」——那正是 R7 要防的盲发。
+        self._injected_len = None
         page.goto(self.editor_url)
         page.wait_for_selector(self.selectors("editor", "content"))
 
@@ -286,6 +329,9 @@ class CsdnAdapter:
         """
         if draft is None:
             raise TypeError("fill_content 需要 draft（open_editor 才允许 None）")
+        # 先作废上一次的记录：这次注入若失败，submit 必须因为「没有记录」被拦下，
+        # 而不是拿着上一次的长度放行。
+        self._injected_len = None
         body = draft.body
         if not body.strip():
             # guard 漏放的空稿不能走到注入：盲发空稿比失败更糟。
@@ -326,6 +372,8 @@ class CsdnAdapter:
                     attempt.actual_len or 0,
                     attempt.elapsed_ms,
                 )
+                # 只在这里记：只有「注入并回读通过」的长度才有资格作为提交前基准。
+                self._injected_len = expected_len
                 return
         raise InjectFailed(tuple(attempts), expected_len=expected_len)
 
@@ -521,8 +569,175 @@ class CsdnAdapter:
             ) from exc
         logger.info("封面已上传：%s（%dx%d，%d 字节）", path.name, width, height, size)
 
-    def submit(self, page: Page) -> SubmitResult:
-        raise NotImplementedError("submit 未实现：发布/存草稿与结果判定属于 T-09")
+    # ----------------------------------------------------------- T-09 提交
 
-    def verify(self, page: Page) -> VerifyResult:
-        raise NotImplementedError("verify 未实现：回读 URL 与文章 id 属于 T-09（P0 里程碑）")
+    def check_content_length(self, page: Page) -> int:
+        """提交前复核：编辑器里的正文必须还是注入时那一份（R7 红线）。
+
+        为什么单独成一个方法而不是顺手写在 submit 里：这是整条链上唯一一处
+        「用平台侧的现状去否定本地的乐观」，出错时要能单独测、单独在日志里留痕。
+        返回实际字数，便于把「复核过多少字」写进日志。
+
+        没有注入记录 = 不知道页面上是什么 → 直接 `SubmitBlocked`。宁可让人重跑，
+        也不发一篇内容不明的稿子。
+        """
+        expected = self._injected_len
+        if expected is None:
+            raise SubmitBlocked(
+                "没有正文注入长度记录：未经验证的正文不许提交（先跑 fill_content，"
+                "或在 open_editor 之后重新注入）"
+            )
+        try:
+            actual = len(
+                read_editor_text(
+                    page,
+                    self.selectors("editor", "content"),
+                    self.selectors("editor", "content_editable"),
+                )
+            )
+        except EditorReadError as exc:
+            raise SubmitBlocked(f"提交前复核失败，读不回正文：{exc}") from exc
+
+        if abs(actual - expected) > expected * LENGTH_TOLERANCE:
+            raise SubmitBlocked(
+                f"提交前复核失败：编辑器里 {actual} 字，注入时 {expected} 字，"
+                f"偏差超 {LENGTH_TOLERANCE:.0%}。已停手，一个按钮都没点"
+            )
+        logger.info("提交前复核通过：编辑器 %d 字与注入时一致", actual)
+        return actual
+
+    def submit(self, page: Page, *, mode: SubmitMode | str = SubmitMode.DRAFT) -> SubmitResult:
+        """存草稿（T-09）。真实发布属于 T-10，这里**明确拒绝**而不是半套实现。
+
+        顺序是硬的：复核正文 → 点按钮。反过来就是「点了才想起没验证」，
+        而发布按钮按下去没有撤销键。
+        """
+        mode = SubmitMode(mode)
+        if mode is not SubmitMode.DRAFT:
+            raise NotImplementedError("publish 模式未实现：真实发布与回执属于 T-10")
+
+        self.check_content_length(page)
+
+        before_url = page.url
+        page.click(self.selectors("editor", "save_draft_button"))
+
+        try:
+            page.wait_for_selector(
+                self.selectors("verify", "success_marker"), timeout_ms=SUBMIT_TIMEOUT_MS
+            )
+        except Exception as exc:
+            # 等不到确认信号不是失败：存草稿常常只弹一个几秒后消失的 toast，
+            # 也可能什么都不提示、URL 也不变。这时候说「失败」会误导人去重发，
+            # 说「成功」又不诚实 —— 交 `unknown`，判定权在 verify。
+            if page.url != before_url:
+                return SubmitResult(
+                    state=SubmitState.SUBMITTED, reason=f"点击后页面已跳转：{page.url}"
+                )
+            return SubmitResult(
+                state=SubmitState.UNKNOWN,
+                reason=(
+                    f"点击后 {SUBMIT_TIMEOUT_MS // 1000}s 内没等到成功提示，URL 也没变"
+                    f"（{type(exc).__name__}）：交给 verify 判定"
+                ),
+            )
+        return SubmitResult(state=SubmitState.SUBMITTED, reason="存草稿后看到成功提示")
+
+    def verify(self, page: Page, *, mode: SubmitMode | str = SubmitMode.DRAFT) -> VerifyResult:
+        """回读确认：拿到 article_id 才算成功（UT-09-01）。
+
+        三条取 id 的路按代价从低到高：
+        1. DOM 里的 `verify.article_id`（发布成功页 / 带 id 的编辑器页）
+        2. 当前 URL：`?articleId=` 或 `/creation/editor/<id>`、`/article/details/<id>`
+        3. 草稿列表页按标题核对（UT-09-02）—— 存草稿后 URL 不变时唯一能确认的办法
+
+        **有成功提示但没有 id 一律判失败**：那正是「以为发出去了、其实列表里没有」
+        的形态，比明确的报错危险得多。
+        """
+        mode = SubmitMode(mode)
+        url = page.url
+        article_id = self._read_article_id(page) or _article_id_from_url(url)
+        if article_id:
+            return VerifyResult(
+                ok=True, url=url, article_id=article_id, reason="从页面标记或 URL 读到 article_id"
+            )
+        if mode is not SubmitMode.DRAFT:
+            # 已发布的文章不在草稿箱里，拿草稿列表兜底只会得到一个假阴性
+            return VerifyResult(
+                ok=False, url=url, reason="发布模式下拿不到 article_id：不走草稿列表兜底"
+            )
+        return self._verify_via_draft_list(page)
+
+    def _read_article_id(self, page: Page) -> str:
+        """读 DOM 里的文章 id。元素在但没 content 就退回文本内容，都没有算没读到。"""
+        element = page.query_selector(self.selectors("verify", "article_id"))
+        if element is None:
+            return ""
+        raw = element.get_attribute("content") or element.text_content() or ""
+        return raw.strip()
+
+    def _verify_via_draft_list(self, page: Page) -> VerifyResult:
+        """草稿列表兜底：按「编辑器里此刻的标题」找同一篇。
+
+        标题必须在**导航之前**从编辑器读出来：一跳页，标题输入框就没了，
+        而平台不会把标题回填到列表页以外的任何地方。
+        """
+        title = self._read_title(page)
+        if not title:
+            return VerifyResult(
+                ok=False, url=page.url, reason="读不到编辑器标题：没法在草稿列表里核对是哪一篇"
+            )
+
+        list_url = self._meta.draft_list_url
+        if not list_url:
+            return VerifyResult(
+                ok=False,
+                url=page.url,
+                reason=f"meta.json 没配 draft_list_url：无法确认「{title}」是否已进草稿箱",
+            )
+
+        try:
+            page.goto(list_url)
+            items = page.query_selector_all(self.selectors("verify", "draft_list_item"))
+        except Exception as exc:
+            return VerifyResult(
+                ok=False,
+                url=page.url,
+                reason=f"草稿列表页打不开（{type(exc).__name__}）：{exc}",
+            )
+
+        href_without_id = ""
+        for item in items:
+            if (item.text_content() or "").strip() != title:
+                continue
+            href = item.get_attribute("href") or ""
+            article_id = _article_id_from_url(href)
+            if not article_id:
+                href_without_id = href or "（无 href）"
+                continue
+            return VerifyResult(
+                ok=True,
+                url=urljoin(list_url, href),
+                article_id=article_id,
+                reason=f"草稿列表页按标题命中（共 {len(items)} 条）",
+            )
+
+        if href_without_id:
+            # 标题对上了、链接里却解析不出 id：这就是「看着像发成了」的样子，
+            # 但下游拿不到 id 就没法回执、没法监测，判失败比判成功安全。
+            return VerifyResult(
+                ok=False,
+                url=list_url,
+                reason=f"草稿列表里找到「{title}」，但链接解析不出 article_id：{href_without_id}",
+            )
+        return VerifyResult(
+            ok=False,
+            url=list_url,
+            reason=f"草稿列表页（{len(items)} 条）里没有标题「{title}」：草稿大概率没存上",
+        )
+
+    def _read_title(self, page: Page) -> str:
+        """读编辑器标题。成功页没有标题框，读不到是正常态，不算错误。"""
+        try:
+            return (page.input_value(self.selectors("editor", "title")) or "").strip()
+        except Exception:
+            return ""

@@ -13,8 +13,10 @@ import pytest
 
 import geopublish
 from geopublish.cli import (
+    EXIT_AUTH,
     EXIT_CONFIG_ERROR,
     EXIT_ENV,
+    EXIT_FAILED,
     EXIT_OK,
     EXIT_REPRODUCED,
     EXIT_USAGE,
@@ -84,7 +86,7 @@ def test_unknown_flag_is_a_usage_error():
 def test_unknown_subcommand_is_a_usage_error():
     """子命令拼错也要是 1（子解析器必须继承同一个 error 行为）。"""
     with pytest.raises(SystemExit) as exc:
-        main(["publish"])
+        main(["publsh"])
 
     assert exc.value.code == EXIT_USAGE
 
@@ -262,3 +264,176 @@ def test_incident_replay_broken_bundle_is_an_env_error(tmp_path, capsys):
 
     assert code == EXIT_ENV
     assert "bundle.json" in capsys.readouterr().err
+
+
+# ------------------------------------------------- T-09：publish --mode draft
+
+from geopublish.adapters.base import AuthState, SubmitBlocked  # noqa: E402
+from geopublish.core.config import Gate  # noqa: E402
+from geopublish.core.session import AuthRequired, BrowserUnavailable  # noqa: E402
+from geopublish.publish import GateClosed, PublishOutcome  # noqa: E402
+
+
+@pytest.fixture
+def draft_dir(tmp_path):
+    root = tmp_path / "draft"
+    root.mkdir()
+    (root / "meta.json").write_text(
+        json.dumps({"slug": "t09-cli", "title": "探针标题", "ai_involvement": "assisted"}),
+        encoding="utf-8",
+    )
+    (root / "csdn.md").write_text("正文" * 100, encoding="utf-8")
+    return root
+
+
+def _stub_publish(monkeypatch, outcome=None, error=None):
+    seen: dict = {}
+
+    def _fake(adapter, loaded, platform_cfg, **kwargs):
+        seen["title"] = loaded.draft.meta.title
+        seen["adapter"] = adapter.name
+        seen["platform"] = platform_cfg.name
+        seen.update(kwargs)
+        if error is not None:
+            raise error
+        return outcome or PublishOutcome(
+            ok=True, url="https://mp.csdn.net/x/1", article_id="1", reason="命中"
+        )
+
+    monkeypatch.setattr("geopublish.cli.publish_draft", _fake)
+    return seen
+
+
+def test_publish_draft_ok_prints_article_id(monkeypatch, capsys, config_file, draft_dir):
+    seen = _stub_publish(monkeypatch)
+
+    code = main(["publish", str(draft_dir), "--config", str(config_file())])
+
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "探针标题" in out and "article_id = 1" in out
+    assert seen["gate"] is Gate.DRAFT, "闸门必须从配置读，不能默认放行"
+    assert seen["mode"] == "draft"
+    assert seen["adapter"] == "csdn"
+
+
+def test_publish_mode_publish_is_refused_without_touching_the_platform(
+    monkeypatch, capsys, config_file, draft_dir
+):
+    """T-10 之前真实发布必须打不开：说清原因，且明确「什么都没点」。"""
+    _stub_publish(monkeypatch)
+
+    code = main(["publish", str(draft_dir), "--mode", "publish", "--config", str(config_file())])
+
+    err = capsys.readouterr().err
+    assert code == EXIT_USAGE
+    assert "T-10" in err and "没有点任何按钮" in err
+
+
+def test_publish_unconfirmed_is_exit_6(monkeypatch, capsys, config_file, draft_dir):
+    _stub_publish(
+        monkeypatch,
+        outcome=PublishOutcome(ok=False, url="https://mp.csdn.net/x", reason="草稿列表页没找到"),
+    )
+
+    code = main(["publish", str(draft_dir), "--config", str(config_file())])
+
+    err = capsys.readouterr().err
+    assert code == EXIT_FAILED
+    assert "未确认成功" in err and "没找到" in err
+    assert "当前页面" in err
+
+
+def test_publish_unconfirmed_without_url_still_fails_cleanly(
+    monkeypatch, capsys, config_file, draft_dir
+):
+    """verify 连当前页面都回读不到时，不该多打印一行空 URL。"""
+    _stub_publish(monkeypatch, outcome=PublishOutcome(ok=False, reason="读不到编辑器标题"))
+
+    code = main(["publish", str(draft_dir), "--config", str(config_file())])
+
+    captured = capsys.readouterr()
+    assert code == EXIT_FAILED
+    assert "当前页面" not in captured.err
+
+
+def test_publish_success_with_screenshot_and_no_url(monkeypatch, capsys, config_file, draft_dir):
+    """草稿模式成功时可能没有公开 URL（只进了草稿箱），但要打印截图路径。"""
+    run_dir = draft_dir.parent / "runs" / "20261021_152030"
+    _stub_publish(
+        monkeypatch,
+        outcome=PublishOutcome(ok=True, url="", article_id="139821477", reason="列表命中", run_dir=run_dir),
+    )
+
+    code = main(["publish", str(draft_dir), "--config", str(config_file())])
+
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "139821477" in out
+    assert "url        =" not in out
+    assert "draft.png" in out
+
+
+def test_publish_config_error_is_exit_3(monkeypatch, capsys, config_file, draft_dir):
+    _stub_publish(monkeypatch)
+
+    assert main(["publish", str(draft_dir), "--config", str(config_file(gate="ship"))]) == (
+        EXIT_CONFIG_ERROR
+    )
+    assert "gate" in capsys.readouterr().err
+
+
+def test_publish_platform_not_in_config_is_exit_3(monkeypatch, capsys, config_file, draft_dir):
+    _stub_publish(monkeypatch)
+
+    code = main(
+        ["publish", str(draft_dir), "--platform", "juejin", "--config", str(config_file())]
+    )
+
+    assert code == EXIT_CONFIG_ERROR
+    assert "juejin" in capsys.readouterr().err
+
+
+def test_publish_bad_draft_dir_is_a_usage_error(monkeypatch, capsys, config_file, tmp_path):
+    _stub_publish(monkeypatch)
+
+    code = main(["publish", str(tmp_path / "nope"), "--config", str(config_file())])
+
+    assert code == EXIT_USAGE
+    assert "稿件目录不存在" in capsys.readouterr().err
+
+
+def test_publish_real_load_draft_error_is_a_usage_error(
+    monkeypatch, capsys, config_file, tmp_path
+):
+    """真 load_draft 跑一遍：meta.json 缺字段属于「稿件有问题」，不是环境问题。"""
+    _stub_publish(monkeypatch)
+    root = tmp_path / "d"
+    root.mkdir()
+    (root / "meta.json").write_text(json.dumps({"slug": "x"}), encoding="utf-8")
+    (root / "csdn.md").write_text("正文", encoding="utf-8")
+
+    code = main(["publish", str(root), "--config", str(config_file())])
+
+    assert code == EXIT_USAGE
+    assert "meta.json" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "error, expected",
+    [
+        (AuthRequired("csdn", AuthState.EXPIRED, "被踢回登录页"), EXIT_AUTH),
+        (BrowserUnavailable("没装 playwright"), EXIT_ENV),
+        (GateClosed("gate=dry_run"), EXIT_CONFIG_ERROR),
+        (SubmitBlocked("提交前复核失败"), EXIT_FAILED),
+    ],
+    ids=["auth", "browser", "gate", "blocked"],
+)
+def test_publish_maps_each_failure_to_its_own_exit_code(
+    monkeypatch, capsys, config_file, draft_dir, error, expected
+):
+    """退出码得能指向正确的修复动作：去扫码 / 装浏览器 / 改配置 / 看后台。"""
+    _stub_publish(monkeypatch, error=error)
+
+    assert main(["publish", str(draft_dir), "--config", str(config_file())]) == expected
+    assert capsys.readouterr().err

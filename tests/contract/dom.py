@@ -84,3 +84,13 @@ class StaticPage:
 
     def set_input_files(self, selector: str, path) -> None:
         raise StaticPageError("静态快照不能上传文件。")
+
+    # --- 只读一件：回读确认（T-09）用的读面 ---
+
+    def input_value(self, selector: str) -> str:
+        """读 `value` 属性。快照里的输入框是死的，读它不会改变任何状态，
+        所以这一件可以真实现——verify 的标题比对就能在静态页上跑。"""
+        element = self.query_selector(selector)
+        if element is None:
+            raise StaticPageError(f"静态快照里没有命中：{selector}")
+        return element.get_attribute("value") or ""

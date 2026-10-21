@@ -6,10 +6,12 @@
 - `geopublish login <platform>`：扫码登录，登录态写进持久 profile（T-06）
 - `geopublish snapshot <url> <name>`：把页面存成 fixture（T-04）
 - `geopublish incident replay <dir>`：回放现场包（T-04，repro.sh 调的就是它）
+- `geopublish publish <draft_dir> --mode draft`：把稿件投进草稿箱（T-09）
 
-退出码约定（后续 publish 复用）：
+退出码约定：
   0 成功 / 1 用法错误 / 2 需重新授权 / 3 配置错误 /
-  4 现场已复现（replay 的预期结果）/ 5 环境不可用（缺浏览器驱动、抓不到内容）
+  4 现场已复现（replay 的预期结果）/ 5 环境不可用（缺浏览器驱动、抓不到内容）/
+  6 发布未确认成功（verify 没过、提交前复核被拦）
 
 「1 用法错误」包括**没给子命令**：cron 里跑 `geopublish` 忘写子命令如果退 0，
 监控会当成「今天跑过了」，第二天才发现一篇都没发。argparse 默认对解析失败退 2，
@@ -17,6 +19,9 @@
 
 4 和 5 是刻意分开的：repro.sh 拿 4 判断「复现成功」，而 5 表示这台机器压根
 没装好浏览器 —— 那时候「复现失败」是环境问题，不能当成「这个 bug 不复现」。
+
+6 与 5 也是刻意分开的：5 是「这台机器不行，修机器」，6 是「这次投递没被确认，
+去平台后台看一眼」。混在一起的话，cron 的告警会指向错误的修复动作。
 """
 
 from __future__ import annotations
@@ -27,12 +32,15 @@ from pathlib import Path
 from typing import Sequence
 
 from . import __version__
+from .adapters.base import CoverError, InjectFailed, MetaError, SubmitBlocked
+from .adapters.csdn.flow import EditorReadError
 from .core.config import DEFAULT_CONFIG_PATH, Config, ConfigError, load_config
 from .core.incident import BundleNotFound, IncidentError, describe_failure, load
 from .core.session import (
     DEFAULT_PROFILE_ROOT,
     AuthRequired,
     BrowserUnavailable,
+    PersistentBrowser,
     SessionConfig,
     SessionError,
     login,
@@ -46,6 +54,7 @@ from .core.snapshot import (
     SnapshotError,
     capture,
 )
+from .publish import DraftLoadError, GateClosed, load_draft, publish_draft
 
 EXIT_OK = 0
 EXIT_USAGE = 1
@@ -53,6 +62,7 @@ EXIT_AUTH = 2
 EXIT_CONFIG_ERROR = 3
 EXIT_REPRODUCED = 4
 EXIT_ENV = 5
+EXIT_FAILED = 6
 
 DEFAULT_SNAPSHOT_DIR = Path("data/snapshots")
 
@@ -117,6 +127,33 @@ def build_parser() -> argparse.ArgumentParser:
     replay_cmd = incident_sub.add_parser("replay", help="回放一个现场包（预期退出 4）")
     replay_cmd.add_argument("path", help="现场包目录")
 
+    publish_cmd = sub.add_parser("publish", help="把一篇稿件投到平台（T-09：草稿投递）")
+    publish_cmd.add_argument(
+        "draft_dir", help="稿件目录（含 meta.json，正文为 <platform>.md / body.md / draft.md）"
+    )
+    publish_cmd.add_argument(
+        "--mode",
+        default="draft",
+        choices=("draft", "publish"),
+        help="draft=只存草稿（默认）；publish=真实发布，由 T-10 提供，现在会明确拒绝",
+    )
+    publish_cmd.add_argument("--platform", default="csdn", help="平台名（默认 csdn）")
+    publish_cmd.add_argument(
+        "--config",
+        default=str(DEFAULT_CONFIG_PATH),
+        help=f"配置文件路径（默认 {DEFAULT_CONFIG_PATH}）",
+    )
+    publish_cmd.add_argument(
+        "--channel",
+        default="chrome",
+        help="浏览器来源：chrome=复用系统 Chrome（默认）；bundled=用 playwright 自带 chromium",
+    )
+    publish_cmd.add_argument(
+        "--profile-root",
+        default=None,
+        help=f"profile 根目录（默认 {DEFAULT_PROFILE_ROOT}）",
+    )
+
     return parser
 
 
@@ -132,6 +169,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _snapshot(args)
     if args.command == "incident":
         return _incident(args)
+    if args.command == "publish":
+        return _publish(args)
 
     # 没给子命令不是「打印帮助然后成功」，是用法错了。
     # 退 0 会让 cron 以为今天跑过了 —— 静默成功比报错危险得多。
@@ -177,6 +216,87 @@ def _adapter_for(platform: str) -> object:
     if key not in registry:
         raise SessionError(f"未知平台：{platform}（可用：{', '.join(sorted(registry))}）")
     return registry[key]()
+
+
+def _publish(args: argparse.Namespace) -> int:
+    """一条命令把稿件投进草稿箱（T-09 P0 里程碑）。
+
+    失败全部转成退出码，不给 cron 丢 traceback。这里**没有重试**：
+    提交前复核被拦、verify 没过，重试只会多留一篇草稿（幂等是 T-11 的事）。
+    """
+    if args.mode != "draft":
+        # 真实发布的按钮不是「多一个 if」就能开的：它还要回执、幂等、失败分类。
+        # 所以在参数层就拒绝，并且明说「什么都没点」——否则人会以为已经发出去了。
+        print(
+            "发布模式（--mode publish）属于 T-10：本次未连接平台，也没有点任何按钮",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+
+    try:
+        cfg = load_config(Path(args.config))
+        platform_cfg = cfg.platform(args.platform)
+    except ConfigError as exc:
+        print(f"配置错误：{exc}", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
+    except KeyError as exc:
+        # cfg.platform 用 KeyError 表达「配置里没这个平台」：是配置问题，不是用法问题
+        print(f"配置错误：{exc}", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
+
+    try:
+        adapter = _adapter_for(args.platform)
+        loaded = load_draft(Path(args.draft_dir), platform=platform_cfg.key)
+    except (DraftLoadError, SessionError) as exc:
+        print(f"用法错误：{exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    channel = None if str(args.channel).strip().lower() in {"bundled", "none", ""} else args.channel
+    browser = PersistentBrowser(
+        SessionConfig(
+            profile_root=Path(args.profile_root) if args.profile_root else DEFAULT_PROFILE_ROOT,
+            channel=channel,
+        )
+    )
+
+    try:
+        outcome = publish_draft(
+            adapter,
+            loaded,
+            platform_cfg,
+            gate=cfg.gate,
+            open_page=lambda: browser.open(adapter.name),
+            mode=args.mode,
+            data_dir=cfg.data_dir,
+            screenshot=lambda page, path: page.screenshot(path=str(path)),
+        )
+    except AuthRequired as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_AUTH
+    except BrowserUnavailable as exc:
+        print(f"环境不可用：{exc}", file=sys.stderr)
+        return EXIT_ENV
+    except GateClosed as exc:
+        print(f"闸门关闭：{exc}", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
+    except (InjectFailed, MetaError, CoverError, SubmitBlocked, EditorReadError) as exc:
+        # T-12 会把这张表搬进 core/errors.py；在那之前，能到这里就是这一组。
+        print(f"发布失败：{exc}", file=sys.stderr)
+        return EXIT_FAILED
+
+    if not outcome.ok:
+        print(f"未确认成功：{outcome.reason}", file=sys.stderr)
+        if outcome.url:
+            print(f"  当前页面：{outcome.url}", file=sys.stderr)
+        return EXIT_FAILED
+
+    print(f"草稿已保存：{loaded.draft.meta.title}")
+    print(f"  article_id = {outcome.article_id}")
+    if outcome.url:
+        print(f"  url        = {outcome.url}")
+    if outcome.run_dir:
+        print(f"  截图       = {outcome.run_dir / 'draft.png'}")
+    return EXIT_OK
 
 
 def _snapshot(args: argparse.Namespace) -> int:

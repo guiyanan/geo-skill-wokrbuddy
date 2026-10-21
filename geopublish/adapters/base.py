@@ -14,9 +14,9 @@
    「登录过期」和「遇到验证码」需要不同的处置（前者让人扫码，后者必须停手），
    一个 bool 表达不了，而回到裸字符串就是回到字符串比较。
 
-七方法的分工见架构 §3.2。截至 T-08 已落地 5 个（check_auth / open_editor /
-fill_content / fill_meta / upload_cover）；`submit` / `verify` 仍用
-`NotImplementedError` 明确标注归属 T-09——**绝不写 `pass`**。
+七方法的分工见架构 §3.2。截至 T-09 已落地 6 个（check_auth / open_editor /
+fill_content / fill_meta / upload_cover / submit(draft) / verify）；
+`submit(mode=publish)` 仍用 `NotImplementedError` 明确标注归属 T-10——**绝不写 `pass`**。
 """
 
 from __future__ import annotations
@@ -46,6 +46,8 @@ __all__ = [
     "REQUIRED_SELECTORS",
     "SelectorError",
     "Selectors",
+    "SubmitBlocked",
+    "SubmitMode",
     "SubmitResult",
     "SubmitState",
     "VerifyResult",
@@ -63,7 +65,7 @@ REQUIRED_SELECTORS: Mapping[str, tuple[str, ...]] = {
     "editor": ("title", "content", "content_editable", "publish_button", "save_draft_button"),
     "meta": ("category", "tags", "summary", "original_declaration", "ai_declaration"),
     "cover": ("upload_input", "thumbnail"),
-    "verify": ("article_id", "success_marker"),
+    "verify": ("article_id", "success_marker", "draft_list_item"),
 }
 
 ADAPTER_METHODS: tuple[str, ...] = (
@@ -113,8 +115,22 @@ class SubmitState(str, Enum):
     UNKNOWN = "unknown"
 
 
+class SubmitMode(str, Enum):
+    """提交方式：存草稿 vs 真实发布。
+
+    为什么不用 `submit(page, draft=True)` 这种 bool：调用点写成 `submit(page, False)`
+    没人看得懂，而这个参数决定的后果是「这篇文章会不会当场公开」。语义写进类型里，
+    日志与现场包也能直接读出当时要的是哪一种。
+    """
+
+    DRAFT = "draft"
+    PUBLISH = "publish"
+
+
 @dataclass(frozen=True, slots=True)
 class SubmitResult:
+    """点击之后的**即时观察**，不代表成功——成功与否只由 verify 判定（R8）。"""
+
     state: SubmitState
     reason: str = ""
 
@@ -183,6 +199,16 @@ class CoverError(RuntimeError):
     """
 
 
+class SubmitBlocked(RuntimeError):
+    """提交前的复核没通过，因此**一个按钮都没点**。
+
+    R7 红线：未验证正文前不得点发布。编辑器里的字数和注入时不符、或者压根没有
+    注入记录，都说明页面上此刻的内容不是我们要发的那篇 —— 这时候点下去，
+    发出去的是残稿。「拦在按钮之前」是这条异常唯一的价值，所以它不是普通的失败：
+    失败可以重试，拦下来是**保护**。
+    """
+
+
 # --------------------------------------------------------------- 页面抽象
 
 @runtime_checkable
@@ -236,6 +262,16 @@ class Page(Protocol):
 
     def set_input_files(self, selector: str, path: Path) -> None:
         """给 file input 塞本地文件（封面上传）。路径必须是绝对路径。"""
+        ...
+
+    # --- 读一件：回读确认（T-09）的最小读面。
+
+    def input_value(self, selector: str) -> str:
+        """读输入框当前值。
+
+        verify 要靠它拿到「编辑器里此刻的标题」再去草稿列表比对：
+        标题只存在于这次会话里，平台不会把它回填到成功页上。
+        """
         ...
 
 
@@ -358,6 +394,9 @@ class AdapterMeta:
     login_url: str = ""
     # 封面上传规格（宽/高/大小上限）。None = 平台未提供规格，upload_cover 会拒绝上传。
     cover: CoverSpec | None = None
+    # 草稿列表页。verify 在「提交后 URL 没变、DOM 里也没有 article_id」时退到这一页
+    # 按标题找（UT-09-02）。空 = 该平台没有这条兜底，verify 会明确报错而不是瞎猜。
+    draft_list_url: str = ""
 
     @classmethod
     def load(cls, path: str | Path) -> AdapterMeta:
@@ -384,6 +423,15 @@ class AdapterMeta:
             # 写错协议（passport.csdn.net/login 少了 https://）不报出来的话，
             # 登录会打到一条相对路径上，人看到的是一个 404 空白页
             raise SelectorError(f"login_url 必须是 http(s) 地址（{path}）")
+
+        draft_list_url = data.get("draft_list_url", "")
+        if not isinstance(draft_list_url, str):
+            raise SelectorError(f"draft_list_url 必须是字符串（{path}）")
+        draft_list_url = draft_list_url.strip()
+        if draft_list_url and not draft_list_url.startswith(("https://", "http://")):
+            # 兜底页地址写错的话，verify 会 goto 到一条相对路径上、拿到 404，
+            # 然后报「草稿列表里没找到」—— 一个地址笔误被误诊成「稿子没发出去」
+            raise SelectorError(f"draft_list_url 必须是 http(s) 地址（{path}）")
 
         domains = data.get("domains")
         if (
@@ -412,6 +460,7 @@ class AdapterMeta:
             editor_url=editor_url.strip(),
             login_url=login_url,
             cover=cover,
+            draft_list_url=draft_list_url,
         )
 
 
@@ -442,11 +491,15 @@ class PlatformAdapter(Protocol):
     def upload_cover(self, page: Page, path: Path) -> None:
         """上传封面，等缩略图出现。"""
 
-    def submit(self, page: Page) -> SubmitResult:
-        """点发布/存草稿。"""
+    def submit(self, page: Page, *, mode: SubmitMode | str = SubmitMode.DRAFT) -> SubmitResult:
+        """点发布/存草稿。`mode` 决定点哪个按钮——存草稿绝不碰发布按钮（UT-09-04）。"""
 
-    def verify(self, page: Page) -> VerifyResult:
-        """回读确认：拿到真实 URL 和文章 id。没验证过的不算成功。"""
+    def verify(self, page: Page, *, mode: SubmitMode | str = SubmitMode.DRAFT) -> VerifyResult:
+        """回读确认：拿到真实 URL 和文章 id。没验证过的不算成功。
+
+        `mode` 只影响兜底路径：draft 模式允许去草稿列表页按标题核对（UT-09-02），
+        发布模式不走那条 —— 已发布的文章本来就不在草稿箱里。
+        """
 
 
 def assert_adapter(candidate: Any) -> None:

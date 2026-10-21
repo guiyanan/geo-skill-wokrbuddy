@@ -124,6 +124,24 @@ def test_verify_selectors_hit_on_the_success_page(fixture_dom):
     assert page.query_selector(adapter.selectors("verify", "success_marker")).text_content().strip()
 
 
+def test_draft_list_item_hits_on_the_draft_list_page(fixture_dom):
+    """存草稿后 URL 不变时的唯一兜底：列表页每行都得有标题和 href。
+
+    href 是 article_id 的来源，所以不能只断言「命中」，还要断言「带得出链接」——
+    否则 verify 会走到「标题对上了但解析不出 id」那条判失败的岔路上。
+    """
+    from dom import StaticPage
+
+    adapter = CsdnAdapter()
+    page = StaticPage(fixture_dom("csdn", "drafts"))
+
+    hits = page.query_selector_all(adapter.selectors("verify", "draft_list_item"))
+    assert len(hits) == 2
+    for hit in hits:
+        assert hit.text_content().strip(), "每行必须能读到标题"
+        assert (hit.get_attribute("href") or "").startswith("//"), "每行必须带可解析的 href"
+
+
 # ------------------------------------------------ 结构校验
 
 def test_contract_is_satisfied_by_the_shipped_file():
