@@ -18,6 +18,9 @@ dev = [
     "pytest-cov>=5.0",
     "pytest-repeat>=0.9",
     "playwright>=1.44",
+    # tests/contract/dom.py 用 BeautifulSoup 回放 DOM 快照，
+    # test_selectors.py 用 soupsieve 做 CSS 语法校验（随 bs4 安装）
+    "beautifulsoup4>=4.12",
 ]
 
 [tool.setuptools.packages.find]
