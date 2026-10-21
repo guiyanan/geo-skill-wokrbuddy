@@ -168,7 +168,7 @@ geo-publish/
 - [x] T-05  adapter 契约 + fixture 回放
 - [x] T-06  登录态管理
 - [x] T-07  正文注入（三级降级）
-- [ ] T-08  元信息与封面
+- [x] T-08  元信息与封面
 - [ ] T-09  草稿投递 + verify          ← P0 里程碑
 ```
 
@@ -609,6 +609,24 @@ UT-03-07/08 确保 R4 五项**全部**与 `rejected` 联动，而不只是前三
 | UT-08-05 | 封面尺寸不符平台要求时**在本地就拒绝**，不上传后才失败 |
 
 **DoD**：草稿里标题/分类/标签/封面全部正确
+
+**交付记录（2026-10-21 完成）**
+| 项 | 结果 |
+|---|---|
+| 文件 | `adapters/csdn/flow.py::fill_meta/upload_cover`（flow 195 语句/60 分支 100%）、`adapters/base.py` 增 `MetaError`/`CoverError`/`CoverSpec` + `AdapterMeta.cover` + `Page` 补 `press`/`set_input_files`、`adapters/imageinfo.py`（49 语句/22 分支 100%）、`csdn/meta.json` 增 cover 规格、`tests/contract/dom.py` 同步写口形状 |
+| 用例 | UT-08-01~05 全绿 + 14 条对抗用例（控件不存在/可选项空列表/上传框拒收/封面规格缺失/PNG·JPEG 各类损坏头）；unit+contract 全绿，全包 1582 语句/392 分支 **100%** |
+| 上限来源 | 标题/标签上限只认 `PlatformConfig`（fill_meta 第三参必填，`None` 直接 TypeError）；封面尺寸只认 `meta.json`（PRD：尺寸从平台读取，不得硬编码）——两个方向相反，理由都写进了 JSON 注释 |
+| 失败语义 | `MetaError`（分类不在可选项→**列出全部可选项**；AI 参与度为空→第二道防线）；`CoverError`（尺寸/大小/文件/格式**全部在 set_input_files 之前**拒绝） |
+
+**三处设计取舍**
+1. **分类不硬编码清单**：先从页面读真实可选项，对不上就抛错并把可选项全列出来——平台改栏目是常态，硬编码必死；报错带清单，人工一眼可改。
+2. **封面三道预检全部在本地完成**：文件在不在 → 尺寸对不对（imageinfo 只读头，零依赖，不引 PIL）→ 大小超没超。传上去才发现不对，后台就多一张要人工清理的垃圾图。
+3. **fill_meta 不点原创声明**：那是账号级风险决策，交给人工或后续工单，不在这层偷偷勾；AI 标注按 `meta.ai_involvement` 照实填（R4 第五条）。
+
+**已知失败模式**
+- **受控组件只改 value 不派发事件** = 看着填好了、提交时是空的 → `_SET_VALUE_JS` 固定派发 input+change。
+- **Python bool 是 int 子类**：`cover.width: true` 这类 JSON 写错会通过 isinstance 检查 → 显式排除 bool。
+- **meta.json cover 为初始值 1140×640**：T-09 首发时须对照真实后台上传框校准（已写进 _note）。
 
 ---
 
