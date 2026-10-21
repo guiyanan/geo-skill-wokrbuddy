@@ -112,7 +112,6 @@ def test_protocol_is_runtime_checkable():
 @pytest.mark.parametrize(
     "method, ticket, args",
     [
-        ("fill_content", "T-07", (object(), None)),
         ("fill_meta", "T-08", (object(), None)),
         ("upload_cover", "T-08", (object(), Path("cover.png"))),
         ("submit", "T-09", (object(),)),
