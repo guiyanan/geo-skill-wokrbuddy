@@ -345,3 +345,85 @@ def test_receipt_only_exists_for_published():
         )
 
     assert "published" in str(exc.value)
+
+
+# ------------------------------------------------- 对抗探测补漏（全覆盖审计）
+
+def test_meta_from_json_rejects_string_tags():
+    """`"tags": "人工智能"` 会被 tuple() 拆成逐字符 —— 字符串不是数组，必须当场报错。"""
+    from geopublish.core.models import ModelError
+
+    with pytest.raises(ModelError) as exc:
+        Meta.from_json({"slug": "x-y", "title": "t", "tags": "人工智能"})
+
+    assert "tags" in str(exc.value)
+
+
+def test_meta_from_json_rejects_non_string_tag_entries():
+    from geopublish.core.models import ModelError
+
+    with pytest.raises(ModelError) as exc:
+        Meta.from_json({"slug": "x-y", "title": "t", "tags": ["ok", 3]})
+
+    assert "tags" in str(exc.value)
+
+
+def test_meta_from_json_rejects_string_platforms():
+    from geopublish.core.models import ModelError
+
+    with pytest.raises(ModelError) as exc:
+        Meta.from_json({"slug": "x-y", "title": "t", "platforms": "csdn"})
+
+    assert "platforms" in str(exc.value)
+
+
+def test_from_row_bad_ts_raises_incomplete_not_raw_valueerror():
+    """损坏日志行的 ts 必须映射成 IncompleteLogEntry ——
+    裸 ValueError 会绕过 replay/load 的错误处理链，直接甩 traceback。"""
+    row = {
+        "ts": "not-a-date",
+        "platform": "csdn",
+        "account": "a",
+        "slug": "s",
+        "idem_key": "k",
+        "status": "pending",
+        "url": "",
+        "article_id": "",
+        "screenshot": "",
+        "indexed_at": "",
+        "note": "",
+    }
+
+    with pytest.raises(IncompleteLogEntry) as exc:
+        LogEntry.from_row(row)
+
+    assert "ts" in str(exc.value)
+
+
+def test_from_row_bad_indexed_at_raises_incomplete():
+    row = {
+        "ts": "2026-10-21T10:00:00+08:00",
+        "platform": "csdn",
+        "account": "a",
+        "slug": "s",
+        "idem_key": "k",
+        "status": "pending",
+        "url": "",
+        "article_id": "",
+        "screenshot": "",
+        "indexed_at": "garbage",
+        "note": "",
+    }
+
+    with pytest.raises(IncompleteLogEntry):
+        LogEntry.from_row(row)
+
+
+def test_receipt_from_json_missing_required_fields_names_them():
+    """缺 url 不该是 KeyError：receipt 回读的报错要能被日报/CLI 用人话接住。"""
+    from geopublish.core.models import ModelError
+
+    with pytest.raises(ModelError) as exc:
+        Receipt.from_json({"article_id": "1", "published_at": "2026-10-21T10:00:00+08:00"})
+
+    assert "url" in str(exc.value)

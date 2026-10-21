@@ -110,7 +110,16 @@ class Meta:
         kwargs = dict(data)
         for key in ("tags", "platforms"):
             if key in kwargs:
-                kwargs[key] = tuple(kwargs[key])
+                value = kwargs[key]
+                if (
+                    isinstance(value, str)
+                    or not isinstance(value, (list, tuple))
+                    or not all(isinstance(item, str) for item in value)
+                ):
+                    # 字符串会被 tuple() 拆成逐字符：「人工智能」→ ('人','工','智','能')。
+                    # JSON 里这俩字段只该是字符串数组。
+                    raise ModelError(f"meta.json 的 {key} 必须是字符串数组，收到 {value!r}")
+                kwargs[key] = tuple(value)
         return cls(**kwargs)
 
 
@@ -174,6 +183,11 @@ class Receipt:
 
     @classmethod
     def from_json(cls, data: Mapping[str, Any]) -> Receipt:
+        missing = [k for k in ("url", "article_id", "published_at") if k not in data]
+        if missing:
+            # 缺字段给 KeyError 的话，日报/CLI 接到的是 'url' 这种内部细节，
+            # 看不出「回执文件不完整」这件事
+            raise ModelError(f"receipt.json 缺必填字段：{', '.join(missing)}")
         return cls(
             url=data["url"],
             article_id=data["article_id"],
@@ -251,8 +265,19 @@ class LogEntry:
         except ValueError as exc:
             raise IncompleteLogEntry(f"status 值非法：{row['status']!r}") from exc
 
+        # 时间解析错误同样属于「这行没法用」—— 不能让裸 ValueError 绕过
+        # replay/load 的错误链（CLI 只接 IncompleteLogEntry/ModelError）。
+        try:
+            ts = datetime.fromisoformat(raw_ts)
+        except ValueError as exc:
+            raise IncompleteLogEntry(f"ts 不是合法时间：{raw_ts!r}") from exc
+        try:
+            indexed_at = datetime.fromisoformat(indexed) if indexed else None
+        except ValueError as exc:
+            raise IncompleteLogEntry(f"indexed_at 不是合法时间：{indexed!r}") from exc
+
         return cls(
-            ts=datetime.fromisoformat(raw_ts),
+            ts=ts,
             platform=row["platform"],
             account=row["account"],
             slug=row["slug"],
@@ -261,6 +286,6 @@ class LogEntry:
             url=row.get("url", ""),
             article_id=row.get("article_id", ""),
             screenshot=row.get("screenshot", ""),
-            indexed_at=datetime.fromisoformat(indexed) if indexed else None,
+            indexed_at=indexed_at,
             note=row.get("note", ""),
         )
