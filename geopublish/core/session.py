@@ -134,12 +134,14 @@ def ensure_profile_dir(path: str | Path) -> Path:
         # 根目录自己是自己的父目录。放过去的话下一个动作就是 chmod / 成 700。
         raise SessionError(f"不能把根目录当 profile 目录：{target}")
 
+    if target.exists() and not target.is_dir():
+        # 先问再建，不靠异常类：macOS 的 mkdir 撞到同名文件时，
+        # 异常类在 FileExistsError / PermissionError 之间漂移（errno 甚至还是 EEXIST），
+        # 用 except 归类会写出「在 A 路径绿、B 路径红」的代码。
+        raise SessionError(f"profile 路径被一个文件占住了，不是目录：{target}")
+
     try:
         target.mkdir(parents=True, exist_ok=True, mode=PROFILE_MODE)
-    except FileExistsError as exc:
-        # mkdir 撞到同名文件时 Python 报的是 EEXIST/PermissionError，读起来像权限问题。
-        # 实际原因通常是「上次登录把 profile 路径写成了一个文件名」，得说清楚。
-        raise SessionError(f"profile 路径被一个文件占住了，不是目录：{target}") from exc
     except OSError as exc:
         raise SessionError(f"profile 目录建不出来：{target}（{exc}）") from exc
 
