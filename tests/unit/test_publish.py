@@ -37,6 +37,7 @@ class RecordingAdapter:
     """记录调用顺序的假 adapter。七个动作一个不少，谁跳过就少一个字符串。"""
 
     name = "fake"
+    editor_url = "https://mp.csdn.net/mp_blog/creation/editor"
 
     def __init__(
         self,
@@ -79,13 +80,25 @@ class RecordingAdapter:
         return VerifyResult(ok=False, url="https://mp.csdn.net/x", reason="草稿列表页没找到")
 
 
-def _opener(log: list[str]):
+class StubPage:
+    """只记录导航的假会话页：发布编排层自己只做 goto，剩下的动作全在 adapter 上。"""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def goto(self, url: str) -> None:
+        self.calls.append(("goto", url))
+
+
+def _opener(log: list[str], page: StubPage | None = None):
+    stub = page or StubPage()
+
     @contextmanager
     def open_page():
         log.append("open_page")
-        yield object()
+        yield stub
 
-    return open_page
+    return open_page, stub
 
 
 def _loaded(tmp_path: Path, *, cover: bool = False) -> LoadedDraft:
@@ -110,14 +123,16 @@ def test_publish_runs_the_seven_steps_in_order(tmp_path):
     adapter = RecordingAdapter()
     opened: list[str] = []
     loaded = _loaded(tmp_path, cover=True)
+    open_page, page = _opener(opened)
 
-    outcome = publish_draft(
-        adapter, loaded, _cfg(), gate=Gate.DRAFT, open_page=_opener(opened)
-    )
+    outcome = publish_draft(adapter, loaded, _cfg(), gate=Gate.DRAFT, open_page=open_page)
 
     assert outcome.ok is True
     assert outcome.article_id == "1"
     assert opened == ["open_page"]
+    assert page.calls == [("goto", adapter.editor_url)], (
+        "探活前必须先导航到编辑器页：空白页上 check_auth 只能判出 unknown"
+    )
     assert adapter.calls == [
         "check_auth",
         "open_editor",
@@ -134,7 +149,7 @@ def test_cover_step_is_skipped_when_the_draft_has_none(tmp_path):
     loaded = _loaded(tmp_path, cover=False)
     assert loaded.cover is None
 
-    publish_draft(adapter, loaded, _cfg(), gate=Gate.DRAFT, open_page=_opener([]))
+    publish_draft(adapter, loaded, _cfg(), gate=Gate.DRAFT, open_page=_opener([])[0])
 
     assert not [c for c in adapter.calls if isinstance(c, tuple) and c[0] == "upload_cover"]
 
@@ -142,7 +157,7 @@ def test_cover_step_is_skipped_when_the_draft_has_none(tmp_path):
 def test_default_mode_is_draft(tmp_path):
     """不传 mode 必须是 draft：默认值决定的是「会不会当场公开」。"""
     adapter = RecordingAdapter()
-    publish_draft(adapter, _loaded(tmp_path), _cfg(), gate=Gate.DRAFT, open_page=_opener([]))
+    publish_draft(adapter, _loaded(tmp_path), _cfg(), gate=Gate.DRAFT, open_page=_opener([])[0])
 
     assert ("submit", "draft") in adapter.calls
     assert ("verify", "draft") in adapter.calls
@@ -160,7 +175,7 @@ def test_verify_failure_is_reported_and_no_screenshot_is_taken(tmp_path):
         loaded,
         _cfg(),
         gate=Gate.DRAFT,
-        open_page=_opener([]),
+        open_page=_opener([])[0],
         data_dir=tmp_path / "data",
         screenshot=lambda page, path: shots.append(path),
     )
@@ -175,18 +190,20 @@ def test_submit_exception_propagates_and_verify_never_runs(tmp_path):
     adapter = RecordingAdapter(submit_error=RuntimeError("按钮点不动"))
 
     with pytest.raises(RuntimeError):
-        publish_draft(adapter, _loaded(tmp_path), _cfg(), gate=Gate.DRAFT, open_page=_opener([]))
+        publish_draft(adapter, _loaded(tmp_path), _cfg(), gate=Gate.DRAFT, open_page=_opener([])[0])
 
     assert ("verify", "draft") not in adapter.calls
 
 
 def test_auth_expired_stops_before_any_editor_action(tmp_path):
-    """探活失败就停：不导航、不注入，也不重试（R6）。"""
+    """探活失败就停：不导航第二次、不注入，也不重试（R6）。"""
     adapter = RecordingAdapter(auth=AuthState.EXPIRED)
+    open_page, page = _opener([])
 
     with pytest.raises(AuthRequired):
-        publish_draft(adapter, _loaded(tmp_path), _cfg(), gate=Gate.DRAFT, open_page=_opener([]))
+        publish_draft(adapter, _loaded(tmp_path), _cfg(), gate=Gate.DRAFT, open_page=open_page)
 
+    assert page.calls == [("goto", adapter.editor_url)], "探活那次导航是唯一允许的"
     assert adapter.calls == ["check_auth"]
 
 
@@ -204,7 +221,7 @@ def test_screenshot_lands_in_a_run_dir_named_by_the_injected_clock(tmp_path):
         _loaded(tmp_path),
         _cfg(),
         gate=Gate.DRAFT,
-        open_page=_opener([]),
+        open_page=_opener([])[0],
         data_dir=tmp_path / "data",
         clock=FakeClock("2026-10-21T15:20:30+08:00"),
         screenshot=_shot,
@@ -229,7 +246,7 @@ def test_screenshot_failure_is_a_warning_not_a_publish_failure(tmp_path, caplog)
             _loaded(tmp_path),
             _cfg(),
             gate=Gate.DRAFT,
-            open_page=_opener([]),
+            open_page=_opener([])[0],
             data_dir=tmp_path / "data",
             screenshot=_boom,
         )
@@ -247,7 +264,7 @@ def test_dry_run_gate_never_even_opens_the_browser(tmp_path):
     with pytest.raises(GateClosed) as exc:
         publish_draft(
             RecordingAdapter(), _loaded(tmp_path), _cfg(), gate=Gate.DRY_RUN,
-            open_page=_opener(opened),
+            open_page=_opener(opened)[0],
         )
 
     assert "dry_run" in str(exc.value)
@@ -258,7 +275,7 @@ def test_disabled_platform_is_refused(tmp_path):
     with pytest.raises(GateClosed) as exc:
         publish_draft(
             RecordingAdapter(), _loaded(tmp_path), _cfg(enabled=False),
-            gate=Gate.DRAFT, open_page=_opener([]),
+            gate=Gate.DRAFT, open_page=_opener([])[0],
         )
     assert "enabled=false" in str(exc.value)
 
@@ -267,7 +284,7 @@ def test_publish_mode_needs_the_publish_gate(tmp_path):
     with pytest.raises(GateClosed) as exc:
         publish_draft(
             RecordingAdapter(), _loaded(tmp_path), _cfg(), gate=Gate.DRAFT,
-            open_page=_opener([]), mode=SubmitMode.PUBLISH,
+            open_page=_opener([])[0], mode=SubmitMode.PUBLISH,
         )
     assert "只允许存草稿" in str(exc.value)
 
@@ -277,7 +294,7 @@ def test_publish_mode_passes_the_gate_and_travels_down_as_publish(tmp_path):
 
     publish_draft(
         adapter, _loaded(tmp_path), _cfg(), gate=Gate.PUBLISH,
-        open_page=_opener([]), mode="publish",
+        open_page=_opener([])[0], mode="publish",
     )
 
     assert ("submit", "publish") in adapter.calls

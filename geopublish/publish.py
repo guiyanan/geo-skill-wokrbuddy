@@ -197,7 +197,10 @@ def publish_draft(
     draft = loaded.draft
 
     with open_page() as page:
-        # 探活一次即停：不通过就抛 AuthRequired，后面的动作一个都不做（R6）
+        # 新开的会话停在空白页上，check_auth 在空白页只能判出 unknown。
+        # 先导航到编辑器页再探活：已登录 → 看到头像/编辑器；被踢 → 平台自己跳登录页，
+        # 两种情况都给出权威信号。探活一次即停，不通过就抛 AuthRequired（R6）。
+        page.goto(adapter.editor_url)
         check_login(adapter, page)
         adapter.open_editor(page, draft)
         adapter.fill_content(page, draft)
