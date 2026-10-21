@@ -1,8 +1,9 @@
 """CSDN 适配器。
 
-已实现：`check_auth` / `open_editor`（T-05）、`fill_content`（T-07 三级降级注入）。
+已实现：`check_auth` / `open_editor`（T-05）、`fill_content`（T-07 三级降级注入）、
+`fill_meta` / `upload_cover`（T-08）。
 
-其余四个方法**故意**抛 `NotImplementedError` 并写明归属工单：
+其余两个方法**故意**抛 `NotImplementedError` 并写明归属工单：
 写 `pass` 是最危险的做法——流程会一路绿到「发布成功」，然后线上什么都没有。
 """
 
@@ -18,14 +19,18 @@ from ..base import (
     AdapterMeta,
     AuthResult,
     AuthState,
+    CoverError,
     InjectAttempt,
     InjectFailed,
+    MetaError,
     Page,
     Selectors,
     SubmitResult,
     VerifyResult,
 )
+from ..imageinfo import ImageInfoError, image_size
 from ...core.clock import Clock, SystemClock
+from ...core.config import PlatformConfig
 from ...core.models import Draft
 
 __all__ = [
@@ -43,6 +48,8 @@ logger = logging.getLogger("geopublish.csdn")
 LENGTH_TOLERANCE = 0.02
 SEGMENT_SIZE = 500
 TYPING_DELAY_MS = 5.0
+# UT-08-04：上传后缩略图的等待上限（毫秒）。
+THUMBNAIL_TIMEOUT_MS = 10_000
 
 # 选择器一律经参数传入（[sel, text] / [sel, editableSel]），代码里不出现裸选择器——
 # .precommit/check_no_naked_selectors.py 盯着这个目录。
@@ -93,6 +100,39 @@ _CLEAR_JS = """/* op=clear */
   const ed = document.querySelector(editableSel);
   if (ed) { ed.innerText = ""; return {ok: true}; }
   return {ok: false, reason: "清场失败：容器与编辑区都未命中"};
+}
+"""
+
+# 元信息填入：直接写 value 并派发 input/change —— 这类表单受框架控制，
+# 只改 value 不派发事件，页面上看着填好了，提交时状态仍是空的。
+_SET_VALUE_JS = """/* op=setvalue */
+([sel, text]) => {
+  const el = document.querySelector(sel);
+  if (!el) return {ok: false, reason: "输入控件不存在（选择器未命中）"};
+  el.focus();
+  if (el.tagName === "SELECT") {
+    const opts = Array.from(el.options || []);
+    const hit = opts.find(o => o.value === text || (o.textContent || "").trim() === text);
+    if (!hit) return {ok: false, reason: "下拉里找不到该选项：" + text};
+    el.value = hit.value;
+  } else {
+    el.value = text;
+  }
+  el.dispatchEvent(new Event("input", {bubbles: true}));
+  el.dispatchEvent(new Event("change", {bubbles: true}));
+  return {ok: true};
+}
+"""
+
+# 分类可选项必须从页面读：平台会改栏目，硬编码一份清单等于给自己埋定时炸弹。
+_CATEGORY_OPTIONS_JS = """/* op=categories */
+(sel) => {
+  const el = document.querySelector(sel);
+  if (!el) return {ok: false, reason: "分类控件不存在（meta.category 未命中）"};
+  const list = el.options ? Array.from(el.options) : Array.from(el.querySelectorAll("option"));
+  const options = list.map(o => ({value: o.value, text: (o.textContent || "").trim()}));
+  if (!options.length) return {ok: false, reason: "分类下拉没有任何可选项"};
+  return {ok: true, options};
 }
 """
 
@@ -339,15 +379,147 @@ class CsdnAdapter:
             elapsed_ms=elapsed_ms,
         )
 
-    # ----------------------------------------------------------- 待实现
+    # ----------------------------------------------------------- T-08 元信息
 
-    def fill_meta(self, page: Page, draft: Draft | None) -> None:
-        raise NotImplementedError(
-            "fill_meta 未实现：标题/分类/标签/摘要/原创声明/AI 标注属于 T-08"
+    def fill_meta(self, page: Page, draft: Draft | None, limits: PlatformConfig) -> None:
+        """填标题/分类/标签/摘要/AI 标注。
+
+        - 标题超上限**截断并告警**（UT-08-01）：静默丢弃会发出一个读者看不懂的标题。
+        - 标签超上限按优先级（列表顺序）取前 N 个并告警（UT-08-02）。
+        - 分类先读页面可选项，对不上就 `MetaError` 列出全部可选项（UT-08-03）——
+          分类是平台会改的东西，硬编码清单必死；报错时把选项带出来，人工一眼可改。
+        - AI 参与度为空 → `MetaError`。guard（T-03）保证非空，这里是不变的第二道防线。
+        - **不点原创声明**：那是账号级风险决策，交给人工或后续工单，不在这层偷偷勾。
+        """
+        if draft is None:
+            raise TypeError("fill_meta 需要 draft（open_editor 才允许 None）")
+        if limits is None:
+            raise TypeError("fill_meta 需要 limits（PlatformConfig）：上限只认 config 一份真相")
+        meta = draft.meta
+
+        involvement = (meta.ai_involvement or "").strip()
+        if not involvement:
+            raise MetaError(
+                "AI 参与度为空：meta.ai_involvement 必须是 human/assisted/generated 之一"
+            )
+
+        title = meta.title
+        if len(title) > limits.title_max:
+            logger.warning(
+                "标题 %d 字超平台上限 %d，已截断（原题：%s…）",
+                len(title),
+                limits.title_max,
+                title[:12],
+            )
+            title = title[: limits.title_max]
+        self._set_value(page, "editor", "title", title)
+
+        if meta.category.strip():
+            self._fill_category(page, meta.category.strip())
+
+        tags_sel = self.selectors("meta", "tags")
+        tags = list(meta.tags)[: limits.tags_max]
+        if len(meta.tags) > limits.tags_max:
+            logger.warning(
+                "标签 %d 个超上限 %d，丢弃 %d 个（保留列表前 %d 个：%s）",
+                len(meta.tags),
+                limits.tags_max,
+                len(meta.tags) - limits.tags_max,
+                len(tags),
+                "、".join(tags),
+            )
+        for tag in tags:
+            page.press_sequentially(tags_sel, tag, delay_ms=TYPING_DELAY_MS)
+            page.press(tags_sel, "Enter")
+
+        if meta.summary.strip():
+            self._set_value(page, "meta", "summary", meta.summary)
+
+        self._set_value(page, "meta", "ai_declaration", involvement)
+        logger.info(
+            "fill_meta 完成：标题 %d 字、分类 %r、标签 %d 个",
+            len(title),
+            meta.category or "（未设置）",
+            len(tags),
         )
 
+    def _set_value(self, page: Page, group: str, key: str, text: str) -> None:
+        """往输入控件写值并派发事件。控件不存在 → MetaError（改版要当场暴露）。"""
+        sel = self.selectors(group, key)
+        outcome = page.evaluate(_SET_VALUE_JS, [sel, text])
+        if not isinstance(outcome, Mapping) or not outcome.get("ok"):
+            reason = outcome.get("reason") if isinstance(outcome, Mapping) else "页面脚本无返回"
+            raise MetaError(f"填不进 {group}.{key}：{reason}")
+
+    def _fill_category(self, page: Page, category: str) -> None:
+        """分类必须命中页面上的真实可选项（UT-08-03）。"""
+        sel = self.selectors("meta", "category")
+        outcome = page.evaluate(_CATEGORY_OPTIONS_JS, [sel])
+        if not isinstance(outcome, Mapping) or not outcome.get("ok"):
+            reason = outcome.get("reason") if isinstance(outcome, Mapping) else "页面脚本无返回"
+            raise MetaError(f"读不到分类可选项：{reason}")
+        options = outcome["options"]
+        if not isinstance(options, list) or not options:
+            raise MetaError("分类可选项为空：页面没渲染完或控件改版")
+        texts = [str(o.get("text") or "") for o in options if isinstance(o, Mapping)]
+        matched = [
+            o for o in options
+            if isinstance(o, Mapping)
+            and (o.get("text") == category or o.get("value") == category)
+        ]
+        if not matched:
+            raise MetaError(
+                f"分类「{category}」不在 {self.name} 的可选项里，可选项有：{'、'.join(texts)}"
+            )
+        self._set_value(page, "meta", "category", category)
+
+    # ----------------------------------------------------------- T-08 封面
+
     def upload_cover(self, page: Page, path: Path) -> None:
-        raise NotImplementedError("upload_cover 未实现：封面规格与缩略图等待属于 T-08")
+        """上传封面并等缩略图。
+
+        三道本地预检**全部发生在 set_input_files 之前**（UT-08-05）：
+        文件在不在、尺寸对不对、大小超没超。传上去才发现不对，
+        后台就多了一张要人工清理的垃圾封面。
+        规格只认 meta.json 的 cover 字段（PRD：尺寸从平台读取，不得硬编码）。
+        """
+        path = Path(path)
+        if not path.is_file():
+            raise CoverError(f"封面文件不存在：{path}")
+
+        spec = self._meta.cover
+        if spec is None:
+            raise CoverError(
+                f"meta.json 未提供 cover 规格（width/height/max_bytes）：没有规格就不上传"
+            )
+        try:
+            width, height = image_size(path)
+        except ImageInfoError as exc:
+            raise CoverError(f"封面识别失败，拒绝上传：{exc}") from exc
+        if (width, height) != (spec.width, spec.height):
+            raise CoverError(
+                f"封面尺寸 {width}x{height} 与 {self.name} 要求 {spec.width}x{spec.height} "
+                f"不符：本地拒绝，未上传"
+            )
+        size = path.stat().st_size
+        if size > spec.max_bytes:
+            raise CoverError(
+                f"封面 {size} 字节超过上限 {spec.max_bytes} 字节：本地拒绝，未上传"
+            )
+
+        try:
+            page.set_input_files(self.selectors("cover", "upload_input"), path)
+        except Exception as exc:
+            raise CoverError(f"封面塞不进上传框（cover.upload_input）：{exc}") from exc
+        try:
+            page.wait_for_selector(
+                self.selectors("cover", "thumbnail"), timeout_ms=THUMBNAIL_TIMEOUT_MS
+            )
+        except Exception as exc:
+            raise CoverError(
+                f"封面上传后缩略图 {THUMBNAIL_TIMEOUT_MS // 1000}s 内未出现：{exc}"
+            ) from exc
+        logger.info("封面已上传：%s（%dx%d，%d 字节）", path.name, width, height, size)
 
     def submit(self, page: Page) -> SubmitResult:
         raise NotImplementedError("submit 未实现：发布/存草稿与结果判定属于 T-09")

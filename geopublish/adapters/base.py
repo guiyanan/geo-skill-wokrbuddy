@@ -14,8 +14,9 @@
    「登录过期」和「遇到验证码」需要不同的处置（前者让人扫码，后者必须停手），
    一个 bool 表达不了，而回到裸字符串就是回到字符串比较。
 
-七方法的分工见架构 §3.2；本工单只落地 `check_auth` / `open_editor`，
-其余五个用 `NotImplementedError` 明确标注归属工单——**绝不写 `pass`**。
+七方法的分工见架构 §3.2。截至 T-08 已落地 5 个（check_auth / open_editor /
+fill_content / fill_meta / upload_cover）；`submit` / `verify` 仍用
+`NotImplementedError` 明确标注归属 T-09——**绝不写 `pass`**。
 """
 
 from __future__ import annotations
@@ -35,8 +36,11 @@ __all__ = [
     "AuthResult",
     "AuthState",
     "Element",
+    "CoverError",
+    "CoverSpec",
     "InjectAttempt",
     "InjectFailed",
+    "MetaError",
     "Page",
     "PlatformAdapter",
     "REQUIRED_SELECTORS",
@@ -161,6 +165,24 @@ class InjectFailed(RuntimeError):
         )
 
 
+# --------------------------------------------------------------- 元信息/封面失败
+
+class MetaError(RuntimeError):
+    """元信息填充失败：分类不在可选项里、AI 参与度为空等。
+
+    与 InjectFailed 同一哲学：**停下来，把现场说清楚**，不许带着半填的元信息
+    往下走——分类错了发出去就是发错了栏目。
+    """
+
+
+class CoverError(RuntimeError):
+    """封面上传失败：文件缺失/尺寸或大小不符/缩略图超时。
+
+    尺寸类失败必须发生在 set_input_files **之前**——传上去才发现不对，
+    后台里就多了一张要人工清理的垃圾封面。
+    """
+
+
 # --------------------------------------------------------------- 页面抽象
 
 @runtime_checkable
@@ -206,6 +228,14 @@ class Page(Protocol):
 
     def press_sequentially(self, selector: str, text: str, delay_ms: float = 0) -> None:
         """逐字符键入。只作 L3 兜底——慢，但几乎不会失败。"""
+
+    # --- 写入两件：元信息与封面（T-08）的最小写面。
+
+    def press(self, selector: str, key: str) -> None:
+        """按一次按键。标签框靠 Enter 确认，没有它标签就停在未提交状态。"""
+
+    def set_input_files(self, selector: str, path: Path) -> None:
+        """给 file input 塞本地文件（封面上传）。路径必须是绝对路径。"""
         ...
 
 
@@ -300,6 +330,20 @@ class Selectors:
 # --------------------------------------------------------------- 元信息
 
 @dataclass(frozen=True, slots=True)
+class CoverSpec:
+    """平台后台上传框的封面规格。**平台事实**，所以放 meta.json 不放 config。
+
+    与字数/标题/标签上限相反：那三个是本项目的发文纪律（config 一份真相），
+    尺寸是平台说了算（PRD：尺寸从平台读取，不得硬编码）。数值要与真实
+    后台上传框核对（T-09 首发时校准），但存放位置就是这份 JSON。
+    """
+
+    width: int
+    height: int
+    max_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
 class AdapterMeta:
     """平台元信息。**不含**字数/标题/标签上限——那些只在 PlatformConfig 里。
 
@@ -312,6 +356,8 @@ class AdapterMeta:
     # 登录页地址。不给就退回 editor_url（很多平台后台页会自己跳登录）。
     # 放这里而不是 core 里：换平台不该改主程序。
     login_url: str = ""
+    # 封面上传规格（宽/高/大小上限）。None = 平台未提供规格，upload_cover 会拒绝上传。
+    cover: CoverSpec | None = None
 
     @classmethod
     def load(cls, path: str | Path) -> AdapterMeta:
@@ -347,11 +393,25 @@ class AdapterMeta:
         ):
             raise SelectorError(f"domains 必须是非空字符串数组（{path}）")
 
+        cover_raw = data.get("cover")
+        cover: CoverSpec | None = None
+        if cover_raw is not None:
+            if not isinstance(cover_raw, dict):
+                raise SelectorError(f"cover 必须是对象（width/height/max_bytes）（{path}）")
+            values: dict[str, int] = {}
+            for field in ("width", "height", "max_bytes"):
+                value = cover_raw.get(field)
+                if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                    raise SelectorError(f"cover.{field} 必须是正整数，收到 {value!r}（{path}）")
+                values[field] = value
+            cover = CoverSpec(**values)
+
         return cls(
             name=str(data.get("name") or path.parent.name),
             domains=tuple(item.strip() for item in domains),
             editor_url=editor_url.strip(),
             login_url=login_url,
+            cover=cover,
         )
 
 
@@ -372,8 +432,12 @@ class PlatformAdapter(Protocol):
     def fill_content(self, page: Page, draft: Draft | None) -> None:
         """注入正文。内部自带三级降级。"""
 
-    def fill_meta(self, page: Page, draft: Draft | None) -> None:
-        """标题、分类、标签、摘要、原创声明、AI 标注。"""
+    def fill_meta(self, page: Page, draft: Draft | None, limits: Any) -> None:
+        """标题、分类、标签、摘要、AI 标注。
+
+        `limits` 传 `core.config.PlatformConfig`：标题/标签上限只在那里有一份真相，
+        adapter 不另存一份（PRD §9.1 的 L1/L3 划分）。
+        """
 
     def upload_cover(self, page: Page, path: Path) -> None:
         """上传封面，等缩略图出现。"""

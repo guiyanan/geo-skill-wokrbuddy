@@ -26,12 +26,15 @@ from _imgfactory import jpeg_bytes, png_bytes
 class FakeCoverPage:
     """假封面上传页。thumbnail_ok=False 模拟「传上去了但缩略图一直不出现」。"""
 
-    def __init__(self, *, thumbnail_ok: bool = True) -> None:
+    def __init__(self, *, thumbnail_ok: bool = True, upload_fails: bool = False) -> None:
         self.thumbnail_ok = thumbnail_ok
+        self.upload_fails = upload_fails
         self.uploads: list[tuple[str, Path]] = []
         self.url = "https://mp.csdn.net/"
 
     def set_input_files(self, selector: str, path: Path) -> None:
+        if self.upload_fails:
+            raise RuntimeError("上传框元素不存在")
         self.uploads.append((selector, Path(path)))
 
     def wait_for_selector(self, selector: str, timeout_ms: int = 10_000):
@@ -150,3 +153,12 @@ def test_meta_without_cover_spec_fails_loud(tmp_path: Path):
     good.write_bytes(png_bytes(1140, 640))
     with pytest.raises(CoverError):
         _adapter(meta).upload_cover(FakeCoverPage(), good)
+
+
+def test_upload_input_rejection_is_wrapped_as_cover_error(tmp_path: Path):
+    """上传框元素不存在（改版）→ CoverError 说清是哪一步，不裸漏 playwright 异常。"""
+    good = tmp_path / "cover.png"
+    good.write_bytes(png_bytes(1140, 640))
+    with pytest.raises(CoverError) as exc:
+        _adapter().upload_cover(FakeCoverPage(upload_fails=True), good)
+    assert "上传框" in str(exc.value)

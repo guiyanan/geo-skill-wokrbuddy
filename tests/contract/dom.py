@@ -78,3 +78,9 @@ class StaticPage:
 
     def press_sequentially(self, selector: str, text: str, delay_ms: float = 0) -> None:
         raise StaticPageError("静态快照不能键入。")
+
+    def press(self, selector: str, key: str) -> None:
+        raise StaticPageError("静态快照不能按键。")
+
+    def set_input_files(self, selector: str, path) -> None:
+        raise StaticPageError("静态快照不能上传文件。")

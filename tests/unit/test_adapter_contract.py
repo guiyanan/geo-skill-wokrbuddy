@@ -112,8 +112,6 @@ def test_protocol_is_runtime_checkable():
 @pytest.mark.parametrize(
     "method, ticket, args",
     [
-        ("fill_meta", "T-08", (object(), None)),
-        ("upload_cover", "T-08", (object(), Path("cover.png"))),
         ("submit", "T-09", (object(),)),
         ("verify", "T-09", (object(),)),
     ],
@@ -122,6 +120,7 @@ def test_unimplemented_methods_name_their_ticket(method, ticket, args):
     """没实现就要**说出来属于哪张工单**。
 
     最危险的是写个 `pass` —— 流程会一路绿到「发布成功」，然后线上什么都没有。
+    （fill_meta / upload_cover 已在 T-08 落地，本表只剩 T-09 两个。）
     """
     adapter = CsdnAdapter()
     with pytest.raises(NotImplementedError) as exc:
@@ -269,6 +268,57 @@ def test_meta_login_url_must_be_a_string(tmp_path):
     with pytest.raises(SelectorError) as exc:
         CsdnAdapter(meta_path=path)
     assert "login_url" in str(exc.value)
+
+
+def test_meta_cover_spec_is_loaded():
+    """真实 csdn/meta.json 的 cover 规格必须能读出来（封面预检靠它）。"""
+    spec = CsdnAdapter()._meta.cover
+    assert spec is not None
+    assert spec.width > 0 and spec.height > 0 and spec.max_bytes > 0
+
+
+def _meta_file(tmp_path, cover):
+    path = tmp_path / "meta.json"
+    path.write_text(
+        json.dumps(
+            {
+                "editor_url": "https://mp.csdn.net/x",
+                "domains": ["mp.csdn.net"],
+                "cover": cover,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_meta_cover_must_be_an_object(tmp_path):
+    with pytest.raises(SelectorError) as exc:
+        CsdnAdapter(meta_path=_meta_file(tmp_path, "1140x640"))
+    assert "cover" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "cover",
+    [
+        {"width": "1140", "height": 640, "max_bytes": 5242880},
+        {"width": 0, "height": 640, "max_bytes": 5242880},
+        {"width": True, "height": 640, "max_bytes": 5242880},
+        {"width": 1140, "height": 640},
+    ],
+    ids=["width_is_string", "width_is_zero", "width_is_bool", "missing_max_bytes"],
+)
+def test_meta_cover_fields_must_be_positive_ints(tmp_path, cover):
+    """bool 是 int 的子类（Python 经典陷阱）、0 不是有效尺寸，都得拦。"""
+    with pytest.raises(SelectorError) as exc:
+        CsdnAdapter(meta_path=_meta_file(tmp_path, cover))
+    assert "cover." in str(exc.value)
+
+
+def test_meta_without_cover_is_allowed(tmp_path):
+    """不写 cover 合法（规格还没校准的平台），但 upload_cover 会拒绝上传。"""
+    adapter = CsdnAdapter(meta_path=_meta_file(tmp_path, None))
+    assert adapter._meta.cover is None
 
 
 def test_auth_state_values_are_stable_strings():

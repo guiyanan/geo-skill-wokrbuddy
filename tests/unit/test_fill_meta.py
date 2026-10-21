@@ -28,11 +28,20 @@ class FakeMetaPage:
 
     - op=setvalue   参数 [sel, text] → values[sel] = text
     - op=categories 参数 sel        → 返回 self.options
+    setvalue_ok=False 模拟控件不存在；options_empty_ok=True 模拟「ok 但列表为空」。
     """
 
-    def __init__(self, *, options: list[dict[str, str]] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        options: list[dict[str, str]] | None = None,
+        setvalue_ok: bool = True,
+        options_empty_ok: bool = False,
+    ) -> None:
         self.values: dict[str, str] = {}
         self.options = options or []
+        self.setvalue_ok = setvalue_ok
+        self.options_empty_ok = options_empty_ok
         self.typed: list[tuple[str, str]] = []
         self.pressed: list[tuple[str, str]] = []
         self.clicks: list[str] = []
@@ -42,10 +51,14 @@ class FakeMetaPage:
         op = script.split("/* op=", 1)[1].split(" ", 1)[0]
         if op == "setvalue":
             sel, text = arg
+            if not self.setvalue_ok:
+                return {"ok": False, "reason": "输入控件不存在（选择器未命中）"}
             self.values[sel] = text
             return {"ok": True}
         if op == "categories":
             (sel,) = arg
+            if self.options_empty_ok:
+                return {"ok": True, "options": []}
             if not self.options:
                 return {"ok": False, "reason": f"分类下拉没有可选项（{sel} 未命中）"}
             return {"ok": True, "options": self.options}
@@ -120,7 +133,11 @@ def test_title_within_limit_is_not_touched_or_warned(caplog):
     """标题在上限内 → 原样填入，零告警（不误报）。"""
     page = FakeMetaPage(options=OPTIONS)
     with caplog.at_level(logging.WARNING, logger="geopublish.csdn"):
-        _adapter().fill_meta(page, _draft(), PlatformConfig(name="csdn"))
+        _adapter().fill_meta(
+            page,
+            _draft(title="探针标题", tags=("文档解析", "PDF")),
+            PlatformConfig(name="csdn"),
+        )
     assert page.values[_adapter().selectors("editor", "title")] == "探针标题"
     assert not [r for r in caplog.records if r.levelno == logging.WARNING]
 
@@ -218,3 +235,30 @@ def test_fill_meta_requires_draft_and_limits():
         _adapter().fill_meta(page, None, PlatformConfig(name="csdn"))
     with pytest.raises(TypeError):
         _adapter().fill_meta(page, _draft(), None)  # type: ignore[arg-type]
+
+
+def test_no_category_skips_category_control_entirely():
+    """稿件没写分类 → 完全不碰分类控件（不读选项、不填空值覆盖）。"""
+    page = FakeMetaPage(options=OPTIONS)
+    adapter = _adapter()
+    adapter.fill_meta(
+        page, _draft(category=""), PlatformConfig(name="csdn")
+    )
+    category_sel = adapter.selectors("meta", "category")
+    assert category_sel not in page.values
+
+
+def test_unwritable_control_raises_meta_error():
+    """控件不存在（改版把 title 输入框改了名）→ MetaError，当场暴露而不是填丢。"""
+    page = FakeMetaPage(options=OPTIONS, setvalue_ok=False)
+    with pytest.raises(MetaError) as exc:
+        _adapter().fill_meta(page, _draft(), PlatformConfig(name="csdn"))
+    assert "填不进" in str(exc.value)
+
+
+def test_category_options_empty_list_raises():
+    """脚本返回 ok 但选项是空列表（渲染到一半）→ MetaError，不许当可选项处理。"""
+    page = FakeMetaPage(options=OPTIONS, options_empty_ok=True)
+    with pytest.raises(MetaError) as exc:
+        _adapter().fill_meta(page, _draft(), PlatformConfig(name="csdn"))
+    assert "可选项为空" in str(exc.value)
