@@ -41,6 +41,7 @@ class FakeEditorPage:
     - "truncate" 注入「成功」但只进了一半（粘贴被平台拦就是这种）
     - "deny"     脚本返回 ok:false（拿不到 CM 实例）
     - "raise"    evaluate 直接抛异常（元素不存在/超时）
+    - "deny_bare" 脚本返回 ok:false 且不给原因（页面脚本崩坏时的真实形态）
     """
 
     def __init__(
@@ -49,6 +50,7 @@ class FakeEditorPage:
         l1: str = "ok",
         l2: str = "ok",
         type_ok: bool = True,
+        clear_ok: bool = True,
         readback_ok: bool = True,
         clock: FakeClock | None = None,
         evaluate_cost_s: float = 0.0,
@@ -56,6 +58,7 @@ class FakeEditorPage:
         self.doc = ""
         self.plan = {"paste": l1, "dispatch": l2}
         self.type_ok = type_ok
+        self.clear_ok = clear_ok
         self.readback_ok = readback_ok
         self.clock = clock
         self.evaluate_cost_s = evaluate_cost_s
@@ -82,6 +85,12 @@ class FakeEditorPage:
             if not self.readback_ok:
                 return {"ok": False, "reason": "容器与编辑区都未命中"}
             return {"ok": True, "text": self.doc}
+        if op == "clear":
+            self.calls.append(("clear", None))
+            if not self.clear_ok:
+                raise RuntimeError("清场脚本被页面拒绝")
+            self.doc = ""
+            return {"ok": True}
 
         sel, text = arg
         self.calls.append((op, len(text)))
@@ -90,6 +99,8 @@ class FakeEditorPage:
             raise RuntimeError(f"{op} 元素不存在")
         if behavior == "deny":
             return {"ok": False, "reason": f"{op} 被编辑器拒绝"}
+        if behavior == "deny_bare":
+            return {"ok": False}
         if behavior == "truncate":
             self.doc = text[: len(text) // 2]
             return {"ok": True}
@@ -199,21 +210,28 @@ def test_inject_failed_is_not_silently_swallowed_by_readback_failure():
 
 # ----------------------------------------------------------- UT-07-05
 
-def test_ut_07_05_long_body_l1_within_time_limit():
-    """5000 字长文 L1 在 10s 时限内完成，不算超时。"""
+def test_ut_07_05_long_body_l1_within_time_limit(caplog):
+    """5000 字长文 L1 一次成功；耗时进日志（真机 <10s 属 L4 DoD 验证项）。"""
     body = "长文" * 2500  # 5000 字
     clock = FakeClock(CLOCK_START)
     adapter = CsdnAdapter(clock=clock)
     page = FakeEditorPage(clock=clock, evaluate_cost_s=9.9)
 
-    adapter.fill_content(page, _draft(body))
+    with caplog.at_level(logging.INFO, logger="geopublish.csdn"):
+        adapter.fill_content(page, _draft(body))
 
     assert page.doc == body
+    success = [r for r in caplog.records if "fill_content 成功" in r.message]
+    assert success and "耗时 9900ms" in success[0].message
 
 
-def test_l1_over_time_limit_counts_as_failed_and_degrades():
-    """L1 超过 10s：哪怕内容进去了也判失败降级 —— 卡住的编辑器不可信。"""
-    body = "超时正文" * 100
+def test_slow_but_verified_l1_still_counts_as_success():
+    """L1 慢（>10s）但回读吻合 → 算成功，不降级。
+
+    回读是唯一裁决：内容落地且对得上就是成了；为了「快」把已验证的注入
+    判负、降级去跑更慢的路径，方向反了。
+    """
+    body = "慢但成功的正文" * 100
     clock = FakeClock(CLOCK_START)
     adapter = CsdnAdapter(clock=clock)
     page = FakeEditorPage(l1="ok", clock=clock, evaluate_cost_s=10.1)
@@ -221,7 +239,30 @@ def test_l1_over_time_limit_counts_as_failed_and_degrades():
     adapter.fill_content(page, _draft(body))
 
     ops = [name for name, _ in page.calls]
-    assert "dispatch" in ops, "L1 超时后必须降级到 L2"
+    assert ops == ["paste", "readback"], f"已验证的成功不该降级：{ops}"
+
+
+def test_l3_clears_before_typing_so_no_duplicate_content():
+    """L1 只进去半截、L2 被拒 → L3 先清场再打字，正文不能叠成两倍。"""
+    body = "半截残留" * 100
+    adapter = CsdnAdapter()
+    page = FakeEditorPage(l1="truncate", l2="deny")
+
+    adapter.fill_content(page, _draft(body))
+
+    assert page.doc == body, f"残留 + 追加 = 双倍正文：实际 {len(page.doc)} 字"
+    ops = [name for name, _ in page.calls]
+    assert "clear" in ops[: ops.index("type")], "第一次 type 之前必须先清场"
+
+
+def test_l3_clear_failure_does_not_crash_but_readback_catches_residue():
+    """清场失败不许炸在半路；叠出来的双倍正文由回读拦下 → InjectFailed。"""
+    body = "清不掉的残留" * 100
+    adapter = CsdnAdapter()
+    page = FakeEditorPage(l1="truncate", l2="deny", clear_ok=False)
+
+    with pytest.raises(InjectFailed):
+        adapter.fill_content(page, _draft(body))
 
 
 # ----------------------------------------------------------- UT-07-06
@@ -241,6 +282,22 @@ def test_ut_07_06_markdown_structure_survives_injection():
     )
     assert readback.count("\n|") == body.count("\n|"), "表格行数不能丢"
     assert readback.count("```") == body.count("```"), "代码块围栏不能丢"
+
+
+def test_crlf_body_is_normalized_before_length_compare():
+    """Windows 稿件的 \\r\\n：编辑器回读统一成 \\n，不归一会被误判成「丢字」。
+
+    一篇 100 个 \\r\\n 的 3000 字稿，回读少 100 字 = 偏差 3.3% → 假 InjectFailed。
+    """
+    body = "第一行\r\n第二行\r\n" * 150
+    adapter = CsdnAdapter()
+    page = FakeEditorPage()
+
+    adapter.fill_content(page, _draft(body))
+
+    assert page.doc == body.replace("\r\n", "\n")
+    ops = [name for name, _ in page.calls]
+    assert ops == ["paste", "readback"], f"换行差异不该触发降级：{ops}"
 
 
 # ----------------------------------------------------------- 入口守卫
@@ -270,3 +327,46 @@ def test_inject_result_without_ok_counts_as_failure():
     page.evaluate = weird_evaluate  # type: ignore[method-assign]
     with pytest.raises(InjectFailed):
         adapter.fill_content(page, _draft("返回怪东西" * 50))
+
+
+def test_inject_denied_without_reason_still_degrades():
+    """ok:false 但没给原因（页面脚本崩坏的真实形态）→ 照常降级，原因有兜底文案。"""
+    adapter = CsdnAdapter()
+    page = FakeEditorPage(l1="deny_bare")
+
+    adapter.fill_content(page, _draft("无理由拒绝" * 50))
+
+    ops = [name for name, _ in page.calls]
+    assert "dispatch" in ops
+
+
+def test_readback_returning_nothing_counts_as_failure():
+    """回读脚本返回 None（页面上下文崩了）→ 该级失败，逐级降级后 InjectFailed。"""
+    adapter = CsdnAdapter()
+    page = FakeEditorPage()
+    real_evaluate = page.evaluate
+
+    def no_readback(script, arg=None):
+        if "op=readback" in script:
+            return None
+        return real_evaluate(script, arg)
+
+    page.evaluate = no_readback  # type: ignore[method-assign]
+    with pytest.raises(InjectFailed):
+        adapter.fill_content(page, _draft("回读为空" * 50))
+
+
+def test_readback_without_text_field_counts_as_failure():
+    """回读 ok:true 但没有 text 字段 → 不能当成功，三级全灭后 InjectFailed。"""
+    adapter = CsdnAdapter()
+    page = FakeEditorPage()
+    real_evaluate = page.evaluate
+
+    def no_text(script, arg=None):
+        if "op=readback" in script:
+            return {"ok": True}
+        return real_evaluate(script, arg)
+
+    page.evaluate = no_text  # type: ignore[method-assign]
+    with pytest.raises(InjectFailed):
+        adapter.fill_content(page, _draft("回读缺字段" * 50))

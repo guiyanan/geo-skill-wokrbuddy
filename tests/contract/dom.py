@@ -67,3 +67,14 @@ class StaticPage:
         raise StaticPageError(
             "静态快照不能导航。需要导航的流程请用 integration 测试（真 chromium 或假站点）。"
         )
+
+    def evaluate(self, script: str, arg=None):
+        raise StaticPageError(
+            "静态快照不能执行脚本。注入/回读请用 unit 的假编辑器页或 integration 真浏览器。"
+        )
+
+    def click(self, selector: str) -> None:
+        raise StaticPageError("静态快照不能点击。")
+
+    def press_sequentially(self, selector: str, text: str, delay_ms: float = 0) -> None:
+        raise StaticPageError("静态快照不能键入。")

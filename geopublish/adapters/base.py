@@ -35,6 +35,8 @@ __all__ = [
     "AuthResult",
     "AuthState",
     "Element",
+    "InjectAttempt",
+    "InjectFailed",
     "Page",
     "PlatformAdapter",
     "REQUIRED_SELECTORS",
@@ -123,6 +125,42 @@ class VerifyResult:
     reason: str = ""
 
 
+# --------------------------------------------------------------- 注入结果
+
+@dataclass(frozen=True, slots=True)
+class InjectAttempt:
+    """一级注入尝试的完整记录。
+
+    三级全灭时这三条就是现场包 `input.json` 的核心 payload——
+    「L2 为什么被跳过」必须能从这里直接读出来，不许只留一个 bool。
+    """
+
+    level: str  # "L1-paste" / "L2-dispatch" / "L3-type"，进日志与现场包，改名 = 改语义
+    ok: bool
+    reason: str = ""
+    expected_len: int = 0
+    actual_len: int | None = None
+    elapsed_ms: float = 0.0
+
+
+class InjectFailed(RuntimeError):
+    """三级注入全部失败。
+
+    携带全部尝试记录：上层（T-09 起的发布流程）捕获后负责归档现场包，
+    适配器层自己碰不到截图/HAR，**绝不在这里静默**。
+    """
+
+    def __init__(self, attempts: tuple[InjectAttempt, ...], expected_len: int) -> None:
+        self.attempts = attempts
+        self.expected_len = expected_len
+        detail = "；".join(
+            f"{a.level}（{a.reason or '未知原因'}）" for a in attempts
+        )
+        super().__init__(
+            f"三级注入全部失败（源文 {expected_len} 字）：{detail}。已停手，等待人工排查现场包"
+        )
+
+
 # --------------------------------------------------------------- 页面抽象
 
 @runtime_checkable
@@ -154,6 +192,21 @@ class Page(Protocol):
     def query_selector(self, selector: str) -> Element | None: ...
 
     def query_selector_all(self, selector: str) -> list[Element]: ...
+
+    # --- 写入三件：正文注入（T-07）的最小写面。
+    # 选择器一律由调用方从 selectors.json 取好再传入，实现里不接裸脚本。
+
+    def evaluate(self, script: str, arg: Any = None) -> Any:
+        """在页面上下文执行脚本。注入/回读都走它，脚本里的选择器必须经 arg 传入。"""
+        ...
+
+    def click(self, selector: str) -> None:
+        """聚焦元素。L3 分段 type 之前必须先聚焦，直接灌键盘事件会丢字。"""
+        ...
+
+    def press_sequentially(self, selector: str, text: str, delay_ms: float = 0) -> None:
+        """逐字符键入。只作 L3 兜底——慢，但几乎不会失败。"""
+        ...
 
 
 # --------------------------------------------------------------- 选择器表
