@@ -166,7 +166,7 @@ geo-publish/
 - [x] T-03  自检引擎（纯逻辑）
 - [x] T-04  现场包与快照存档
 - [x] T-05  adapter 契约 + fixture 回放
-- [ ] T-06  登录态管理
+- [x] T-06  登录态管理
 - [ ] T-07  正文注入（三级降级）
 - [ ] T-08  元信息与封面
 - [ ] T-09  草稿投递 + verify          ← P0 里程碑
@@ -528,6 +528,31 @@ UT-03-07/08 确保 R4 五项**全部**与 `rejected` 联动，而不只是前三
 **DoD**：扫码一次后 7 天内可连续使用（L4 手工验证）
 
 **已知失败模式**：把重试写在 auth 里 → 反复撞登录页触发风控。UT-06-01 钉死"只调一次"。
+
+**交付记录（2026-10-21，T-06 完成）**
+
+- `core/session.py`（119 语句/18 分支，语句+分支 100%）：`check_login`（探活恰好一次）、
+  `AuthRequired`（带 state/has_challenge，消息含可执行命令）、`ensure_profile_dir`（700）、
+  `PersistentBrowser`（持久 profile，channel 可配置）、`login`（登录页→等扫码→编辑器页回读）
+- CLI 新增 `geopublish login <platform> [--channel chrome|bundled] [--profile-root ...]`；
+  `AuthRequired → 2`、`BrowserUnavailable → 5`、未知平台 → 1
+- `AdapterMeta` 加可选 `login_url`（换平台不改主程序）；`csdn/meta.json` 补 `https://passport.csdn.net/login`
+
+**关键决定**
+
+- `channel=None` 时**不传**这个参数（playwright 把 None 当非法值）——这就是
+  「本地 chrome / CI 默认」的落法，CLI 用 `--channel bundled` 表达。
+- 探活入口只有一个（`check_login`），且**没有 retry 参数**：堵在入口，比约定「不要重试」可靠。
+- profile 只收绝对路径（相对路径的第一个副作用是 chmod cwd）；拒根目录。
+
+**对抗探测修的三洞**（全绿后喂刁钻输入抓到的）
+
+1. profile 路径被文件占住 → 原生 `PermissionError: EEXIST` 指错方向 → 报「被文件占住」
+2. `--profile-root .` → 会把 cwd chmod 700 且登录态散落 → 拒相对路径
+3. cron/管道里跑 login → `EOFError` 回溯 → 报「需要终端交互」
+
+**遗留（L4，等首次真机扫码）**：7 天续期验证属 DoD 手工项；首次扫码后用
+`geopublish snapshot --out fixtures` 替换手工 fixture（T-05 的已知失败模式）。
 
 ---
 
