@@ -9,6 +9,7 @@
 | `login.html` | `passport.csdn.net` 登录页 | 被踢回登录 → `expired` |
 | `captcha.html` | 风控验证页 | 有人机校验 → `unknown` + `has_challenge=True`，**且优先于登录表单判定** |
 | `success.html` | 发布成功页 | 回读用的 `article_id` / `success_marker` 能命中 |
+| `drafts.html` | `mp.csdn.net/mp_blog/manage/article`（草稿箱） | verify 兜底：列表行命中 `draft_list_item`，且每行带得出 href（article_id 的来源） |
 
 **词汇说明**：选择器键叫 `auth.challenge`、结果字段叫 `has_challenge`，不叫
 `captcha`/`has_captcha`。因为 `geopublish/**/*.py` 里出现那个英文词会被红线门禁拦下
@@ -32,8 +33,9 @@ geopublish snapshot "https://passport.csdn.net/login" csdn/login --out fixtures
 存在的意义。`meta.json` 里的 `html_sha256` 会记录每次替换的差异。
 
 `success.html` 的 `article:id` / `success_marker` 两个选择器是**按 CMS 惯例先占位**的，
-等 T-09 真发一篇草稿后再用真实成功页校准——到那时如果打不中，契约测试会先红，
-而不是等到「以为发出去了其实没有」。
+`drafts.html` 的列表结构同理。等 T-09 真发一篇草稿后再用真实页面校准——到那时如果
+打不中，契约测试会先红，而不是等到「以为发出去了其实没有」。
+
 
 ## 为什么不 mock adapter
 

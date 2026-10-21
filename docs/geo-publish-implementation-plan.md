@@ -169,7 +169,7 @@ geo-publish/
 - [x] T-06  登录态管理
 - [x] T-07  正文注入（三级降级）
 - [x] T-08  元信息与封面
-- [ ] T-09  草稿投递 + verify          ← P0 里程碑
+- [x] T-09  草稿投递 + verify          ← P0 里程碑（代码层完成；L4 真机验收待做，见交付记录）
 ```
 
 **P1 · 全自动**
@@ -643,6 +643,24 @@ UT-03-07/08 确保 R4 五项**全部**与 `rejected` 联动，而不只是前三
 | UT-09-04 | `--mode draft` 绝不点"发布"按钮（断言点击元素集合不含 publish） |
 
 **DoD（P0 验收）**：一条命令，CSDN 草稿箱出现正确文章，正文 diff < 2%，截图留证
+
+**交付记录（2026-10-21 完成）**
+| 项 | 结果 |
+|---|---|
+| 文件 | `adapters/csdn/flow.py::submit/verify/check_content_length`（flow 282 语句/90 分支 100%）、`adapters/base.py` 增 `SubmitMode`/`SubmitBlocked` + `Page.input_value` + `AdapterMeta.draft_list_url` + verify 契约增 `draft_list_item`、`csdn/selectors.json`（2026-10-21.2）、`csdn/meta.json` 增草稿列表页、`geopublish/publish.py`（编排 + 装载 + 闸门，115 语句/28 分支 100%）、`geopublish/cli.py` 增 `publish` 子命令 + 退出码 6、`fixtures/csdn/drafts.html`、`tests/contract/dom.py` 补 `input_value`、`tests/unit/test_submit.py`（13 条）/`test_verify.py`（13 条）/`test_publish.py`（21 条）/CLI 补 10 条 |
+| 用例 | UT-09-01~04 全绿 + 13 条对抗用例（再注入失败作废旧记录、open_editor 清记录、列表页打不开/标题读不到/无 href/无 id 各判败、发布模式不走草稿兜底等）；unit+contract 全绿（549 条），全包 1856 语句/466 分支 **100%** |
+| 失败语义 | `SubmitBlocked`（复核不通过 → **一个按钮都没点**，R7 红线的代码形态）；verify 拿不到 id 一律 `ok=False`，即便有成功提示（「以为发出去了其实没有」的形态比明确报错更危险） |
+| 命令 | `geopublish publish <draft_dir> --mode draft`；稿件目录 = `meta.json` + `<platform>.md`/`body.md`/`draft.md` + 封面；退出码沿用 0/1/2/3/5，新增 **6=发布未确认成功**（verify 未过/复核被拦） |
+
+**三处设计取舍**
+1. **注入长度记录在 adapter 上，submit 不再收 `expected_len`**：「注入了多少字」只有 fill_content 知道，再传一份等于允许调用方和事实不一致。记录只在注入并回读通过后写，`open_editor` 与失败的再注入都会把它作废——旧记录放行新残稿正是 R7 要防的盲发。
+2. **等不到成功提示返回 `unknown` 而不是 `failed`**：存草稿常常只弹一个几秒后消失的 toast、URL 也不变。说「失败」会诱导人重发（重复草稿），说「成功」不诚实——判定权交给 verify。
+3. **verify 三条取 id 路径按代价排序**：DOM meta → URL（`?articleId=` / `/creation/editor/<id>` / `/article/details/<id>`）→ 草稿列表页按标题核对。最后一条是存草稿后 URL 不变时唯一能确认的办法，所以 meta.json 配了 `draft_list_url`、selectors 配了 `draft_list_item`，并有契约测试兜底（没有断言过的选择器等于一句愿望）。
+
+**已知失败模式 / 待办**
+- **L4 真机验收未做**（DoD 的手工项）：本机没有 CSDN 登录态。需要 `geopublish login csdn` 后跑 `geopublish publish <draft> --mode draft`；届时按真实页面校准 `success.html`/`drafts.html` 快照、`draft_list_url`、`draft_list_item` 与 cover 规格（T-08 遗留的 1140×640）。校准时打不中 → 契约测试会先红，这正是它们存在的意义。
+- **无幂等**：连跑两次会在草稿箱留两篇。R9 由 T-11 落地，此前不要把 publish 接进 cron。
+- **快照里截图只有成功后一张**：before/after 双图与 `receipt.json` 是 T-10 的回执设计。
 
 ---
 
