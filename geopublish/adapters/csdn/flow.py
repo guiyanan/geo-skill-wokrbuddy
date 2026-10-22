@@ -913,6 +913,9 @@ class CsdnAdapter:
 
         try:
             page.goto(list_url)
+            # 管理页是 SPA：tab 不随 load 事件出现，先等它渲染出来再点（实测：
+            # 不等的话 evaluate 里一个 .nav-link 都找不到，报「tab 点不开」假失败）。
+            page.wait_for_selector(self.selectors("verify", "draft_list_tab"))
             # 默认停在「全部」tab：先点「草稿箱」，再等异步加载圈消失（T-09b 实测：
             # 不等的话读到的是空列表，会把「存成了」误判成失败）。
             tab = page.evaluate(
@@ -932,7 +935,7 @@ class CsdnAdapter:
             return VerifyResult(
                 ok=False,
                 url=page.url,
-                reason=f"草稿列表页打不开（{type(exc).__name__}）：{exc}",
+                reason=f"草稿列表页打不开或没渲染完（{type(exc).__name__}）：{exc}",
             )
 
         wanted = _squash(title)
