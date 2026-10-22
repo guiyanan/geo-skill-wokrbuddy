@@ -279,13 +279,27 @@ def _clear_editor(page: Page, content_sel: str) -> None:
         pass
 
 
+def _type_text(page: Page, sel: str, text: str, delay_ms: float) -> None:
+    """逐字键入的统一入口。
+
+    Playwright 的 `press_sequentially` 在 **Locator** 上，Page 上没有——
+    假页面（协议形状）有这个方法所以测试一直没暴露，真机一跑就 AttributeError
+    （T-09b 正式验收抓出）。测试路径走协议方法，真机路径走 locator。
+    """
+    direct = getattr(page, "press_sequentially", None)
+    if direct is not None:
+        direct(sel, text, delay_ms=delay_ms)
+        return
+    page.locator(sel).press_sequentially(text, delay=delay_ms)
+
+
 def _type_in_segments(page: Page, content_sel: str, text: str) -> dict[str, Any]:
     """L3 兜底：聚焦 → 清场 → 分段逐字键入。慢，但走的是真实键盘管线。"""
     page.click(content_sel)
     _clear_editor(page, content_sel)
     for offset in range(0, len(text), SEGMENT_SIZE):
-        page.press_sequentially(
-            content_sel, text[offset : offset + SEGMENT_SIZE], delay_ms=TYPING_DELAY_MS
+        _type_text(
+            page, content_sel, text[offset : offset + SEGMENT_SIZE], delay_ms=TYPING_DELAY_MS
         )
     return {"ok": True}
 
@@ -613,7 +627,7 @@ class CsdnAdapter:
                 "、".join(tags),
             )
         for tag in tags:
-            page.press_sequentially(tags_sel, tag, delay_ms=TYPING_DELAY_MS)
+            _type_text(page, tags_sel, tag, delay_ms=TYPING_DELAY_MS)
             page.press(tags_sel, "Enter")
 
         if meta.summary.strip():
@@ -641,7 +655,7 @@ class CsdnAdapter:
             page.click(display_sel)
             page.press(input_sel, "Meta+A")
             page.press(input_sel, "Backspace")
-            page.press_sequentially(input_sel, title, delay_ms=TYPING_DELAY_MS)
+            _type_text(page, input_sel, title, delay_ms=TYPING_DELAY_MS)
             page.click(self.selectors("editor", "content"))
         except Exception as exc:
             raise MetaError(f"填不进 editor.title：{type(exc).__name__}: {exc}") from exc

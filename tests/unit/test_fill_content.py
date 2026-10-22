@@ -403,3 +403,55 @@ def test_readback_without_text_field_counts_as_failure():
     page.evaluate = no_text  # type: ignore[method-assign]
     with pytest.raises(InjectFailed):
         adapter.fill_content(page, _draft("回读缺字段" * 50))
+
+
+def test_l3_typing_uses_locator_when_page_lacks_press_sequentially():
+    """真机形态：Playwright Page 没有 press_sequentially（在 Locator 上），
+    必须自动走 locator——这条是 T-09b 正式验收抓出来的真实差异。"""
+
+    class _Locator:
+        def __init__(self, page):
+            self._page = page
+
+        def press_sequentially(self, text, delay=0):
+            self._page.doc += text
+
+    class _LocatorPage(FakeEditorPage):
+        press_sequentially = None  # getattr 返回 None → 走 locator 路径
+
+        def locator(self, selector):
+            return _Locator(self)
+
+    body = "真机键盘路径" * 50
+    adapter = CsdnAdapter()
+    page = _LocatorPage(l1="raise", l2="raise")
+
+    adapter.fill_content(page, _draft(body))
+
+    assert page.doc == body
+
+
+def test_l3_typing_uses_locator_when_page_lacks_press_sequentially():
+    """真机形态：Playwright Page 没有 press_sequentially（在 Locator 上），
+    必须自动走 locator——这条是 T-09b 正式验收抓出来的真实差异。"""
+
+    class _Locator:
+        def __init__(self, page):
+            self._page = page
+
+        def press_sequentially(self, text, delay=0):
+            self._page.doc += text
+
+    class _LocatorPage(FakeEditorPage):
+        press_sequentially = None  # getattr 返回 None → 走 locator 路径
+
+        def locator(self, selector):
+            return _Locator(self)
+
+    body = "真机键盘路径" * 50
+    adapter = CsdnAdapter()
+    page = _LocatorPage(l1="raise", l2="raise")
+
+    adapter.fill_content(page, _draft(body))
+
+    assert page.doc == body
