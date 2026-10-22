@@ -693,35 +693,47 @@ class CsdnAdapter:
         )
 
     def _fill_title(self, page: Page, title: str) -> None:
-        """双层标题控件 + 受控模型：点 display → 清空 → **真实键盘**输入 → blur → 回读。
+        """双层标题控件 + 受控模型 + **异步草稿恢复**：点 display → 点 input →
+        清空 → 真实键盘输入 → blur → 回读模型态。
 
-        两个实测教训（T-09b）：
+        三个实测教训（T-09b）：
         1. `fill()` 只写 input 的 value，模型不吃——存出来的草稿是【无标题】。
-           唯一被模型承认的输入是真实键盘事件（press / press_sequentially）。
+           唯一被模型承认的输入是真实键盘事件。
         2. 回读要看 display 展示层（模型态），不是 input 的 value。
+        3. 编辑器会**异步恢复上次未保存的标题**，恢复落盘的时机每次不一样：
+           打快了会被恢复覆盖（实测只剩前两个字、甚至全灭）。恢复只发生一次，
+           所以回读不符时**重打一次**——第二次落在已稳定的编辑器上。重打仍不符
+           才是 MetaError（那时多半是改版，不是时序）。
         """
         display_sel = self.selectors("editor", "title_display")
         input_sel = self.selectors("editor", "title")
-        try:
-            page.click(display_sel)
-            # display 点击只负责让 input 出现，焦点要显式点进 input（照 v6 实测路径）；
-            # 之后全选清空、逐字键入。延迟 15ms：5ms 时受控模型会丢字。
-            page.click(input_sel)
-            page.press(input_sel, "Meta+A")
-            page.press(input_sel, "Backspace")
-            _type_text(page, input_sel, title, delay_ms=TITLE_TYPING_DELAY_MS)
-            # blur 走 DOM focus：Playwright click 可能被残存遮罩拦到超时（实测）
-            page.evaluate(_FOCUS_JS, self.selectors("editor", "content"))
-        except Exception as exc:
-            raise MetaError(f"填不进 editor.title：{type(exc).__name__}: {exc}") from exc
+        actual = ""
+        for attempt in (1, 2):
+            try:
+                page.click(display_sel)
+                # display 点击只负责让 input 出现，焦点要显式点进 input（照实测路径）；
+                # 之后全选清空、逐字键入。延迟 15ms：5ms 时受控模型会丢字。
+                page.click(input_sel)
+                page.press(input_sel, "Meta+A")
+                page.press(input_sel, "Backspace")
+                _type_text(page, input_sel, title, delay_ms=TITLE_TYPING_DELAY_MS)
+                # blur 走 DOM focus：Playwright click 可能被残存遮罩拦到超时（实测）
+                page.evaluate(_FOCUS_JS, self.selectors("editor", "content"))
+            except Exception as exc:
+                raise MetaError(f"填不进 editor.title：{type(exc).__name__}: {exc}") from exc
 
-        outcome = page.evaluate(_READ_TITLE_DISPLAY_JS, display_sel)
-        actual = outcome.get("text", "") if isinstance(outcome, Mapping) else ""
-        if _squash(actual) != _squash(title):
-            raise MetaError(
-                f"标题回读不符：写入 {title!r}，模型态是 {actual!r}"
-                "（平台会归一空白，比对已忽略空白）"
+            outcome = page.evaluate(_READ_TITLE_DISPLAY_JS, display_sel)
+            actual = outcome.get("text", "") if isinstance(outcome, Mapping) else ""
+            if _squash(actual) == _squash(title):
+                return
+            logger.warning(
+                "标题第 %d 次键入后被模型拒绝（%r != %r），按草稿恢复覆盖处理，重打一次",
+                attempt, actual, title,
             )
+        raise MetaError(
+            f"标题回读不符：写入 {title!r}，两次键入后模型态仍是 {actual!r}"
+            "（平台会归一空白，比对已忽略空白）"
+        )
 
     def _set_value(self, page: Page, group: str, key: str, text: str) -> None:
         """往输入控件写值并派发事件。控件不存在 → MetaError（改版要当场暴露）。"""

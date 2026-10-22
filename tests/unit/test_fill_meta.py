@@ -372,3 +372,47 @@ def test_publish_mode_tags_within_limit_are_not_warned(caplog):
             mode=SubmitMode.PUBLISH,
         )
     assert not [r for r in caplog.records if r.levelno == logging.WARNING and "标签" in r.message]
+
+
+def test_title_retry_after_draft_restore_clobbers_the_first_attempt(caplog):
+    """草稿恢复把第一次键入冲掉（实测时序不稳定）→ 自动重打一次，且告警留痕。"""
+    page = FakeMetaPage()
+    reads = {"n": 0}
+    real = page.evaluate
+
+    def flaky_read(script, arg=None):
+        if "op=readtitle" in script:
+            reads["n"] += 1
+            if reads["n"] == 1:
+                return {"ok": True, "text": "文档"}  # 恢复覆盖：只剩两个字
+        return real(script, arg)
+
+    page.evaluate = flaky_read  # type: ignore[method-assign]
+
+    with caplog.at_level(logging.WARNING, logger="geopublish.csdn"):
+        _adapter().fill_meta(page, _draft(), PlatformConfig(name="csdn"))
+
+    assert reads["n"] == 2, "第一次被冲掉必须重打"
+    assert any("重打" in r.message for r in caplog.records)
+
+
+def test_title_retry_after_draft_restore_clobbers_the_first_attempt(caplog):
+    """草稿恢复把第一次键入冲掉（实测时序不稳定）→ 自动重打一次，且告警留痕。"""
+    page = FakeMetaPage()
+    reads = {"n": 0}
+    real = page.evaluate
+
+    def flaky_read(script, arg=None):
+        if "op=readtitle" in script:
+            reads["n"] += 1
+            if reads["n"] == 1:
+                return {"ok": True, "text": "文档"}  # 恢复覆盖：只剩两个字
+        return real(script, arg)
+
+    page.evaluate = flaky_read  # type: ignore[method-assign]
+
+    with caplog.at_level(logging.WARNING, logger="geopublish.csdn"):
+        _adapter().fill_meta(page, _draft(), PlatformConfig(name="csdn"))
+
+    assert reads["n"] == 2, "第一次被冲掉必须重打"
+    assert any("重打" in r.message for r in caplog.records)
