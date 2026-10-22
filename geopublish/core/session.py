@@ -27,6 +27,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+import logging
+
 # AuthState / AuthResult 是 adapter 契约里的值对象。core 只借这两个类型，
 # 不依赖任何具体平台实现（adapters 反过来依赖 core.models，方向仍然单向）。
 from ..adapters.base import AuthResult, AuthState, Page
@@ -48,6 +50,12 @@ __all__ = [
 
 DEFAULT_PROFILE_ROOT = Path.home() / ".geo-publish" / "profiles"
 PROFILE_MODE = 0o700
+
+logger = logging.getLogger("geopublish.session")
+
+# Chrome 进程异常退出（被杀、崩溃、宿主沙箱拦截）会留下 Singleton* 锁文件，
+# 下一次启动直接报 ProcessSingleton 错。这是真机验收（T-09）撞上两次的真实故障。
+_STALE_LOCK_FILES = ("SingletonLock", "SingletonSocket", "SingletonCookie")
 
 # 登录页扫码等人：默认走标准输入，测试注入假的等待函数
 WaitForUser = Callable[[str], Any]
@@ -235,7 +243,7 @@ class PersistentBrowser:
             kwargs["channel"] = cfg.channel
 
         with launcher() as playwright:
-            context = playwright.chromium.launch_persistent_context(**kwargs)
+            context = self._launch(playwright, profile, kwargs)
             try:
                 page = context.pages[0] if context.pages else context.new_page()
                 page.set_default_timeout(cfg.timeout_ms)
@@ -243,6 +251,30 @@ class PersistentBrowser:
             finally:
                 # 不关就锁着 profile 目录，下一次登录会直接卡住
                 context.close()
+
+    def _launch(self, playwright: Any, profile: Path, kwargs: dict[str, Any]) -> Any:
+        """启动持久上下文；撞上陈旧 Singleton 锁就清掉重试一次（只重试一次）。
+
+        锁文件只在「上一次进程没正常退出」时残留。不处理的话，用户每次都要
+        手工去删三个文件——而这个故障恰恰是自动化场景的高发态（进程被杀）。
+        只清 Singleton* 三个文件，别的什么都不动；清完还起不来就原样抛出，
+        那时多半是真有活着的实例在占着 profile，不该抢。
+        """
+        try:
+            return playwright.chromium.launch_persistent_context(**kwargs)
+        except Exception as exc:
+            if "ProcessSingleton" not in str(exc) and "SingletonLock" not in str(exc):
+                raise
+            removed = []
+            for name in _STALE_LOCK_FILES:
+                lock = profile / name
+                try:
+                    lock.unlink(missing_ok=True)
+                    removed.append(name)
+                except OSError:
+                    pass
+            logger.warning("清掉陈旧 Chrome 锁文件后重试启动：%s", "、".join(removed))
+            return playwright.chromium.launch_persistent_context(**kwargs)
 
 
 # --------------------------------------------------------------- login 流程

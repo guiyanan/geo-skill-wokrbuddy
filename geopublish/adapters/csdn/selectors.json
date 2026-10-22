@@ -1,16 +1,19 @@
 {
-  "version": "2026-10-21.2",
+  "version": "2026-10-21.3",
   "auth": {
-    "login_form": "#loginForm, .login-box form",
+    "login_form": ".login-box",
     "challenge": "#captchaImg, img.captcha-img",
-    "avatar": "header .user-avatar, .marketing-nav .user-avatar"
+    "avatar": "img.img-user-avatar"
   },
   "editor": {
-    "title": "#article-title",
-    "content": ".editor__inner .CodeMirror",
-    "content_editable": ".CodeMirror-code [contenteditable='true']",
-    "publish_button": ".editor__bottom .btn-publish",
-    "save_draft_button": ".editor__bottom .btn-save-draft"
+    "title": "input.article-bar__title--input",
+    "title_display": ".article-bar__title-display",
+    "content": "pre.editor__inner.markdown-highlighting",
+    "content_editable": "pre.editor__inner[contenteditable='true']",
+    "publish_button": "button.btn-publish",
+    "save_draft_button": "button.btn-save",
+    "save_draft_item": ".pop-save-opt a.btn-link",
+    "modal_close": ".modal__close-button"
   },
   "meta": {
     "category": "#category",

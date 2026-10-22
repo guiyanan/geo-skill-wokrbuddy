@@ -37,7 +37,7 @@ SEVEN_METHODS = (
 
 
 class _Recorder:
-    """记录调用顺序的假 page：只用来验证 open_editor 的两步。"""
+    """记录调用顺序的假 page：验证 open_editor 的「导航 → 等编辑器 → 关弹窗」。"""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, object]] = []
@@ -50,6 +50,11 @@ class _Recorder:
     def wait_for_selector(self, selector: str, timeout_ms: int = 10_000):
         self.calls.append(("wait_for_selector", selector))
         return object()
+
+    def evaluate(self, script: str, arg=None):
+        op = script.split("/* op=", 1)[1].split(" ", 1)[0]
+        self.calls.append((op, arg))
+        return {"ok": True, "closed": 0}
 
 
 # --------------------------------------------------- 七方法契约
@@ -133,8 +138,8 @@ def test_unimplemented_modes_name_their_ticket(call, ticket, method):
 
 # --------------------------------------------------- open_editor
 
-def test_open_editor_navigates_then_waits_for_the_editor():
-    """顺序不能反：先 goto 再等选择器。反了就是在上一页等，必然超时。"""
+def test_open_editor_navigates_waits_then_closes_modals():
+    """顺序不能反：goto → 等编辑器 → 关弹窗（模版库弹窗会挡住后续一切点击）。"""
     adapter = CsdnAdapter()
     page = _Recorder()
 
@@ -143,6 +148,8 @@ def test_open_editor_navigates_then_waits_for_the_editor():
     assert page.calls[0][0] == "goto"
     assert page.calls[0][1] == adapter.editor_url
     assert page.calls[1] == ("wait_for_selector", adapter.selectors("editor", "content"))
+    assert page.calls[2][0] == "closemodals"
+    assert page.calls[2][1] == adapter.selectors("editor", "modal_close")
     assert page.url == adapter.editor_url
 
 
@@ -151,8 +158,11 @@ def test_open_editor_navigates_then_waits_for_the_editor():
 def test_meta_points_at_the_real_editor_and_domains():
     meta = json.loads(META_PATH.read_text(encoding="utf-8"))
 
-    assert meta["editor_url"].startswith("https://mp.csdn.net/")
+    # T-09b 真机校准：Markdown 编辑器在独立域名，默认的 creation/editor 是
+    # CKEditor 富文本（正文在 iframe 里，不在我们的写面内）
+    assert meta["editor_url"].startswith("https://editor.csdn.net/md")
     assert "passport.csdn.net" in meta["domains"], "登录态判定要靠它识别被踢回登录页"
+    assert "editor.csdn.net" in meta["domains"], "编辑器页自己的域名也得在白名单里"
 
 
 def test_meta_does_not_duplicate_platform_limits():

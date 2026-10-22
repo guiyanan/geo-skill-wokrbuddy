@@ -2,79 +2,66 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <title>写文章 - CSDN 创作者中心</title>
+  <title>写文章-CSDN博客</title>
 </head>
-<body class="mp-editor-page">
+<body>
+  <!--
+    2026-10-21 真机校准版（T-09b）：结构按真实 MD 编辑器（editor.csdn.net/md）
+    勘查数据重建。与旧版的差异全部是实测结论：
+    - 标题是双层控件：可见 display + aria-hidden 的真实 input
+    - 正文是 pre.editor__inner 的 contenteditable（cledit），不是 CodeMirror
+    - 保存草稿是「button.btn-save → popover .pop-save-opt 里的链接」两步
+    - 编辑器会弹模版库弹窗（.modal + .modal__close-button）
+    - 分类/标签/摘要/声明/封面不在本页——它们在发布对话框里（见 publish-dialog.html）
+    TODO: 用 geopublish snapshot 抓一份完整真实页面替换本文件。
+  -->
+
   <!-- 已登录标志：右上角头像。选择器 auth.avatar -->
-  <header class="marketing-nav">
-    <div class="marketing-nav__user">
-      <a class="user-avatar" href="//i.csdn.net/user/personal">
-        <img src="//profile-avatar.csdnimg.cn/placeholder.jpg" alt="拾一米">
-      </a>
+  <div class="article-bar flex flex--row flex--align-center">
+    <div class="article-bar__input-box">
+      <!-- 选择器 editor.title_display（先点它） -->
+      <div class="article-bar__title-display"></div>
+      <!-- 选择器 editor.title（真实输入框，aria-hidden） -->
+      <input class="article-bar__title article-bar__title--input text-input"
+             aria-hidden="true" maxlength="100" placeholder="请输入文章标题（5~100个字）" value="">
     </div>
-  </header>
-
-  <div class="editor">
-    <div class="article-bar">
-      <!-- 标题：一个输入框。选择器 editor.title -->
-      <input id="article-title" class="article-bar__title"
-             placeholder="请输入文章标题（100 字以内）" maxlength="100" value="">
-    </div>
-
-    <!-- 正文：CodeMirror 容器（结构照抄 6.x 版编辑器）。选择器 editor.content -->
-    <div class="editor__inner">
-      <div class="CodeMirror CodeMirror-wrap cm-s-default">
-        <div class="CodeMirror-scroll">
-          <div class="CodeMirror-sizer">
-            <div class="CodeMirror-code" role="presentation">
-              <pre class=" CodeMirror-line" role="presentation"><span role="presentation"
-                    contenteditable="true" style="padding-right: 0.1px;"></span></pre>
-            </div>
+    <div class="article-bar__user-box flex flex--row">
+      <div class="user-box">
+        <div class="btn-userinfo">
+          <div class="avatar-box">
+            <img class="img-user-avatar" src="//profile-avatar.csdnimg.cn/placeholder.jpg" alt="">
           </div>
         </div>
       </div>
     </div>
+  </div>
 
-    <div class="editor__bottom">
-      <button class="btn btn-publish" type="button">发布文章</button>
-      <button class="btn btn-save-draft" type="button">存草稿</button>
+  <!-- 正文：cledit contenteditable。选择器 editor.content / editor.content_editable -->
+  <div class="layout__panel layout__panel--editor">
+    <div class="gutter"></div>
+    <div class="editor">
+      <pre class="editor__inner markdown-highlighting" contenteditable="true"><div class="cledit-section"><span class="token p"></span></div></pre>
     </div>
+  </div>
 
-    <div class="editor__panel">
-      <div class="panel-item">
-        <label class="panel-item__label" for="category">分类专栏</label>
-        <select id="category" class="panel-item__select">
-          <option value="0">请选择专栏</option>
-          <option value="123">技术分享</option>
-        </select>
-      </div>
+  <!-- 底部按钮区。选择器 editor.save_draft_button / editor.publish_button -->
+  <div class="editor__bottom-bar">
+    <button class="navigation-bar__button button button-save hasChg" type="button">填写标题才可自动保存</button>
+    <button class="btn btn-save el-popover__reference" type="button">保存草稿</button>
+    <button class="btn btn-publish" type="button">发布文章</button>
+  </div>
 
-      <div class="panel-item">
-        <label class="panel-item__label" for="tag-input">添加标签</label>
-        <div class="tag-area">
-          <input id="tag-input" class="tag-input" placeholder="最多添加 5 个标签">
-        </div>
-      </div>
+  <!-- 保存按钮唤出的 popover。选择器 editor.save_draft_item -->
+  <div class="el-popover el-popper pop-save-opt hide">
+    <a class="btn-link">保存草稿</a>
+    <a class="btn-link">保存并预览</a>
+  </div>
 
-      <div class="panel-item">
-        <label class="panel-item__label" for="summary">摘要</label>
-        <textarea id="summary" class="panel-item__textarea" maxlength="100"
-                  placeholder="可选，100 字以内"></textarea>
-      </div>
-
-      <div class="panel-item">
-        <label class="checkbox">
-          <input type="checkbox" id="original-declaration"> 原创声明
-        </label>
-        <label class="checkbox">
-          <input type="checkbox" id="ai-declaration"> AI 辅助生成
-        </label>
-      </div>
-
-      <div class="panel-item">
-        <input type="file" id="cover-upload" class="cover-upload" accept="image/*">
-        <img class="cover-thumbnail" alt="" src="">
-      </div>
+  <!-- 编辑器打开时自动弹出的模版库弹窗。选择器 editor.modal_close -->
+  <div class="modal">
+    <div class="modal__content">
+      <button class="modal__close-button button not-tabbable" type="button"></button>
+      <div class="switch--item flex1 switch--active">模版库</div>
     </div>
   </div>
 </body>

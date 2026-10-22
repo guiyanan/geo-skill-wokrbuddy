@@ -548,3 +548,129 @@ def test_csdn_adapter_exposes_its_login_page():
 
     assert adapter.login_url.startswith("https://passport.csdn.net")
     assert adapter.login_url != adapter.editor_url, "登录页和编辑器页不是一回事"
+
+
+# ------------------------------------------------------- 陈旧 Singleton 锁（T-09b 真机撞上的）
+
+def test_stale_singleton_lock_is_cleaned_and_launch_retried(tmp_path):
+    """Chrome 异常退出留下的 Singleton* 锁会让下一次启动报 ProcessSingleton：
+    清掉三个锁文件并**恰好重试一次**（真机验收撞上两次的真实故障）。"""
+    launcher = _FakeLauncher()
+    calls = {"n": 0}
+    real_launch = launcher.pw.chromium.launch_persistent_context
+
+    def flaky(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("Failed to create a ProcessSingleton for your profile")
+        return real_launch(**kwargs)
+
+    launcher.pw.chromium.launch_persistent_context = flaky
+    profile = tmp_path / "profiles" / "csdn"
+
+    with session_mod.PersistentBrowser(
+        SessionConfig(profile_root=tmp_path / "profiles"), launcher=launcher
+    ).open("csdn"):
+        pass
+
+    assert calls["n"] == 2, "撞锁后必须恰好重试一次"
+    for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        assert not (profile / name).exists()
+
+
+def test_lock_cleanup_only_touches_singleton_files(tmp_path):
+    """清锁不许顺手删别的：profile 里的登录态文件一个都不能动。"""
+    launcher = _FakeLauncher()
+    calls = {"n": 0}
+    real_launch = launcher.pw.chromium.launch_persistent_context
+
+    def flaky(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("Failed to create a ProcessSingleton for your profile")
+        return real_launch(**kwargs)
+
+    launcher.pw.chromium.launch_persistent_context = flaky
+    profile = tmp_path / "profiles" / "csdn"
+    profile.mkdir(parents=True)
+    keep = profile / "Cookies"
+    keep.write_text("登录态", encoding="utf-8")
+    for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        (profile / name).write_text("锁", encoding="utf-8")
+
+    with session_mod.PersistentBrowser(
+        SessionConfig(profile_root=tmp_path / "profiles"), launcher=launcher
+    ).open("csdn"):
+        pass
+
+    assert keep.read_text(encoding="utf-8") == "登录态"
+
+
+def test_non_singleton_launch_error_is_not_retried(tmp_path):
+    """别的启动错误（比如驱动坏了）不许被误清锁误重试——清锁治不了那种病。"""
+    launcher = _FakeLauncher()
+
+    def boom(**kwargs):
+        raise RuntimeError("浏览器二进制缺失")
+
+    launcher.pw.chromium.launch_persistent_context = boom
+
+    with pytest.raises(RuntimeError, match="二进制缺失"):
+        with session_mod.PersistentBrowser(
+            SessionConfig(profile_root=tmp_path / "profiles"), launcher=launcher
+        ).open("csdn"):
+            pass
+
+
+def test_lock_cleanup_tolerates_unlink_failures(tmp_path, monkeypatch):
+    """清锁时 unlink 被拒（权限/竞争）不许炸：重试照样发起，起不起来由第二次决定。"""
+    launcher = _FakeLauncher()
+    calls = {"n": 0}
+    real_launch = launcher.pw.chromium.launch_persistent_context
+
+    def flaky(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("Failed to create a ProcessSingleton for your profile")
+        return real_launch(**kwargs)
+
+    launcher.pw.chromium.launch_persistent_context = flaky
+
+    def deny(self, missing_ok=False):
+        raise OSError("Operation not permitted")
+
+    monkeypatch.setattr(Path, "unlink", deny)
+
+    with session_mod.PersistentBrowser(
+        SessionConfig(profile_root=tmp_path / "profiles"), launcher=launcher
+    ).open("csdn"):
+        pass
+
+    assert calls["n"] == 2
+
+
+def test_lock_cleanup_tolerates_unlink_failures(tmp_path, monkeypatch):
+    """清锁时 unlink 被拒（权限/竞争）不许炸：重试照样发起，起不起来由第二次决定。"""
+    launcher = _FakeLauncher()
+    calls = {"n": 0}
+    real_launch = launcher.pw.chromium.launch_persistent_context
+
+    def flaky(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("Failed to create a ProcessSingleton for your profile")
+        return real_launch(**kwargs)
+
+    launcher.pw.chromium.launch_persistent_context = flaky
+
+    def deny(self, missing_ok=False):
+        raise OSError("Operation not permitted")
+
+    monkeypatch.setattr(Path, "unlink", deny)
+
+    with session_mod.PersistentBrowser(
+        SessionConfig(profile_root=tmp_path / "profiles"), launcher=launcher
+    ).open("csdn"):
+        pass
+
+    assert calls["n"] == 2

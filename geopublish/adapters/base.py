@@ -62,7 +62,16 @@ __all__ = [
 # 价值正在于「一刀切、不给例外」，所以改词不改门禁。
 REQUIRED_SELECTORS: Mapping[str, tuple[str, ...]] = {
     "auth": ("login_form", "challenge", "avatar"),
-    "editor": ("title", "content", "content_editable", "publish_button", "save_draft_button"),
+    "editor": (
+        "title",           # 隐藏的真实 input（CSDN：可见的是 display，输入框 aria-hidden）
+        "title_display",   # 可见的标题展示层：先点它，输入框才出现
+        "content",
+        "content_editable",
+        "publish_button",
+        "save_draft_button",
+        "save_draft_item",  # 保存按钮唤出的 popover 里的「保存草稿」链接
+        "modal_close",      # 编辑器会自动弹模版库等弹窗，不关掉会挡住一切点击
+    ),
     "meta": ("category", "tags", "summary", "original_declaration", "ai_declaration"),
     "cover": ("upload_input", "thumbnail"),
     "verify": ("article_id", "success_marker", "draft_list_item"),
@@ -272,6 +281,20 @@ class Page(Protocol):
         verify 要靠它拿到「编辑器里此刻的标题」再去草稿列表比对：
         标题只存在于这次会话里，平台不会把它回填到成功页上。
         """
+        ...
+
+    # --- 写入两件：真机校准（T-09b）加的最小写面。
+
+    def fill(self, selector: str, text: str) -> None:
+        """一次性填入文本框。框架受控组件只认真实输入管线，value= 赋值会被模型无视。
+
+        Playwright 的 fill 自带可见性等待，正好覆盖「先点 display 再填隐藏 input」
+        这种两步控件。
+        """
+        ...
+
+    def wait_for_url(self, pattern: str, timeout_ms: int = 10_000) -> None:
+        """等 URL 变成某个 glob 形态。存草稿成功的真实信号就是 URL 长出 articleId。"""
         ...
 
 

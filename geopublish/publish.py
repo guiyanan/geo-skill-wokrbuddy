@@ -205,9 +205,14 @@ def publish_draft(
         adapter.open_editor(page, draft)
         adapter.fill_content(page, draft)
         if loaded.cover is not None:
-            # 顺序照架构 §5：封面在元信息之前，缩略图等待期间还能顺手发现上传框改版
-            adapter.upload_cover(page, loaded.cover)
-        adapter.fill_meta(page, draft, platform_cfg)
+            if mode is SubmitMode.PUBLISH:
+                # 顺序照架构 §5：封面在元信息之前，缩略图等待期间还能顺手发现上传框改版
+                adapter.upload_cover(page, loaded.cover)
+            else:
+                # 真机校准（T-09b）：封面上传框在「发布文章」对话框里，编辑器页面上
+                # 没有这个控件。草稿模式强行上传只会撞选择器超时，明说跳过。
+                logger.warning("草稿模式不上传封面（封面控件在发布对话框里，T-10）：%s", loaded.cover)
+        adapter.fill_meta(page, draft, platform_cfg, mode=mode)
 
         submitted = adapter.submit(page, mode=mode)
         logger.info("submit 返回 %s：%s", submitted.state.value, submitted.reason)

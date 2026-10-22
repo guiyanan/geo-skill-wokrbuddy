@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>发布文章 - CSDN（占位快照）</title>
+</head>
+<body class="mp-editor-page">
+  <!--
+    ⚠️ 占位快照（未经真机校准）：发布对话框的真实 DOM 还没抓过——抓它需要点
+    「发布文章」打开对话框（不点最终发布按钮），属于 T-10 的第一步现场工作。
+    本文件里的控件 id/类名沿用手工约定，meta/cover 组的契约测试只证明
+    「选择器语法有效且形状自洽」，不证明「对线上有效」。
+    T-10 抓到真实对话框后，第一件事就是替换本文件并看着契约测试红/绿。
+  -->
+
+  <div class="publish-dialog">
+    <div class="panel-item">
+      <label class="panel-item__label" for="category">分类专栏</label>
+      <!-- 选择器 meta.category -->
+      <select id="category" class="panel-item__select">
+        <option value="0">请选择专栏</option>
+        <option value="123">技术分享</option>
+      </select>
+    </div>
+
+    <div class="panel-item">
+      <label class="panel-item__label" for="tag-input">添加标签</label>
+      <!-- 选择器 meta.tags -->
+      <div class="tag-area">
+        <input id="tag-input" class="tag-input" placeholder="最多添加 5 个标签">
+      </div>
+    </div>
+
+    <div class="panel-item">
+      <label class="panel-item__label" for="summary">摘要</label>
+      <!-- 选择器 meta.summary -->
+      <textarea id="summary" class="panel-item__textarea" placeholder="不填则默认提取正文前 256 字"></textarea>
+    </div>
+
+    <div class="panel-item">
+      <!-- 选择器 meta.original_declaration -->
+      <input id="original-declaration" type="checkbox">
+      <label for="original-declaration">原创声明</label>
+      <!-- 选择器 meta.ai_declaration -->
+      <select id="ai-declaration">
+        <option value="">请选择 AI 参与度</option>
+        <option value="human">未使用 AI</option>
+        <option value="assisted">AI 辅助</option>
+        <option value="generated">AI 生成</option>
+      </select>
+    </div>
+
+    <div class="panel-item">
+      <label>封面</label>
+      <!-- 选择器 cover.upload_input / cover.thumbnail -->
+      <input id="cover-upload" type="file" accept="image/png,image/jpeg">
+      <img class="cover-thumbnail" src="" alt="封面预览" hidden>
+    </div>
+  </div>
+</body>
+</html>

@@ -7,7 +7,7 @@
     "editor.csdn.net",
     "passport.csdn.net"
   ],
-  "editor_url": "https://mp.csdn.net/mp_blog/creation/editor",
+  "editor_url": "https://editor.csdn.net/md?not_checkout=1",
   "login_url": "https://passport.csdn.net/login",
   "draft_list_url": "https://mp.csdn.net/mp_blog/manage/article",
   "cover": {
@@ -15,5 +15,5 @@
     "height": 640,
     "max_bytes": 5242880
   },
-  "_note": "字数/标题/标签上限只在 config/geopublish.json（PlatformConfig）里，这里不许再写一份：两处都写就是两份真相，改了一处忘了另一处，guard 拦的和平台实际限制会对不上。cover 反过来：尺寸是平台说了算（PRD：尺寸从平台读取，不得硬编码），所以规格进这份 JSON；1140x640 是初始值，T-09 首发时须对照真实后台上传框校准。draft_list_url 是 verify 的兜底页（存草稿后 URL 不变时按标题核对），同样要在首发时用真实后台地址校准。"
+  "_note": "字数/标题/标签上限只在 config/geopublish.json（PlatformConfig）里，这里不许再写一份：两处都写就是两份真相，改了一处忘了另一处，guard 拦的和平台实际限制会对不上。cover 反过来：尺寸是平台说了算（PRD：尺寸从平台读取，不得硬编码），所以规格进这份 JSON；1140x640 是初始值，待校准（真实上传框在发布对话框里，T-10 抓取）。2026-10-21 真机校准：editor_url 改为 MD 编辑器（默认落地的是 CKEditor 富文本，正文在 iframe 里，不在我们的写面内）；草稿/编辑器选择器已按真实 DOM 校准（见 selectors.json 2026-10-21.3）。verify 的真实成功信号是 URL 长出 ?articleId= 参数（window.articleId 实测恒为 null，勿用）。draft_list_url 的列表行结构（draft_list_item）尚未校准——列表加载是异步的，当时勘查脚本等得不够久。"
 }

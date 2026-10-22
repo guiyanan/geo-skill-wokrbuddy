@@ -94,3 +94,9 @@ class StaticPage:
         if element is None:
             raise StaticPageError(f"静态快照里没有命中：{selector}")
         return element.get_attribute("value") or ""
+
+    def fill(self, selector: str, text: str) -> None:
+        raise StaticPageError("静态快照不能填表。")
+
+    def wait_for_url(self, pattern: str, timeout_ms: int = 10_000) -> None:
+        raise StaticPageError("静态快照的 URL 不会变。")

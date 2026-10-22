@@ -64,8 +64,8 @@ class RecordingAdapter:
     def upload_cover(self, page, path):
         self.calls.append(("upload_cover", Path(path).name))
 
-    def fill_meta(self, page, draft, limits):
-        self.calls.append("fill_meta")
+    def fill_meta(self, page, draft, limits, *, mode=SubmitMode.DRAFT):
+        self.calls.append(("fill_meta", SubmitMode(mode).value))
 
     def submit(self, page, *, mode=SubmitMode.DRAFT):
         self.calls.append(("submit", SubmitMode(mode).value))
@@ -119,10 +119,10 @@ def _cfg(**over) -> PlatformConfig:
 
 # --------------------------------------------------------------- 顺序
 
-def test_publish_runs_the_seven_steps_in_order(tmp_path):
+def test_publish_runs_the_steps_in_order(tmp_path):
     adapter = RecordingAdapter()
     opened: list[str] = []
-    loaded = _loaded(tmp_path, cover=True)
+    loaded = _loaded(tmp_path, cover=False)  # 草稿链路：标题 + 正文 + 保存
     open_page, page = _opener(opened)
 
     outcome = publish_draft(adapter, loaded, _cfg(), gate=Gate.DRAFT, open_page=open_page)
@@ -137,11 +137,25 @@ def test_publish_runs_the_seven_steps_in_order(tmp_path):
         "check_auth",
         "open_editor",
         "fill_content",
-        ("upload_cover", "cover.png"),
-        "fill_meta",
+        ("fill_meta", "draft"),
         ("submit", "draft"),
         ("verify", "draft"),
     ], f"实际顺序：{adapter.calls}"
+
+
+def test_draft_mode_skips_cover_upload_with_a_warning(tmp_path, caplog):
+    """封面上传框在发布对话框里（真机校准）：草稿模式跳过并明说，不撞选择器。"""
+    adapter = RecordingAdapter()
+    loaded = _loaded(tmp_path, cover=True)
+
+    with caplog.at_level(logging.WARNING, logger="geopublish.publish"):
+        outcome = publish_draft(
+            adapter, loaded, _cfg(), gate=Gate.DRAFT, open_page=_opener([])[0]
+        )
+
+    assert outcome.ok is True
+    assert not [c for c in adapter.calls if isinstance(c, tuple) and c[0] == "upload_cover"]
+    assert any("草稿模式不上传封面" in r.message for r in caplog.records)
 
 
 def test_cover_step_is_skipped_when_the_draft_has_none(tmp_path):
@@ -152,6 +166,26 @@ def test_cover_step_is_skipped_when_the_draft_has_none(tmp_path):
     publish_draft(adapter, loaded, _cfg(), gate=Gate.DRAFT, open_page=_opener([])[0])
 
     assert not [c for c in adapter.calls if isinstance(c, tuple) and c[0] == "upload_cover"]
+
+
+def test_publish_mode_uploads_cover_and_passes_mode_down(tmp_path):
+    """发布模式：封面上传在元信息之前，且 mode 一路传到 fill_meta/submit/verify。"""
+    adapter = RecordingAdapter()
+
+    publish_draft(
+        adapter, _loaded(tmp_path, cover=True), _cfg(), gate=Gate.PUBLISH,
+        open_page=_opener([])[0], mode="publish",
+    )
+
+    assert adapter.calls == [
+        "check_auth",
+        "open_editor",
+        "fill_content",
+        ("upload_cover", "cover.png"),
+        ("fill_meta", "publish"),
+        ("submit", "publish"),
+        ("verify", "publish"),
+    ]
 
 
 def test_default_mode_is_draft(tmp_path):
@@ -298,6 +332,7 @@ def test_publish_mode_passes_the_gate_and_travels_down_as_publish(tmp_path):
     )
 
     assert ("submit", "publish") in adapter.calls
+    assert ("fill_meta", "publish") in adapter.calls
 
 
 # --------------------------------------------------------------- 稿件装载

@@ -5,11 +5,12 @@
 
 | 文件 | 对应线上页面 | 用来钉什么 |
 |---|---|---|
-| `editor.html` | `mp.csdn.net/mp_blog/creation/editor`（已登录） | 标题 / CodeMirror 正文容器 / 分类 / 标签 / 摘要 / 声明 / 封面 / 发布按钮 |
+| `editor.html` | `editor.csdn.net/md` MD 编辑器（已登录）。**2026-10-21 按真机勘查重建** | 标题双层控件 / cledit 正文 / 保存草稿两步 / 发布按钮 / 模版库弹窗 / 头像 |
+| `publish-dialog.html` | 「发布文章」对话框（⚠️ **占位，未经真机校准**——抓取属于 T-10 第一步） | 分类 / 标签 / 摘要 / 声明 / 封面上传框 |
 | `login.html` | `passport.csdn.net` 登录页 | 被踢回登录 → `expired` |
-| `captcha.html` | 风控验证页 | 有人机校验 → `unknown` + `has_challenge=True`，**且优先于登录表单判定** |
-| `success.html` | 发布成功页 | 回读用的 `article_id` / `success_marker` 能命中 |
-| `drafts.html` | `mp.csdn.net/mp_blog/manage/article`（草稿箱） | verify 兜底：列表行命中 `draft_list_item`，且每行带得出 href（article_id 的来源） |
+| `captcha.html` | 风控验证页（⚠️ 占位，未见过真实风控页） | 有人机校验 → `unknown` + `has_challenge=True`，**且优先于登录表单判定** |
+| `success.html` | 发布成功页（⚠️ 占位，等 T-10 真发布后校准） | 回读用的 `article_id` / `success_marker` 能命中 |
+| `drafts.html` | `mp.csdn.net/mp_blog/manage/article` 草稿箱（⚠️ 占位——列表行结构未抓到，当时勘查脚本没等够加载时间） | verify 兜底：列表行命中 `draft_list_item`，且每行带得出 href |
 
 **词汇说明**：选择器键叫 `auth.challenge`、结果字段叫 `has_challenge`，不叫
 `captcha`/`has_captcha`。因为 `geopublish/**/*.py` 里出现那个英文词会被红线门禁拦下
@@ -36,6 +37,20 @@ geopublish snapshot "https://passport.csdn.net/login" csdn/login --out fixtures
 `drafts.html` 的列表结构同理。等 T-09 真发一篇草稿后再用真实页面校准——到那时如果
 打不中，契约测试会先红，而不是等到「以为发出去了其实没有」。
 
+
+## 校准状态（2026-10-21 T-09b 真机勘查后）
+
+**已校准**（按真实页面重建/确认）：`editor.html`（MD 编辑器）、`login.html` 的 `.login-box`、
+登录态头像 `img.img-user-avatar`、存草稿两步流程、URL `?articleId=` 成功信号。
+
+**仍是占位**（明确标注在文件头注释里）：`publish-dialog.html`、`success.html`、
+`drafts.html`、`captcha.html`。它们的选择器打不中真站时，契约测试不会红——
+这是已知缺口，堵法是 T-10 现场抓取替换（那时打不中会先红，而不是以为发出去其实没有）。
+
+真机实测还要记住三条（写进了 adapter 注释）：
+1. 编辑器**会恢复上次未保存内容**——注入前必须清场。
+2. 回读只能用 `textContent`，`innerText` 会把空行算两次。
+3. `window.articleId` 恒为 null——成功信号在 URL 参数里。
 
 ## 为什么不 mock adapter
 

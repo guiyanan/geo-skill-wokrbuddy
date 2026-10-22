@@ -1,9 +1,10 @@
-"""T-07 正文注入（三级降级）。
+"""T-07 正文注入（三级降级）；2026-10-21 T-09b 真机校准后改版。
 
 钉死的行为：
-- L1 模拟粘贴 → L2 CodeMirror 实例 → L3 分段 type，顺序固定，不许跳级
-- 每级注入后**回读**比对，长度偏差 > 2% 视为该级失败（不验证就提交 = 盲发）
-- 单级超时限 = 该级失败（时间走注入时钟，不是墙钟）
+- L1 execCommand insertText → L2 合成 paste → L3 分段 type，顺序固定，不许跳级
+- **先清场再注入**：编辑器会恢复上次未保存的内容（真机实测），不清场 = 双倍正文
+- 每级注入后**回读**比对（textContent，剥离尾换行），长度偏差 > 2% 视为该级失败
+- 每次降级前重新清场：上一级可能写了半截，残留 + 新内容 = 双倍正文
 - 三级全灭 → InjectFailed，携带三级尝试记录（上层拿它归档现场包），**不做任何提交动作**
 - 每次降级都有 WARNING 日志（UT-07-03 要能看到两次）
 """
@@ -34,12 +35,12 @@ def _draft(body: str) -> Draft:
 
 
 class FakeEditorPage:
-    """假编辑器页：按 op 注释分发 evaluate，内部维护一份 doc 模拟 CodeMirror。
+    """假 cledit 编辑器页：按 op 注释分发 evaluate，内部维护一份 doc。
 
     behavior 取值：
     - "ok"       注入成功，doc 变成全文
-    - "truncate" 注入「成功」但只进了一半（粘贴被平台拦就是这种）
-    - "deny"     脚本返回 ok:false（拿不到 CM 实例）
+    - "truncate" 注入「成功」但只进了一半
+    - "deny"     脚本返回 ok:false（execCommand 被拒就是这种）
     - "raise"    evaluate 直接抛异常（元素不存在/超时）
     - "deny_bare" 脚本返回 ok:false 且不给原因（页面脚本崩坏时的真实形态）
     """
@@ -52,18 +53,19 @@ class FakeEditorPage:
         type_ok: bool = True,
         clear_ok: bool = True,
         readback_ok: bool = True,
+        restored: str = "",
         clock: FakeClock | None = None,
         evaluate_cost_s: float = 0.0,
     ) -> None:
-        self.doc = ""
-        self.plan = {"paste": l1, "dispatch": l2}
+        self.doc = restored
+        self.plan = {"insert": l1, "paste": l2}
         self.type_ok = type_ok
         self.clear_ok = clear_ok
         self.readback_ok = readback_ok
         self.clock = clock
         self.evaluate_cost_s = evaluate_cost_s
         self.calls: list[tuple[str, object]] = []
-        self.url = "https://mp.csdn.net/"
+        self.url = "https://editor.csdn.net/md"
 
     # --- 写操作（生产代码只允许通过这三个口子碰页面） ---
 
@@ -78,12 +80,12 @@ class FakeEditorPage:
 
     def evaluate(self, script: str, arg=None):
         op = script.split("/* op=", 1)[1].split(" ", 1)[0]
-        if self.clock is not None and op != "readback":
+        if self.clock is not None and op in self.plan:
             self.clock.advance(self.evaluate_cost_s)
         if op == "readback":
             self.calls.append(("readback", None))
             if not self.readback_ok:
-                return {"ok": False, "reason": "容器与编辑区都未命中"}
+                return {"ok": False, "reason": "编辑区未命中"}
             return {"ok": True, "text": self.doc}
         if op == "clear":
             self.calls.append(("clear", None))
@@ -91,6 +93,8 @@ class FakeEditorPage:
                 raise RuntimeError("清场脚本被页面拒绝")
             self.doc = ""
             return {"ok": True}
+        if op == "closemodals":
+            return {"ok": True, "closed": 0}
 
         sel, text = arg
         self.calls.append((op, len(text)))
@@ -110,7 +114,7 @@ class FakeEditorPage:
 
 # ----------------------------------------------------------- UT-07-01
 
-def test_ut_07_01_l1_paste_success_readback_within_tolerance(caplog):
+def test_ut_07_01_l1_insert_success_readback_within_tolerance(caplog):
     """L1 成功后回读长度与源文差异 < 2%，且不再碰 L2/L3。"""
     body = "正文" * 500
     adapter = CsdnAdapter()
@@ -121,14 +125,43 @@ def test_ut_07_01_l1_paste_success_readback_within_tolerance(caplog):
 
     assert page.doc == body
     ops = [name for name, _ in page.calls]
-    assert ops == ["paste", "readback"], f"L1 成功不该碰 L2/L3：{ops}"
-    assert any("L1-paste" in r.message for r in caplog.records)
+    assert ops == ["clear", "insert", "readback"], f"L1 成功不该碰 L2/L3：{ops}"
+    assert any("L1-insert" in r.message for r in caplog.records)
+
+
+def test_restored_content_is_cleared_before_injection():
+    """编辑器恢复了上次未保存的内容（真机实测）→ 必须先清场再注入。"""
+    body = "新稿正文" * 200
+    adapter = CsdnAdapter()
+    page = FakeEditorPage(restored="上次没发出去的残稿" * 100)
+
+    adapter.fill_content(page, _draft(body))
+
+    assert page.doc == body, "残稿不能被追加在新正文前面"
+    assert page.calls[0][0] == "clear", "第一步必须是清场"
+
+
+def test_trailing_newline_added_by_editor_is_not_a_failure():
+    """编辑器自动补的尾换行（实测 +1 字）不该把成功判成失败。"""
+    adapter = CsdnAdapter()
+    body = "短正文" * 10  # 30 字，+1 尾换行超 2% 容忍
+    page = FakeEditorPage()
+    real_evaluate = page.evaluate
+
+    def add_trailing_newline(script, arg=None):
+        result = real_evaluate(script, arg)
+        if "op=readback" in script and result.get("ok"):
+            result = {"ok": True, "text": result["text"] + "\n"}
+        return result
+
+    page.evaluate = add_trailing_newline  # type: ignore[method-assign]
+    adapter.fill_content(page, _draft(body))  # 不抛异常即为通过
 
 
 # ----------------------------------------------------------- UT-07-02
 
 def test_ut_07_02_l1_length_deviation_degrades_to_l2(caplog):
-    """L1 注入后回读长度偏差 50% → 自动降级 L2，不直接失败。"""
+    """L1 注入后回读长度偏差 50% → 重新清场并降级 L2，不直接失败。"""
     body = "甲" * 1000
     adapter = CsdnAdapter()
     page = FakeEditorPage(l1="truncate")
@@ -138,9 +171,9 @@ def test_ut_07_02_l1_length_deviation_degrades_to_l2(caplog):
 
     assert page.doc == body, "L2 要把全文补进去"
     ops = [name for name, _ in page.calls]
-    assert ops == ["paste", "readback", "dispatch", "readback"]
+    assert ops == ["clear", "insert", "readback", "clear", "paste", "readback"]
     downgrades = [r for r in caplog.records if "降级" in r.message]
-    assert len(downgrades) == 1 and "L1-paste" in downgrades[0].message
+    assert len(downgrades) == 1 and "L1-insert" in downgrades[0].message
 
 
 # ----------------------------------------------------------- UT-07-03
@@ -157,7 +190,7 @@ def test_ut_07_03_l1_l2_fail_degrade_to_l3_with_two_warnings(caplog):
     assert page.doc == body
     ops = [name for name, _ in page.calls]
     type_calls = [n for name, n in page.calls if name == "type"]
-    assert ops[0] == "paste" and "dispatch" in ops
+    assert ops[0] == "clear" and "insert" in ops and "paste" in ops
     assert len(type_calls) == math.ceil(len(body) / SEGMENT_SIZE)
     assert all(n <= SEGMENT_SIZE for n in type_calls), "每段不得超过 SEGMENT_SIZE"
     downgrades = [r for r in caplog.records if "降级" in r.message and r.levelno == logging.WARNING]
@@ -190,10 +223,10 @@ def test_ut_07_04_all_three_levels_fail_raise_inject_failed():
 
     err = exc.value
     assert len(err.attempts) == 3
-    assert [a.level for a in err.attempts] == ["L1-paste", "L2-dispatch", "L3-type"]
+    assert [a.level for a in err.attempts] == ["L1-insert", "L2-paste", "L3-type"]
     assert all(not a.ok for a in err.attempts)
     assert err.expected_len == len(body)
-    for level in ("L1-paste", "L2-dispatch", "L3-type"):
+    for level in ("L1-insert", "L2-paste", "L3-type"):
         assert level in str(err), "异常消息要能说清三级各自怎么死的"
     # 现场包 payload 直接可用：每条尝试都有原因
     assert all(a.reason for a in err.attempts)
@@ -239,7 +272,7 @@ def test_slow_but_verified_l1_still_counts_as_success():
     adapter.fill_content(page, _draft(body))
 
     ops = [name for name, _ in page.calls]
-    assert ops == ["paste", "readback"], f"已验证的成功不该降级：{ops}"
+    assert ops == ["clear", "insert", "readback"], f"已验证的成功不该降级：{ops}"
 
 
 def test_l3_clears_before_typing_so_no_duplicate_content():
@@ -297,7 +330,7 @@ def test_crlf_body_is_normalized_before_length_compare():
 
     assert page.doc == body.replace("\r\n", "\n")
     ops = [name for name, _ in page.calls]
-    assert ops == ["paste", "readback"], f"换行差异不该触发降级：{ops}"
+    assert ops == ["clear", "insert", "readback"], f"换行差异不该触发降级：{ops}"
 
 
 # ----------------------------------------------------------- 入口守卫
@@ -337,7 +370,7 @@ def test_inject_denied_without_reason_still_degrades():
     adapter.fill_content(page, _draft("无理由拒绝" * 50))
 
     ops = [name for name, _ in page.calls]
-    assert "dispatch" in ops
+    assert "paste" in ops
 
 
 def test_readback_returning_nothing_counts_as_failure():

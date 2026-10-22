@@ -34,7 +34,7 @@ def _leaf_paths() -> list[str]:
 # ------------------------------------------------ CT-05-01 / CT-05-02 命中
 
 def test_title_selector_hits_exactly_one_input(fixture_dom):
-    """CT-05-01：标题选择器命中 1 个元素。
+    """CT-05-01：标题选择器命中 1 个元素（真实 input，不是可见的 display 层）。
 
     命中 2 个是更隐蔽的错误：真跑的时候 Playwright 用第一个，你以为填了 A 其实填了 B。
     """
@@ -46,11 +46,23 @@ def test_title_selector_hits_exactly_one_input(fixture_dom):
     )
 
     assert len(hits) == 1
-    assert hits[0].get_attribute("id") == "article-title"
+    assert "article-bar__title--input" in (hits[0].get_attribute("class") or "")
 
 
-def test_content_selector_hits_the_codemirror_container(fixture_dom):
-    """CT-05-02：正文选择器落在 CodeMirror 容器上（不是里面的 pre，也不是外层 editor）。"""
+def test_title_display_selector_hits_the_visible_layer(fixture_dom):
+    """T-09b：display 展示层也得有 DOM 证明——填标题的第一步是点它。"""
+    from dom import StaticPage
+
+    adapter = CsdnAdapter()
+    hits = StaticPage(fixture_dom("csdn", "editor")).query_selector_all(
+        adapter.selectors("editor", "title_display")
+    )
+
+    assert len(hits) == 1
+
+
+def test_content_selector_hits_the_cledit_container(fixture_dom):
+    """CT-05-02：正文选择器落在 cledit 的 pre 上（T-09b：不是 CodeMirror）。"""
     from dom import StaticPage
 
     adapter = CsdnAdapter()
@@ -59,16 +71,41 @@ def test_content_selector_hits_the_codemirror_container(fixture_dom):
     )
 
     assert len(hits) == 1
-    assert "CodeMirror" in (hits[0].get_attribute("class") or "")
+    assert "editor__inner" in (hits[0].get_attribute("class") or "")
 
 
-@pytest.mark.parametrize("group", ["editor", "meta", "cover"])
+@pytest.mark.parametrize("group", ["editor"])
 def test_every_selector_in_group_hits_on_editor_page(fixture_dom, group):
-    """编辑器页上，这三组选择器必须全部命中——任何一个落空都是改版或笔误。"""
+    """编辑器页上，editor 组选择器必须全部命中——任何一个落空都是改版或笔误。
+
+    meta/cover 组不在这里：真机校准发现它们的控件在「发布文章」对话框里，
+    单独对 publish-dialog fixture 断言（见下面的测试）。
+    """
     from dom import StaticPage
 
     adapter = CsdnAdapter()
     page = StaticPage(fixture_dom("csdn", "editor"))
+    missed = {
+        key: selector
+        for key, selector in adapter.selectors_book.group(group).items()
+        if page.query_selector(selector) is None
+    }
+
+    assert not missed, f"{group} 组这些选择器没命中：{missed}"
+
+
+@pytest.mark.parametrize("group", ["meta", "cover"])
+def test_meta_and_cover_hit_on_the_publish_dialog(fixture_dom, group):
+    """meta/cover 组的控件在发布对话框里。
+
+    ⚠️ publish-dialog.html 目前是**占位快照**（未经真机校准，见 fixtures README）——
+    这条测试只保证「选择器语法有效、形状自洽」，T-10 抓到真实对话框后替换 fixture，
+    那时打不中会在这里先红。
+    """
+    from dom import StaticPage
+
+    adapter = CsdnAdapter()
+    page = StaticPage(fixture_dom("csdn", "publish-dialog"))
     missed = {
         key: selector
         for key, selector in adapter.selectors_book.group(group).items()
