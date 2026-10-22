@@ -658,9 +658,34 @@ UT-03-07/08 确保 R4 五项**全部**与 `rejected` 联动，而不只是前三
 3. **verify 三条取 id 路径按代价排序**：DOM meta → URL（`?articleId=` / `/creation/editor/<id>` / `/article/details/<id>`）→ 草稿列表页按标题核对。最后一条是存草稿后 URL 不变时唯一能确认的办法，所以 meta.json 配了 `draft_list_url`、selectors 配了 `draft_list_item`，并有契约测试兜底（没有断言过的选择器等于一句愿望）。
 
 **已知失败模式 / 待办**
-- **L4 真机验收未做**（DoD 的手工项）：本机没有 CSDN 登录态。需要 `geopublish login csdn` 后跑 `geopublish publish <draft> --mode draft`；届时按真实页面校准 `success.html`/`drafts.html` 快照、`draft_list_url`、`draft_list_item` 与 cover 规格（T-08 遗留的 1140×640）。校准时打不中 → 契约测试会先红，这正是它们存在的意义。
+- ~~**L4 真机验收未做**~~ → 2026-10-21 已做，并触发了 **T-09b 真机校准**（见下方记录）：选择器占位 18/18 全不命中，adapter 按真实 DOM 重写。
 - **无幂等**：连跑两次会在草稿箱留两篇。R9 由 T-11 落地，此前不要把 publish 接进 cron。
 - **快照里截图只有成功后一张**：before/after 双图与 `receipt.json` 是 T-10 的回执设计。
+
+**T-09b 真机校准记录（2026-10-21，L4 现场勘查后）**
+
+真机探活发现：手工构造的 fixture 选择器 **18 条全不命中**。真实 CSDN 与猜测的差异：
+
+| 猜测 | 实测 | 处置 |
+|---|---|---|
+| 编辑器在 `mp.csdn.net/mp_blog/creation/editor` | 默认落地 CKEditor（正文在 iframe）；Markdown 编辑器在 `editor.csdn.net/md` | `editor_url` 改 MD 编辑器 |
+| 正文是 CodeMirror | 自研 cledit：`pre.editor__inner[contenteditable]` | 注入链改 L1 insertText → L2 paste → L3 type |
+| 标题是单个 input | 双层控件：可见 display + aria-hidden input；`value=` 被模型无视 | 填标题 = 点 display → `fill` → 回读 |
+| innerText 回读 | 空行被算两次；编辑器自动补尾换行 | 回读只认 `textContent`，双方 rstrip 尾换行再比 |
+| 存草稿是一个按钮 | `button.btn-save` → popover 链接「保存草稿」两步；成功信号是 URL 长出 `?articleId=`（`window.articleId` 恒为 null） | submit 改两步 + `wait_for_url` |
+| 无弹窗 | 打开即弹「模版库」弹窗挡点击（内含「确定删除该模板？」预渲染框） | `close_modals` 进 open_editor 与 submit，**只点关闭按钮** |
+| 无恢复行为 | 编辑器**恢复上次未保存内容** | 注入前必清场，降级前再清场 |
+| 分类/标签/封面在编辑器页 | 全在「发布文章」对话框里 | 草稿模式 fill_meta 只填标题、跳过封面；对话框 DOM 待 T-10 抓取 |
+| — | 浏览器异常退出留 `Singleton*` 锁，下次启动必崩 | session 撞锁清三个文件重试一次（只动锁文件） |
+
+校准后全包 1916 语句/482 分支 **100%**，静态门禁全过。fixtures 已按真机重建（editor.html），
+`publish-dialog.html` / `drafts.html` / `success.html` / `captcha.html` 仍是**明确标注的占位**。
+
+**L4 已验证**：真机存草稿成功，URL 长出 `articleId=168659812`，回读正文 2846/2845 字（diff < 2%，
+那 1 字是编辑器自动补的尾换行）。L4 未验证（等 T-10 或下次真机窗口）：草稿箱列表行结构
+（`draft_list_item` 兜底路径）、发布对话框控件、`geopublish publish` 命令本身的端到端首跑
+（校准后命令路径与手动脚本同源，但还没用命令真跑过一遍）。
+
 
 ---
 
