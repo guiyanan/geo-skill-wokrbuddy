@@ -52,10 +52,12 @@ class FakeMetaPage:
         self.typed: list[tuple[str, str]] = []
         self.pressed: list[tuple[str, str]] = []
         self.clicks: list[str] = []
+        self.ops: list[str] = []
         self.url = "https://editor.csdn.net/md"
 
     def evaluate(self, script: str, arg=None):
         op = script.split("/* op=", 1)[1].split(" ", 1)[0]
+        self.ops.append(op)
         if op == "setvalue":
             sel, text = arg
             if not self.setvalue_ok:
@@ -151,6 +153,18 @@ def test_title_goes_through_display_clear_then_real_keyboard():
     assert (title_sel, "Backspace") in page.pressed
     assert (title_sel, "探针标题") in page.typed, "标题必须走真实键盘"
     assert title_sel not in page.filled, "不许用 fill——模型只认键盘事件"
+
+
+def test_fill_meta_closes_modals_before_touching_the_title():
+    """弹窗会在注入正文后再冒出来（实测）：点标题 display 前必须再关一轮。"""
+    adapter = _adapter()
+    page = FakeMetaPage()
+
+    adapter.fill_meta(page, _draft(), PlatformConfig(name="csdn"))
+
+    assert page.ops and page.ops[0] == "closemodals", (
+        f"第一个动作必须是关弹窗，实际：{page.ops[:3]}"
+    )
 
 
 def test_ut_08_01_overlong_title_is_truncated_with_warning(caplog):

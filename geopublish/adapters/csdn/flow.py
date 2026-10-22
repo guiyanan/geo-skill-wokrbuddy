@@ -602,6 +602,9 @@ class CsdnAdapter:
                 title[:12],
             )
             title = title[: limits.title_max]
+        # 弹窗会在注入正文后再冒出来（实测：open_editor 关过一轮，fill 完又被挡住）。
+        # 点标题 display 之前必须再关一轮，否则 Playwright 卡到超时。
+        self.close_modals(page)
         self._fill_title(page, title)
 
         if mode is SubmitMode.DRAFT:
