@@ -682,9 +682,19 @@ UT-03-07/08 确保 R4 五项**全部**与 `rejected` 联动，而不只是前三
 `publish-dialog.html` / `drafts.html` / `success.html` / `captcha.html` 仍是**明确标注的占位**。
 
 **L4 已验证**：真机存草稿成功，URL 长出 `articleId=168659812`，回读正文 2846/2845 字（diff < 2%，
-那 1 字是编辑器自动补的尾换行）。L4 未验证（等 T-10 或下次真机窗口）：草稿箱列表行结构
-（`draft_list_item` 兜底路径）、发布对话框控件、`geopublish publish` 命令本身的端到端首跑
-（校准后命令路径与手动脚本同源，但还没用命令真跑过一遍）。
+那 1 字是编辑器自动补的尾换行）。
+
+**L4 正式验收（2026-10-22，DoD 达成）**：`geopublish publish data/l4/draft-t09 --mode draft` 一条命令
+退出码 0，草稿 `articleId=168765763`（URL `https://editor.csdn.net/md/?articleId=168765763`），
+截图 `data/runs/20261022_082828/draft.png`。正文注入走 L2-paste（L1 insertText 在真机丢 88 字，
+被回读拦下后自动降级——三级链按设计工作）。正式跑一共修掉 7 个只有真机才暴露的问题：
+探活等待（SPA load≠渲染完）、标题 fill/键盘/15ms 延迟/草稿恢复覆盖重打、
+`press_sequentially` 与 `wait_for_hidden` 的真机 API 兼容、弹窗 `position:fixed`/`display:contents`
+两种拦截形态（点关闭+摘遮罩+DOM focus 三件套）、草稿列表 tab 的异步渲染等待。
+
+**L4 未验证**（等 T-10 或下次真机窗口）：发布对话框控件与封面规格（发布才会点开），
+`publish-dialog.html` / `success.html` / `captcha.html` 三个 fixture 仍是标注占位；
+草稿箱里现存 4 篇测试草稿（含 1 篇【无标题】）待人工清理。
 
 
 ---
