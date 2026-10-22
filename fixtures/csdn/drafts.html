@@ -4,31 +4,62 @@
   <meta charset="utf-8">
   <title>内容管理 - CSDN 创作者中心</title>
 </head>
-<body class="mp-manage-page">
-  <!-- 草稿列表页：verify 的兜底。选择器 verify.draft_list_item -->
-  <header class="marketing-nav">
-    <div class="marketing-nav__user">
-      <a class="user-avatar" href="//i.csdn.net/user/personal">拾一米</a>
-    </div>
-  </header>
-
-  <nav class="manage-tabs">
-    <a class="manage-tab manage-tab--active" href="//mp.csdn.net/mp_blog/manage/article">草稿箱</a>
-    <a class="manage-tab" href="//mp.csdn.net/mp_blog/manage/article?status=published">已发布</a>
+<body>
+  <!--
+    2026-10-22 真机校准版（T-09b 第二轮）：结构按真实内容管理页（草稿箱 tab）
+    勘查数据重建。实测要点：
+    - 默认停在「全部」tab，草稿要点 .nav-link 里的「草稿箱」tab 才出来
+    - 列表异步加载：.ma-mskLoading 转圈不消失时读行 = 读到空列表（假阴性）
+    - 行结构：.article-list-item-mp，标题在 a.el_mcm-tooltip__trigger（文本+href 一体）
+  -->
+  <nav class="main-nav-tabs">
+    <a class="nav-link active">全部(0)</a>
+    <a class="nav-link">已发布(0)</a>
+    <a class="nav-link">审核中/未通过(0)</a>
+    <a class="nav-link">回收站(0)</a>
+    <!-- 选择器 verify.draft_list_tab（按文本「草稿箱」匹配） -->
+    <a class="nav-link bd-right">草稿箱(4)</a>
   </nav>
 
-  <div class="article-list">
-    <div class="article-item">
-      <a class="article-item__title"
-         href="//mp.csdn.net/mp_blog/creation/editor/139821477">文档解析为什么是 RAG 的第一道工序</a>
-      <span class="article-item__status">草稿</span>
-      <span class="article-item__time">2026-10-21 10:12</span>
-    </div>
-    <div class="article-item">
-      <a class="article-item__title"
-         href="//mp.csdn.net/mp_blog/creation/editor/139821300">上一版的旧稿</a>
-      <span class="article-item__status">草稿</span>
-      <span class="article-item__time">2026-10-20 16:40</span>
+  <div class="article_manage_mp home_page_padding">
+    <div class="article_manage_list">
+      <!-- 选择器 verify.draft_list_loading（等它消失再读行） -->
+      <div class="ma-mskLoading" hidden>
+        <div class="ma-line-scale"><div></div></div>
+      </div>
+
+      <!-- 选择器 verify.draft_list_item（标题文本 + href 一体） -->
+      <div class="article-list-item-mp">
+        <div class="list-item-mp-right">
+          <div class="list-item-mp-right-active">
+            <a class="list-item-mp-left" href="https://editor.csdn.net/md/?articleId=168659812"></a>
+            <div class="flex-cont">
+              <a class="el_mcm-tooltip__trigger"
+                 href="https://editor.csdn.net/md/?articleId=168659812">文档解析为什么是RAG 的第一道工序</a>
+            </div>
+          </div>
+          <div class="item-info-oper">
+            <a class="item-info-oper-text">同步多平台</a>
+            <a class="item-info-oper-text" href="https://editor.csdn.net/md/?articleId=168659812">编辑</a>
+          </div>
+        </div>
+      </div>
+
+      <div class="article-list-item-mp">
+        <div class="list-item-mp-right">
+          <div class="list-item-mp-right-active">
+            <a class="list-item-mp-left" href="https://editor.csdn.net/md/?articleId=168659767"></a>
+            <div class="flex-cont">
+              <a class="el_mcm-tooltip__trigger"
+                 href="https://editor.csdn.net/md/?articleId=168659767">上一版的旧稿</a>
+            </div>
+          </div>
+          <div class="item-info-oper">
+            <a class="item-info-oper-text">同步多平台</a>
+            <a class="item-info-oper-text" href="https://editor.csdn.net/md/?articleId=168659767">编辑</a>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 </body>

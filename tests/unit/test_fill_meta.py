@@ -71,6 +71,11 @@ class FakeMetaPage:
             return {"ok": True, "options": self.options}
         if op == "closemodals":
             return {"ok": True, "closed": 0}
+        if op == "readtitle":
+            # 模型态回读：title_echo 模拟「模型没吃下去」；否则回显最后一次键盘输入
+            if self.title_echo is not None:
+                return {"ok": True, "text": self.title_echo}
+            return {"ok": True, "text": self.typed[-1][1] if self.typed else ""}
         raise AssertionError(f"未知脚本 op：{op}")
 
     def click(self, selector: str) -> None:
@@ -129,8 +134,11 @@ def _draft(**overrides) -> Draft:
 
 # ----------------------------------------------------------- 标题（草稿与发布共用）
 
-def test_title_goes_through_display_then_fill_then_readback():
-    """双层标题控件：先点 display，再 fill input，最后回读确认模型吃下去了。"""
+def test_title_goes_through_display_clear_then_real_keyboard():
+    """双层标题控件 + 受控模型：点 display → Meta+A/Backspace 清空 → 真实键盘输入。
+
+    fill() 只写 value 模型不吃（实测存出【无标题】草稿），所以这里钉死键盘路径。
+    """
     adapter = _adapter()
     page = FakeMetaPage()
 
@@ -139,8 +147,10 @@ def test_title_goes_through_display_then_fill_then_readback():
     display_sel = adapter.selectors("editor", "title_display")
     title_sel = adapter.selectors("editor", "title")
     assert page.clicks[0] == display_sel, "第一步必须是点展示层"
-    assert page.filled[title_sel] == "探针标题"
-    assert display_sel not in page.filled, "display 不是输入目标"
+    assert (title_sel, "Meta+A") in page.pressed, "输入前必须全选清掉恢复的标题"
+    assert (title_sel, "Backspace") in page.pressed
+    assert (title_sel, "探针标题") in page.typed, "标题必须走真实键盘"
+    assert title_sel not in page.filled, "不许用 fill——模型只认键盘事件"
 
 
 def test_ut_08_01_overlong_title_is_truncated_with_warning(caplog):
@@ -151,14 +161,14 @@ def test_ut_08_01_overlong_title_is_truncated_with_warning(caplog):
     with caplog.at_level(logging.WARNING, logger="geopublish.csdn"):
         _adapter().fill_meta(page, _draft(title=long_title), PlatformConfig(name="csdn"))
 
-    filled = page.filled[_adapter().selectors("editor", "title")]
-    assert len(filled) == 100, f"应截断到 100 字，实际 {len(filled)}"
+    filled = [t for sel, t in page.typed if sel == _adapter().selectors("editor", "title")]
+    assert filled == ["超" * 100], f"应截断到 100 字，实际 {filled}"
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert any("截断" in r.message and "120" in r.message for r in warnings)
 
 
 def test_title_readback_mismatch_is_meta_error():
-    """fill 之后读回来的和写入的不一样（模型没吃下去）→ MetaError。"""
+    """键盘输入后模型态回读不符（模型没吃下去）→ MetaError。"""
     page = FakeMetaPage(title_echo="残缺的标题")
     with pytest.raises(MetaError) as exc:
         _adapter().fill_meta(page, _draft(), PlatformConfig(name="csdn"))
@@ -203,15 +213,17 @@ def test_draft_mode_touches_nothing_but_the_title():
 
     adapter.fill_meta(page, _draft(), PlatformConfig(name="csdn"))  # 默认 mode=draft
 
-    assert page.typed == [], "草稿模式不该键入标签"
-    assert page.pressed == []
+    tags_sel = adapter.selectors("meta", "tags")
+    assert not [t for sel, t in page.typed if sel == tags_sel], "草稿模式不该键入标签"
+    assert [t for _, t in page.typed] == ["探针标题"], "草稿模式只键入标题"
+    assert not [k for sel, k in page.pressed if sel == tags_sel], "草稿模式不该按 Enter"
     assert page.values == {}, "草稿模式不该 setvalue（摘要/声明/分类）"
 
 
 def test_draft_mode_accepts_mode_as_string():
     page = FakeMetaPage()
     _adapter().fill_meta(page, _draft(), PlatformConfig(name="csdn"), mode="draft")
-    assert page.filled[_adapter().selectors("editor", "title")] == "探针标题"
+    assert (_adapter().selectors("editor", "title"), "探针标题") in page.typed
 
 
 # ----------------------------------------------------------- 发布模式：完整元信息（T-10 校准候选）
@@ -314,10 +326,12 @@ def test_unwritable_control_raises_meta_error():
 
 def test_tags_max_zero_types_nothing():
     page = FakeMetaPage(options=OPTIONS)
-    _adapter().fill_meta(
+    adapter = _adapter()
+    adapter.fill_meta(
         page, _draft(), PlatformConfig(name="csdn", tags_max=0), mode=SubmitMode.PUBLISH
     )
-    assert page.typed == []
+    tags_sel = adapter.selectors("meta", "tags")
+    assert not [t for sel, t in page.typed if sel == tags_sel]
 
 
 def test_publish_mode_tags_within_limit_are_not_warned(caplog):

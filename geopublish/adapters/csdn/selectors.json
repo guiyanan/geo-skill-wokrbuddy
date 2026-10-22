@@ -1,5 +1,5 @@
 {
-  "version": "2026-10-21.3",
+  "version": "2026-10-22.1",
   "auth": {
     "login_form": ".login-box",
     "challenge": "#captchaImg, img.captcha-img",
@@ -29,6 +29,8 @@
   "verify": {
     "article_id": "meta[name='article:id']",
     "success_marker": ".editor__success-tip",
-    "draft_list_item": ".article-list .article-item__title"
+    "draft_list_item": ".article_manage_list a.el_mcm-tooltip__trigger",
+    "draft_list_tab": ".nav-link",
+    "draft_list_loading": ".article_manage_list .ma-mskLoading"
   }
 }

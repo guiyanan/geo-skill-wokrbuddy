@@ -80,9 +80,33 @@ _ARTICLE_ID_PATH_RE = re.compile(r"/(?:article/details|creation/editor|editor)/(
 # 「保存草稿」链接的可见文本。它不是选择器，是用户看到的按钮文字——平台改文案时
 # 这里要跟着改，契约测试管不到文案，只能靠现场包发现。
 _SAVE_DRAFT_LABEL = "保存草稿"
+# 内容管理页的草稿箱 tab 文案（文本里带数量，如「草稿箱(4)」，匹配用包含）。
+_DRAFT_TAB_LABEL = "草稿箱"
 
 # 选择器一律经参数传入，代码里不出现裸选择器——.precommit/check_no_naked_selectors.py
 # 盯着这个目录。
+
+# 标题模型态回读：隐藏 input 的 value 不等于模型（实测 fill() 写了 value 但存出来
+# 是【无标题】），模型态展示在 display 层。
+_READ_TITLE_DISPLAY_JS = """/* op=readtitle */
+(sel) => {
+  const el = document.querySelector(sel);
+  if (!el) return {ok: false, reason: "标题展示层未命中"};
+  return {ok: true, text: (el.textContent || "").trim()};
+}
+"""
+
+# 内容管理页默认停在「全部」tab：草稿要点「草稿箱」tab 才出来。文本匹配而不是
+# 固定类名——tab 文案里带数量，类名随版本变。
+_OPEN_DRAFT_TAB_JS = """/* op=drafttab */
+([tabSel, label]) => {
+  const tabs = Array.from(document.querySelectorAll(tabSel));
+  const hit = tabs.find(t => (t.textContent || "").includes(label));
+  if (!hit) return {ok: false, reason: "没找到「" + label + "」tab"};
+  hit.click();
+  return {ok: true};
+}
+"""
 
 # 清场：全选编辑器内容并删除。编辑器会恢复上次未保存的草稿（实测），不清场的话
 # 新正文会被**追加到残稿后面**——那是双倍正文事故的真实来源。
@@ -216,6 +240,12 @@ def _article_id_from_url(url: str) -> str:
 def _norm_text(text: str) -> str:
     """比对前归一：编辑器会自动补一个尾换行（实测 +1 字），双方一起剥掉再比。"""
     return text.rstrip("\n")
+
+
+def _squash(text: str) -> str:
+    """压掉全部空白做标题比对：平台会归一标题空白（实测「 RAG 」两侧空格被吃掉），
+    逐字节比会把「存成功了」判成失败。"""
+    return "".join(str(text or "").split())
 
 
 class EditorReadError(RuntimeError):
@@ -598,23 +628,30 @@ class CsdnAdapter:
         )
 
     def _fill_title(self, page: Page, title: str) -> None:
-        """双层标题控件：点 display → fill 真实 input → 点正文区 blur → 回读。
+        """双层标题控件 + 受控模型：点 display → 清空 → **真实键盘**输入 → blur → 回读。
 
-        回读这一步不能省：框架受控组件「看着填好了、模型没吃到」是最常见的假成功，
-        读回来对不上就是 MetaError，不许带着假标题往下走。
+        两个实测教训（T-09b）：
+        1. `fill()` 只写 input 的 value，模型不吃——存出来的草稿是【无标题】。
+           唯一被模型承认的输入是真实键盘事件（press / press_sequentially）。
+        2. 回读要看 display 展示层（模型态），不是 input 的 value。
         """
         display_sel = self.selectors("editor", "title_display")
         input_sel = self.selectors("editor", "title")
         try:
             page.click(display_sel)
-            page.fill(input_sel, title)
+            page.press(input_sel, "Meta+A")
+            page.press(input_sel, "Backspace")
+            page.press_sequentially(input_sel, title, delay_ms=TYPING_DELAY_MS)
             page.click(self.selectors("editor", "content"))
         except Exception as exc:
             raise MetaError(f"填不进 editor.title：{type(exc).__name__}: {exc}") from exc
-        actual = page.input_value(input_sel)
-        if actual.strip() != title.strip():
+
+        outcome = page.evaluate(_READ_TITLE_DISPLAY_JS, display_sel)
+        actual = outcome.get("text", "") if isinstance(outcome, Mapping) else ""
+        if _squash(actual) != _squash(title):
             raise MetaError(
-                f"标题回读不符：写入 {title!r}，读到 {actual!r}——前端模型没吃下去"
+                f"标题回读不符：写入 {title!r}，模型态是 {actual!r}"
+                "（平台会归一空白，比对已忽略空白）"
             )
 
     def _set_value(self, page: Page, group: str, key: str, text: str) -> None:
@@ -841,6 +878,20 @@ class CsdnAdapter:
 
         try:
             page.goto(list_url)
+            # 默认停在「全部」tab：先点「草稿箱」，再等异步加载圈消失（T-09b 实测：
+            # 不等的话读到的是空列表，会把「存成了」误判成失败）。
+            tab = page.evaluate(
+                _OPEN_DRAFT_TAB_JS,
+                [self.selectors("verify", "draft_list_tab"), _DRAFT_TAB_LABEL],
+            )
+            if isinstance(tab, Mapping) and not tab.get("ok"):
+                return VerifyResult(
+                    ok=False, url=list_url,
+                    reason=f"草稿箱 tab 点不开（{tab.get('reason')}）：无法核对「{title}」",
+                )
+            page.wait_for_hidden(
+                self.selectors("verify", "draft_list_loading"), timeout_ms=20_000
+            )
             items = page.query_selector_all(self.selectors("verify", "draft_list_item"))
         except Exception as exc:
             return VerifyResult(
@@ -849,9 +900,10 @@ class CsdnAdapter:
                 reason=f"草稿列表页打不开（{type(exc).__name__}）：{exc}",
             )
 
+        wanted = _squash(title)
         href_without_id = ""
         for item in items:
-            if (item.text_content() or "").strip() != title:
+            if _squash(item.text_content()) != wanted:
                 continue
             href = item.get_attribute("href") or ""
             article_id = _article_id_from_url(href)

@@ -162,7 +162,7 @@ def test_verify_selectors_hit_on_the_success_page(fixture_dom):
 
 
 def test_draft_list_item_hits_on_the_draft_list_page(fixture_dom):
-    """存草稿后 URL 不变时的唯一兜底：列表页每行都得有标题和 href。
+    """存草稿后 URL 不变时的唯一兜底：列表行每行都得有标题和 href（2026-10-22 真机校准）。
 
     href 是 article_id 的来源，所以不能只断言「命中」，还要断言「带得出链接」——
     否则 verify 会走到「标题对上了但解析不出 id」那条判失败的岔路上。
@@ -176,7 +176,18 @@ def test_draft_list_item_hits_on_the_draft_list_page(fixture_dom):
     assert len(hits) == 2
     for hit in hits:
         assert hit.text_content().strip(), "每行必须能读到标题"
-        assert (hit.get_attribute("href") or "").startswith("//"), "每行必须带可解析的 href"
+        assert "articleId=" in (hit.get_attribute("href") or ""), "每行必须带可解析的 href"
+
+
+def test_draft_list_tab_and_loading_hit_on_the_draft_list_page(fixture_dom):
+    """兜底流程的两个步骤也要有 DOM 证明：tab 不点读到的是「全部」，加载圈不等就是空列表。"""
+    from dom import StaticPage
+
+    adapter = CsdnAdapter()
+    page = StaticPage(fixture_dom("csdn", "drafts"))
+
+    assert page.query_selector(adapter.selectors("verify", "draft_list_tab")) is not None
+    assert page.query_selector(adapter.selectors("verify", "draft_list_loading")) is not None
 
 
 # ------------------------------------------------ 结构校验

@@ -74,7 +74,13 @@ REQUIRED_SELECTORS: Mapping[str, tuple[str, ...]] = {
     ),
     "meta": ("category", "tags", "summary", "original_declaration", "ai_declaration"),
     "cover": ("upload_input", "thumbnail"),
-    "verify": ("article_id", "success_marker", "draft_list_item"),
+    "verify": (
+        "article_id",
+        "success_marker",
+        "draft_list_item",
+        "draft_list_tab",      # 内容管理页默认停在「全部」，草稿要点这个 tab 才出来
+        "draft_list_loading",  # 列表异步加载的转圈：不消失就读，读到的是空列表（假阴性）
+    ),
 }
 
 ADAPTER_METHODS: tuple[str, ...] = (
@@ -295,6 +301,10 @@ class Page(Protocol):
 
     def wait_for_url(self, pattern: str, timeout_ms: int = 10_000) -> None:
         """等 URL 变成某个 glob 形态。存草稿成功的真实信号就是 URL 长出 articleId。"""
+        ...
+
+    def wait_for_hidden(self, selector: str, timeout_ms: int = 10_000) -> None:
+        """等元素消失（或本来就不在）。草稿列表的加载圈：等它走了再读行。"""
         ...
 
 

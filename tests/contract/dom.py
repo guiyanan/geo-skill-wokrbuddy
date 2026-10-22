@@ -100,3 +100,8 @@ class StaticPage:
 
     def wait_for_url(self, pattern: str, timeout_ms: int = 10_000) -> None:
         raise StaticPageError("静态快照的 URL 不会变。")
+
+    def wait_for_hidden(self, selector: str, timeout_ms: int = 10_000) -> None:
+        """静态快照里「等到消失」只有一种答案：本来就不在。"""
+        if self.query_selector(selector) is not None:
+            raise StaticPageError(f"静态快照里元素仍在：{selector}")

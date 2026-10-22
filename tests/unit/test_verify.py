@@ -66,6 +66,7 @@ class FakeVerifyPage:
         title: str | None = TITLE,
         items: list[_Item] | None = None,
         goto_raises: bool = False,
+        tab_ok: bool = True,
     ) -> None:
         self._id_sel = adapter.selectors("verify", "article_id")
         self._item_sel = adapter.selectors("verify", "draft_list_item")
@@ -75,7 +76,10 @@ class FakeVerifyPage:
         self._title = title
         self._items = items if items is not None else []
         self._goto_raises = goto_raises
+        self._tab_ok = tab_ok
         self.navigated: list[str] = []
+        self.tab_clicks = 0
+        self.hidden_waits: list[str] = []
 
     def query_selector(self, selector: str):
         if selector == self._id_sel and self._article_id is not None:
@@ -100,7 +104,16 @@ class FakeVerifyPage:
         return object()
 
     def evaluate(self, script: str, arg=None):
-        raise AssertionError("verify 不该执行注入脚本")
+        op = script.split("/* op=", 1)[1].split(" ", 1)[0]
+        if op == "drafttab":
+            if not self._tab_ok:
+                return {"ok": False, "reason": "没找到「草稿箱」tab"}
+            self.tab_clicks += 1
+            return {"ok": True}
+        raise AssertionError(f"verify 不该执行脚本 op：{op}")
+
+    def wait_for_hidden(self, selector: str, timeout_ms: int = 10_000) -> None:
+        self.hidden_waits.append(selector)
 
     def click(self, selector: str) -> None:
         raise AssertionError("verify 不该点击")
@@ -178,7 +191,10 @@ def test_ut_09_01_no_article_id_is_a_failure_even_with_success_tip():
 # ----------------------------------------------------------- UT-09-02
 
 def test_ut_09_02_draft_list_match_confirms_the_save():
-    """URL 没变、DOM 里没有 id，但列表页有同标题 → 成功，id 与 URL 从 href 里取。"""
+    """URL 没变、DOM 里没有 id，但列表页有同标题 → 成功，id 与 URL 从 href 里取。
+
+    列表必须先点「草稿箱」tab、再等加载圈消失（T-09b 实测：不等就是空列表假阴性）。
+    """
     adapter = _adapter()
     page = FakeVerifyPage(adapter, items=[_Item("旧稿", DRAFT_HREF), _Item(TITLE, DRAFT_HREF)])
 
@@ -188,6 +204,19 @@ def test_ut_09_02_draft_list_match_confirms_the_save():
     assert result.article_id == "139821477"
     assert result.url == "https://mp.csdn.net/mp_blog/creation/editor/139821477"
     assert page.navigated == [LIST_URL]
+    assert page.tab_clicks == 1, "不点草稿箱 tab 读到的是「全部」"
+    assert page.hidden_waits == [adapter.selectors("verify", "draft_list_loading")]
+
+
+def test_draft_list_tab_missing_is_a_failure():
+    """草稿箱 tab 都没了（大改版）→ 明确判失败，别拿「全部」tab 的列表瞎比对。"""
+    adapter = _adapter()
+    page = FakeVerifyPage(adapter, tab_ok=False, items=[_Item(TITLE, DRAFT_HREF)])
+
+    result = adapter.verify(page)
+
+    assert result.ok is False
+    assert "tab 点不开" in result.reason
 
 
 def test_title_match_ignores_surrounding_whitespace():
