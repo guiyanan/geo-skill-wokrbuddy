@@ -201,6 +201,13 @@ def publish_draft(
         # 先导航到编辑器页再探活：已登录 → 看到头像/编辑器；被踢 → 平台自己跳登录页，
         # 两种情况都给出权威信号。探活一次即停，不通过就抛 AuthRequired（R6）。
         page.goto(adapter.editor_url)
+        try:
+            # SPA 的 load 事件不代表渲染完成（真机实测会在半渲染页面上误判 unknown）：
+            # 先等一个权威信号出现，再让 check_auth 做那一次判定。
+            adapter.wait_for_auth_signal(page)
+        except Exception:
+            # 等不到信号不在这里失败：check_auth 会给出一个能对应到退出码的标准结论。
+            logger.debug("探活信号等待未命中，交由 check_auth 判定")
         check_login(adapter, page)
         adapter.open_editor(page, draft)
         adapter.fill_content(page, draft)

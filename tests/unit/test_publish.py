@@ -45,11 +45,18 @@ class RecordingAdapter:
         auth: AuthState = AuthState.LOGGED_IN,
         verify_ok: bool = True,
         submit_error: Exception | None = None,
+        auth_signal_raises: bool = False,
     ) -> None:
         self.calls: list[object] = []
         self._auth = auth
         self._verify_ok = verify_ok
         self._submit_error = submit_error
+        self._auth_signal_raises = auth_signal_raises
+
+    def wait_for_auth_signal(self, page, timeout_ms: int = 30_000):
+        self.calls.append("wait_for_auth_signal")
+        if self._auth_signal_raises:
+            raise TimeoutError("30s 内没等到权威信号")
 
     def check_auth(self, page):
         self.calls.append("check_auth")
@@ -134,6 +141,7 @@ def test_publish_runs_the_steps_in_order(tmp_path):
         "探活前必须先导航到编辑器页：空白页上 check_auth 只能判出 unknown"
     )
     assert adapter.calls == [
+        "wait_for_auth_signal",
         "check_auth",
         "open_editor",
         "fill_content",
@@ -178,6 +186,7 @@ def test_publish_mode_uploads_cover_and_passes_mode_down(tmp_path):
     )
 
     assert adapter.calls == [
+        "wait_for_auth_signal",
         "check_auth",
         "open_editor",
         "fill_content",
@@ -238,7 +247,22 @@ def test_auth_expired_stops_before_any_editor_action(tmp_path):
         publish_draft(adapter, _loaded(tmp_path), _cfg(), gate=Gate.DRAFT, open_page=open_page)
 
     assert page.calls == [("goto", adapter.editor_url)], "探活那次导航是唯一允许的"
-    assert adapter.calls == ["check_auth"]
+    assert adapter.calls == ["wait_for_auth_signal", "check_auth"]
+
+
+def test_auth_signal_timeout_does_not_fail_the_probe(tmp_path):
+    """等不到权威信号（网慢/改版）→ 照样交给 check_auth 判，不在这里炸。
+
+    这是 T-09b 真机教训的反面：等信号是为了减少误判，不是新增一道会失败的闸门。
+    """
+    adapter = RecordingAdapter(auth_signal_raises=True)
+
+    outcome = publish_draft(
+        adapter, _loaded(tmp_path), _cfg(), gate=Gate.DRAFT, open_page=_opener([])[0]
+    )
+
+    assert outcome.ok is True
+    assert adapter.calls[:2] == ["wait_for_auth_signal", "check_auth"]
 
 
 # --------------------------------------------------------------- 存证

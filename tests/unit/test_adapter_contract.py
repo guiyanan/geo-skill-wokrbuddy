@@ -153,6 +153,21 @@ def test_open_editor_navigates_waits_then_closes_modals():
     assert page.url == adapter.editor_url
 
 
+def test_wait_for_auth_signal_waits_for_any_of_the_three_signals():
+    """T-09b：SPA 的 load ≠ 渲染完成。探活前的等待必须覆盖三个权威信号——
+    编辑器（已登录）、登录表单（被踢）、人机校验（风控），漏一个就多一类误判。"""
+    adapter = CsdnAdapter()
+    page = _Recorder()
+
+    adapter.wait_for_auth_signal(page)
+
+    assert page.calls[0][0] == "wait_for_selector"
+    waited = page.calls[0][1]
+    assert adapter.selectors("editor", "content") in waited
+    assert adapter.selectors("auth", "login_form") in waited
+    assert adapter.selectors("auth", "challenge") in waited
+
+
 # --------------------------------------------------- meta 与单一来源
 
 def test_meta_points_at_the_real_editor_and_domains():

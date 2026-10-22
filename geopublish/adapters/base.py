@@ -498,6 +498,13 @@ class PlatformAdapter(Protocol):
     def check_auth(self, page: Page) -> AuthResult:
         """只读判断登录态，**不做登录动作、不重试**。"""
 
+    def wait_for_auth_signal(self, page: Page, timeout_ms: int = 30_000) -> None:
+        """探活前等页面渲染出权威信号（编辑器 / 登录表单 / 人机校验任一）。
+
+        它不是第八个动作，而是 check_auth 的前置等待：SPA 的 load 事件不代表
+        渲染完成，没有它，check_auth 会在半渲染页面上误判。判定仍然只做一次。
+        """
+
     def open_editor(self, page: Page, draft: Draft | None) -> None:
         """导航到新建文章页，等编辑器就绪。"""
 

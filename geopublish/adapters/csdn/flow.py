@@ -361,6 +361,23 @@ class CsdnAdapter:
             reason="既没看到登录表单也没看到登录态标志（页面没渲染完 / 跳转失败）",
         )
 
+    def wait_for_auth_signal(self, page: Page, timeout_ms: int = 30_000) -> None:
+        """探活前等页面渲染出权威信号（编辑器 / 登录表单 / 人机校验任一）。
+
+        真机实测（T-09b）：编辑器是 SPA，`goto` 的 load 事件**不代表渲染完成**，
+        立刻 check_auth 会在半渲染页面上误判 unknown（登录态明明是好的）。
+        这不是重试——是等页面到达一个**可判定**的状态；判定本身仍由 check_auth
+        恰好做一次（R6 不变）。
+        """
+        combined = ", ".join(
+            [
+                self.selectors("editor", "content"),
+                self.selectors("auth", "login_form"),
+                self.selectors("auth", "challenge"),
+            ]
+        )
+        page.wait_for_selector(combined, timeout_ms=timeout_ms)
+
     def open_editor(self, page: Page, draft: Draft | None) -> None:
         """导航到新建文章页，等编辑器就绪，然后**关掉自动弹出的弹窗**。
 
