@@ -164,11 +164,17 @@ _READBACK_JS = """/* op=readback */
 # 关弹窗：先点可见的关闭按钮；关不掉的遮罩层（没有可见关闭按钮、或点了没消失）
 # 直接从 DOM 摘掉。**摘 DOM ≠ 点任何按钮**——弹窗里预渲染的「确定删除该模板？」
 # 确认框随遮罩一起消失，永远不会被执行。只点关闭按钮、只摘遮罩，绝不点「确定」。
+# 可见性判定用 getClientRects：弹窗是 position:fixed，offsetParent 恒为 null，
+# 拿它当可见性会把所有弹窗漏掉（实测踩中）。
 _CLOSE_MODALS_JS = """/* op=closemodals */
 ([modalSel, closeSel]) => {
-  const closers = Array.from(document.querySelectorAll(closeSel)).filter(b => b.offsetParent !== null);
+  const visible = (el) => {
+    const s = getComputedStyle(el);
+    return s.display !== "none" && s.visibility !== "hidden" && el.getClientRects().length > 0;
+  };
+  const closers = Array.from(document.querySelectorAll(closeSel)).filter(visible);
   closers.forEach(b => b.click());
-  const remaining = Array.from(document.querySelectorAll(modalSel)).filter(m => m.offsetParent !== null);
+  const remaining = Array.from(document.querySelectorAll(modalSel)).filter(visible);
   remaining.forEach(m => m.remove());
   return {ok: true, closed: closers.length, removed: remaining.length};
 }
