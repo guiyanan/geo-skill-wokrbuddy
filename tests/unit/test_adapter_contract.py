@@ -149,7 +149,10 @@ def test_open_editor_navigates_waits_then_closes_modals():
     assert page.calls[0][1] == adapter.editor_url
     assert page.calls[1] == ("wait_for_selector", adapter.selectors("editor", "content"))
     assert page.calls[2][0] == "closemodals"
-    assert page.calls[2][1] == adapter.selectors("editor", "modal_close")
+    assert page.calls[2][1] == [
+        adapter.selectors("editor", "modal_root"),
+        adapter.selectors("editor", "modal_close"),
+    ]
     assert page.url == adapter.editor_url
 
 

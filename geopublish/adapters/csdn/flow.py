@@ -161,13 +161,16 @@ _READBACK_JS = """/* op=readback */
 }
 """
 
-# 关弹窗：编辑器打开时可能弹模版库等弹窗挡住点击。只点关闭按钮，绝不点任何
-# 「确定」——弹窗里预渲染着删除确认框，点错就是事故。
+# 关弹窗：先点可见的关闭按钮；关不掉的遮罩层（没有可见关闭按钮、或点了没消失）
+# 直接从 DOM 摘掉。**摘 DOM ≠ 点任何按钮**——弹窗里预渲染的「确定删除该模板？」
+# 确认框随遮罩一起消失，永远不会被执行。只点关闭按钮、只摘遮罩，绝不点「确定」。
 _CLOSE_MODALS_JS = """/* op=closemodals */
-(sel) => {
-  const closers = Array.from(document.querySelectorAll(sel)).filter(b => b.offsetParent !== null);
+([modalSel, closeSel]) => {
+  const closers = Array.from(document.querySelectorAll(closeSel)).filter(b => b.offsetParent !== null);
   closers.forEach(b => b.click());
-  return {ok: true, closed: closers.length};
+  const remaining = Array.from(document.querySelectorAll(modalSel)).filter(m => m.offsetParent !== null);
+  remaining.forEach(m => m.remove());
+  return {ok: true, closed: closers.length, removed: remaining.length};
 }
 """
 
@@ -436,17 +439,26 @@ class CsdnAdapter:
         self.close_modals(page)
 
     def close_modals(self, page: Page) -> None:
-        """点掉所有可见弹窗的关闭按钮（最多 3 轮）。
+        """清掉挡点击的弹窗（最多 3 轮）：先点关闭按钮，点不掉的遮罩直接摘 DOM。
 
-        只点 `modal_close` 选择器命中的关闭按钮——弹窗里可能预渲染着删除确认框，
-        本方法**永不点「确定」**。
+        实测两种形态都要管：模版库弹窗有 `.modal__close-button` 可点；另一些
+        （`.modal_outer` 遮罩）按钮点了不消失，Playwright 点击会被它拦到超时。
+        **本方法永不点「确定」**——摘 DOM 只是把遮罩层从文档里拿走，不等于执行
+        弹窗里的任何动作。
         """
-        close_sel = self.selectors("editor", "modal_close")
+        args = [self.selectors("editor", "modal_root"), self.selectors("editor", "modal_close")]
         for _ in range(3):
-            outcome = page.evaluate(_CLOSE_MODALS_JS, close_sel)
-            closed = outcome.get("closed", 0) if isinstance(outcome, Mapping) else 0
-            if not closed:
+            outcome = page.evaluate(_CLOSE_MODALS_JS, args)
+            if not isinstance(outcome, Mapping):
                 break
+            cleared = int(outcome.get("closed", 0)) + int(outcome.get("removed", 0))
+            if not cleared:
+                break
+            logger.info(
+                "关弹窗：点关闭 %d 个，摘遮罩 %d 个",
+                outcome.get("closed", 0),
+                outcome.get("removed", 0),
+            )
 
     def fill_content(self, page: Page, draft: Draft | None) -> None:
         """三级降级注入正文：L1 insertText → L2 合成 paste → L3 分段 type。

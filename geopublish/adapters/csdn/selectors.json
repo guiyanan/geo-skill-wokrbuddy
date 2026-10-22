@@ -13,7 +13,8 @@
     "publish_button": "button.btn-publish",
     "save_draft_button": "button.btn-save",
     "save_draft_item": ".pop-save-opt a.btn-link",
-    "modal_close": ".modal__close-button"
+    "modal_close": ".modal__close-button",
+    "modal_root": ".modal"
   },
   "meta": {
     "category": "#category",
