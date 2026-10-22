@@ -318,6 +318,16 @@ def _type_text(page: Page, sel: str, text: str, delay_ms: float) -> None:
     page.locator(sel).press_sequentially(text, delay=delay_ms)
 
 
+def _wait_hidden(page: Page, sel: str, timeout_ms: int) -> None:
+    """等元素消失的统一入口。真实 Page 没有 `wait_for_hidden`，等价物是
+    `wait_for_selector(sel, state="hidden")`——与 `_type_text` 同一类协议假象。"""
+    direct = getattr(page, "wait_for_hidden", None)
+    if direct is not None:
+        direct(sel, timeout_ms=timeout_ms)
+        return
+    page.wait_for_selector(sel, state="hidden", timeout=timeout_ms)
+
+
 def _type_in_segments(page: Page, content_sel: str, text: str) -> dict[str, Any]:
     """L3 兜底：聚焦 → 清场 → 分段逐字键入。慢，但走的是真实键盘管线。
 
@@ -951,8 +961,8 @@ class CsdnAdapter:
                     ok=False, url=list_url,
                     reason=f"草稿箱 tab 点不开（{tab.get('reason')}）：无法核对「{title}」",
                 )
-            page.wait_for_hidden(
-                self.selectors("verify", "draft_list_loading"), timeout_ms=20_000
+            _wait_hidden(
+                page, self.selectors("verify", "draft_list_loading"), timeout_ms=20_000
             )
             items = page.query_selector_all(self.selectors("verify", "draft_list_item"))
         except Exception as exc:

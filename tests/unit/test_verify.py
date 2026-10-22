@@ -328,3 +328,41 @@ def test_verify_accepts_mode_from_string():
 
     assert adapter.verify(page, mode="publish").ok is False
     assert adapter.verify(page, mode="draft").ok is True
+
+
+def test_wait_hidden_falls_back_to_state_hidden_on_real_pages():
+    """真机形态：Page 没有 wait_for_hidden，要走 wait_for_selector(state="hidden")。"""
+
+    class _RealishPage(FakeVerifyPage):
+        wait_for_hidden = None  # getattr 返回 None → 走 state="hidden" 路径
+
+        def wait_for_selector(self, selector, timeout_ms=10_000, **kwargs):
+            self.hidden_waits.append(f"{selector} | state={kwargs.get('state')}")
+            return object()
+
+    adapter = _adapter()
+    page = _RealishPage(adapter, items=[_Item(TITLE, DRAFT_HREF)])
+
+    result = adapter.verify(page)
+
+    assert result.ok is True
+    assert any("state=hidden" in w for w in page.hidden_waits), page.hidden_waits
+
+
+def test_wait_hidden_falls_back_to_state_hidden_on_real_pages():
+    """真机形态：Page 没有 wait_for_hidden，要走 wait_for_selector(state="hidden")。"""
+
+    class _RealishPage(FakeVerifyPage):
+        wait_for_hidden = None  # getattr 返回 None → 走 state="hidden" 路径
+
+        def wait_for_selector(self, selector, timeout_ms=10_000, **kwargs):
+            self.hidden_waits.append(f"{selector} | state={kwargs.get('state')}")
+            return object()
+
+    adapter = _adapter()
+    page = _RealishPage(adapter, items=[_Item(TITLE, DRAFT_HREF)])
+
+    result = adapter.verify(page)
+
+    assert result.ok is True
+    assert any("state=hidden" in w for w in page.hidden_waits), page.hidden_waits
