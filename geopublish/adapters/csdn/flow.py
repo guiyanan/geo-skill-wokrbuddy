@@ -67,6 +67,9 @@ logger = logging.getLogger("geopublish.csdn")
 LENGTH_TOLERANCE = 0.02
 SEGMENT_SIZE = 500
 TYPING_DELAY_MS = 5.0
+# 标题框的键入延迟要比正文大：实测 5ms 时模型只吃到前两个字（它的受控输入
+# 跟不上），15ms 才稳定（T-09b 正式验收抓出）。
+TITLE_TYPING_DELAY_MS = 15.0
 # UT-08-04：上传后缩略图的等待上限（毫秒）。
 THUMBNAIL_TIMEOUT_MS = 10_000
 # 点「保存草稿」后等 URL 长出 articleId 的上限。等不到不算失败——判定权在 verify。
@@ -691,9 +694,12 @@ class CsdnAdapter:
         input_sel = self.selectors("editor", "title")
         try:
             page.click(display_sel)
+            # display 点击只负责让 input 出现，焦点要显式点进 input（照 v6 实测路径）；
+            # 之后全选清空、逐字键入。延迟 15ms：5ms 时受控模型会丢字。
+            page.click(input_sel)
             page.press(input_sel, "Meta+A")
             page.press(input_sel, "Backspace")
-            _type_text(page, input_sel, title, delay_ms=TYPING_DELAY_MS)
+            _type_text(page, input_sel, title, delay_ms=TITLE_TYPING_DELAY_MS)
             # blur 走 DOM focus：Playwright click 可能被残存遮罩拦到超时（实测）
             page.evaluate(_FOCUS_JS, self.selectors("editor", "content"))
         except Exception as exc:

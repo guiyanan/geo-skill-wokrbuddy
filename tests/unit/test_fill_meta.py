@@ -150,7 +150,9 @@ def test_title_goes_through_display_clear_then_real_keyboard():
 
     display_sel = adapter.selectors("editor", "title_display")
     title_sel = adapter.selectors("editor", "title")
-    assert page.clicks[0] == display_sel, "第一步必须是点展示层"
+    assert page.clicks[:2] == [display_sel, title_sel], (
+        f"必须先点展示层、再点进真实输入框，实际：{page.clicks[:2]}"
+    )
     assert (title_sel, "Meta+A") in page.pressed, "输入前必须全选清掉恢复的标题"
     assert (title_sel, "Backspace") in page.pressed
     assert (title_sel, "探针标题") in page.typed, "标题必须走真实键盘"
