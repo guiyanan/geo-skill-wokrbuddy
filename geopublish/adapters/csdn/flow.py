@@ -161,11 +161,12 @@ _READBACK_JS = """/* op=readback */
 }
 """
 
-# 关弹窗：先点可见的关闭按钮；关不掉的遮罩层（没有可见关闭按钮、或点了没消失）
-# 直接从 DOM 摘掉。**摘 DOM ≠ 点任何按钮**——弹窗里预渲染的「确定删除该模板？」
-# 确认框随遮罩一起消失，永远不会被执行。只点关闭按钮、只摘遮罩，绝不点「确定」。
-# 可见性判定用 getClientRects：弹窗是 position:fixed，offsetParent 恒为 null，
-# 拿它当可见性会把所有弹窗漏掉（实测踩中）。
+# 关弹窗：先点可见的关闭按钮；然后把遮罩层整个从 DOM 摘掉。
+# **摘 DOM ≠ 点任何按钮**——弹窗里预渲染的「确定删除该模板？」确认框随遮罩一起
+# 消失，永远不会被执行。只点关闭按钮、只摘遮罩，绝不点「确定」。
+# 两个实测坑：① 弹窗是 position:fixed，offsetParent 恒 null，不能拿它当可见性；
+# ② .modal 可以是 display:contents（自己没盒子、子树照拦截），所以摘除不按
+# 可见性过滤——摘掉一个本就隐藏的节点没有代价，漏摘一个拦截中的节点就是超时。
 _CLOSE_MODALS_JS = """/* op=closemodals */
 ([modalSel, closeSel]) => {
   const visible = (el) => {
@@ -174,9 +175,21 @@ _CLOSE_MODALS_JS = """/* op=closemodals */
   };
   const closers = Array.from(document.querySelectorAll(closeSel)).filter(visible);
   closers.forEach(b => b.click());
-  const remaining = Array.from(document.querySelectorAll(modalSel)).filter(visible);
-  remaining.forEach(m => m.remove());
-  return {ok: true, closed: closers.length, removed: remaining.length};
+  const modals = Array.from(document.querySelectorAll(modalSel));
+  const removedVisible = modals.filter(visible).length;
+  modals.forEach(m => m.remove());
+  return {ok: true, closed: closers.length, removed: removedVisible};
+}
+"""
+
+# 聚焦：Playwright 的 click 会被遮罩拦截（pointer events 检查），而 DOM focus
+# 不需要指针。blur 标题 / L3 打字前聚焦都走它，不跟遮罩玩猫鼠游戏。
+_FOCUS_JS = """/* op=focus */
+(sel) => {
+  const el = document.querySelector(sel);
+  if (!el) return {ok: false, reason: "聚焦目标未命中"};
+  el.focus();
+  return {ok: true};
 }
 """
 
@@ -303,8 +316,12 @@ def _type_text(page: Page, sel: str, text: str, delay_ms: float) -> None:
 
 
 def _type_in_segments(page: Page, content_sel: str, text: str) -> dict[str, Any]:
-    """L3 兜底：聚焦 → 清场 → 分段逐字键入。慢，但走的是真实键盘管线。"""
-    page.click(content_sel)
+    """L3 兜底：聚焦 → 清场 → 分段逐字键入。慢，但走的是真实键盘管线。
+
+    聚焦走 DOM focus 而不是 Playwright click：click 会被残存遮罩拦到超时，
+    而逐字键入本身只要求元素有焦点。
+    """
+    page.evaluate(_FOCUS_JS, content_sel)
     _clear_editor(page, content_sel)
     for offset in range(0, len(text), SEGMENT_SIZE):
         _type_text(
@@ -677,7 +694,8 @@ class CsdnAdapter:
             page.press(input_sel, "Meta+A")
             page.press(input_sel, "Backspace")
             _type_text(page, input_sel, title, delay_ms=TYPING_DELAY_MS)
-            page.click(self.selectors("editor", "content"))
+            # blur 走 DOM focus：Playwright click 可能被残存遮罩拦到超时（实测）
+            page.evaluate(_FOCUS_JS, self.selectors("editor", "content"))
         except Exception as exc:
             raise MetaError(f"填不进 editor.title：{type(exc).__name__}: {exc}") from exc
 

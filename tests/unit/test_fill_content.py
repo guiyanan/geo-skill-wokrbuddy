@@ -95,6 +95,9 @@ class FakeEditorPage:
             return {"ok": True}
         if op == "closemodals":
             return {"ok": True, "closed": 0}
+        if op == "focus":
+            self.calls.append(("focus", arg))
+            return {"ok": True}
 
         sel, text = arg
         self.calls.append((op, len(text)))
@@ -197,8 +200,8 @@ def test_ut_07_03_l1_l2_fail_degrade_to_l3_with_two_warnings(caplog):
     assert len(downgrades) == 2, f"两次降级都要留痕：{[r.message for r in downgrades]}"
 
 
-def test_l3_clicks_editor_before_typing():
-    """L3 先聚焦再打字；直接往没聚焦的页面灌键盘事件会丢字。"""
+def test_l3_focuses_editor_before_typing():
+    """L3 先聚焦（DOM focus）再打字；直接往没聚焦的页面灌键盘事件会丢字。"""
     body = "聚焦测试" * 200
     adapter = CsdnAdapter()
     page = FakeEditorPage(l1="raise", l2="raise")
@@ -207,7 +210,7 @@ def test_l3_clicks_editor_before_typing():
 
     ops = [name for name, _ in page.calls]
     first_type = ops.index("type")
-    assert "click" in ops[:first_type], "第一次 type 之前必须有 click 聚焦"
+    assert "focus" in ops[:first_type], "第一次 type 之前必须先聚焦"
 
 
 # ----------------------------------------------------------- UT-07-04

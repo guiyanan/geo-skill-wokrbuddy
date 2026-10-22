@@ -61,6 +61,8 @@ class FakeEditorPage:
             return {"ok": True, "text": self.text}
         if op == "closemodals":
             return {"ok": True, "closed": 0}
+        if op == "focus":
+            return {"ok": True}
         if op == "savedraft":
             if not self.save_ok:
                 return {"ok": False, "reason": "popover 里没找到「保存草稿」"}

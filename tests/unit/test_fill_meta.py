@@ -73,6 +73,8 @@ class FakeMetaPage:
             return {"ok": True, "options": self.options}
         if op == "closemodals":
             return {"ok": True, "closed": 0}
+        if op == "focus":
+            return {"ok": True}
         if op == "readtitle":
             # 模型态回读：title_echo 模拟「模型没吃下去」；否则回显最后一次键盘输入
             if self.title_echo is not None:
