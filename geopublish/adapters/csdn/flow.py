@@ -49,6 +49,7 @@ from ..base import (
     AuthState,
     ContentRejected,
     CoverError,
+    CoverSpec,
     InjectAttempt,
     InjectFailed,
     MetaError,
@@ -537,6 +538,14 @@ class CsdnAdapter:
     @property
     def domains(self) -> tuple[str, ...]:
         return self._meta.domains
+
+    @property
+    def cover_spec(self) -> CoverSpec | None:
+        """封面规格（宽/高/大小上限）。T-15 封面渲染与 upload_cover 预检共用这同一份事实。
+
+        None = 平台没给规格：渲染/上传都该拒绝，不许猜（PRD：尺寸从平台读取）。
+        """
+        return self._meta.cover
 
     @property
     def selectors_book(self) -> Selectors:

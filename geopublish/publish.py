@@ -52,6 +52,7 @@ from .core.lock import platform_lock
 from .core.models import Draft, LogEntry, Meta, ModelError, Receipt
 from .core.session import check_login
 from .core.state import PublishLog, Status, recover_status, transition
+from .write.cover import require_cover_approved
 
 __all__ = [
     "DraftLoadError",
@@ -324,6 +325,11 @@ def _run(
     stage = "open_page"
     run_dir: Path | None = None
     try:
+        if mode is SubmitMode.PUBLISH and loaded.cover is not None:
+            # T-15 / G2：未过人工抽检的封面不进发布流程。拦在 open_page 之前——
+            # 为一张没确认的封面启动浏览器，和为不存在的封面启动一样冤。
+            # draft 模式不上传封面（控件在发布对话框里），审批闸不拦草稿链路。
+            require_cover_approved(loaded.source_dir or loaded.cover.parent, loaded.cover)
         with open_page() as opened:
             page = opened
             # 新开的会话停在空白页上，check_auth 在空白页只能判出 unknown。

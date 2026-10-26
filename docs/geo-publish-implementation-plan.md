@@ -183,7 +183,7 @@ geo-publish/
 ```
 - [x] T-13  产品库入库
 - [x] T-14  成稿五步
-- [ ] T-15  封面生成
+- [x] T-15  封面生成
 - [ ] T-16  自检闸门串联
 ```
 
@@ -916,6 +916,40 @@ meta.json 带 content_sha，可被 `publish.load_draft` 原样回读。
 2. 主视觉无水印、无多余文字叠加
 
 确认后写入 `cover.approved=true`；**未确认的封面不进入发布流程**。
+
+**实施记录（2026-10-26，与方案的三处偏差须知）**
+
+1. **字体不走 config，走 CLI + 系统候选清单**。方案没规定字体出处；config 是
+   L1 发文纪律的唯一出口，而封面字体更像「这台机器装了什么」的环境事实：
+   `--font` 显式给，缺省按 PingFang/Hiragino/Noto/雅黑候选清单找第一个存在的，
+   全落空 fail fast（UT-15-04 的字面条）。
+2. **审批闸在 publish.py `_run` 的 open_page 之前**，不在 load_draft：
+   publish 模式且带封面才校验；draft 模式本来就不上传封面（真机：控件在发布
+   对话框里），审批闸不拦草稿链路；幂等预检在闸之前，已发布过的跳过不受影响。
+3. **`CoverNotApproved` 退 6**（与「提交前复核被拦」同码：都归人处理，cron
+   只分 0/非 0）。审批落盘位置是 `cover.json`（不是 meta.json）——meta 是
+   成稿产物，审批是流程状态，两个生命周期不搅在一起。
+
+**关键设计**：
+
+1. **两层分离落地**：主视觉只读（UT-15-02 用 sha256 钉死），标题用 HTML
+   叠字 + 无头浏览器截图；`device_scale_factor` 锁 1，输出像素 == 平台规格
+   （UT-15-01），规格从 adapter meta.json 读，不硬编码（PRD §9.5）。
+2. **产物三件套**：cover.png / cover.json / cover-preview.html。审批绑定
+   cover_sha——确认后封面被改动，发布闸照拦（「审 A 发 B」的缝焊死）；
+   重渲染重置 approved，上一次确认留痕 previous_approval（学 T-13 REVIEW.md）。
+3. **字形级 fail fast**（UT-15-04 的另一半）：纯 struct 解析 TTF/OTF/TTC 的
+   cmap（format 4/12，TTC 取第一个 face，表偏移按规范相对文件起点），标题
+   缺字形直接报错让人换字体——豆腐块封面比没有封面更糟。
+4. **产物先落临时文件**，尺寸/字节验收过才 os.replace 进正式位；不合格的
+   当场销毁，盘上不留带病封面（与 upload_cover「传上去才发现不对就多一张
+   垃圾封面」同一哲学，往前挪了一站）。
+5. **shooter 可注入**（PlaywrightShooter 的 launcher 模式同 snapshot.py），
+   单测不开浏览器；CLI 层 `cli.PlaywrightShooter` 同样可替换。
+
+**CLI**：`geopublish cover <draft_dir> [--title T] [--visual P] [--font P]`
+生成 + 预览页；`geopublish cover <draft_dir> --approve --by 名字` 落抽检结论。
+人工确认动作在 DoD 验收时执行（本记录落笔时封面已真机渲染待抽检）。
 
 ---
 

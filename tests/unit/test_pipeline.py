@@ -319,3 +319,328 @@ def test_cli_write_brand_query_is_usage_error(tmp_path, data_dir, clock, capsys)
     assert rc == EXIT_USAGE
     assert "成稿失败" in capsys.readouterr().err
 
+
+
+# --------------------------------------------------------------- 覆盖率补钉（T-15 发现）
+# T-14 交付时只跑了「415 绿」，没跑 CI 的 100% 覆盖门禁——下面这些是漏网的
+# 错误分支。门禁的意义就是不许有「没被断言过的行为」，补齐它们。
+
+from geopublish.write.ingest import Fact  # noqa: E402
+from geopublish.write.pipeline import (  # noqa: E402
+    BrandKit,
+    Product,
+    Query,
+    _Frame,
+    _assert_structure,
+    _render_faq,
+    _render_lead,
+    _render_section,
+    load_product,
+)
+
+_BRAND = BrandKit(name="上海聚托", aliases=("JOTO", "聚托"), products=("DeepParser",))
+_QUERY = Query(id="S01", text="PDF 里的表格怎么自动提取成结构化数据", intent="场景", priority="P0")
+
+
+def _fact(claim: str, tier: str = "B") -> Fact:
+    return Fact(claim=claim, source="测试资料 第 1 页", tier=tier, date="2026-10-26")
+
+
+def _ctx() -> dict:
+    return {"query": _QUERY.text, "product": "DeepParser", "brand": "上海聚托", "brand_obj": _BRAND}
+
+
+def test_load_query_config_error_paths(tmp_path):
+    with pytest.raises(PipelineError, match="问句配置不存在"):
+        load_query_config(tmp_path / "no.json")
+
+    bad = tmp_path / "bad.json"
+    bad.write_text("{坏掉了", encoding="utf-8")
+    with pytest.raises(PipelineError, match="不是合法 JSON"):
+        load_query_config(bad)
+
+    empty = tmp_path / "empty.json"
+    empty.write_text('{"queries": []}', encoding="utf-8")
+    with pytest.raises(PipelineError, match="非空数组"):
+        load_query_config(empty)
+
+    missing_field = tmp_path / "mf.json"
+    missing_field.write_text(json.dumps({"queries": [{"id": "S01"}], "brand": {"name": "x"}}), encoding="utf-8")
+    with pytest.raises(PipelineError, match="缺字段"):
+        load_query_config(missing_field)
+
+    blank = tmp_path / "blank.json"
+    blank.write_text(
+        json.dumps({"queries": [{"id": " ", "text": "x"}], "brand": {"name": "x"}}), encoding="utf-8"
+    )
+    with pytest.raises(PipelineError, match="不能为空"):
+        load_query_config(blank)
+
+    dup = tmp_path / "dup.json"
+    dup.write_text(
+        json.dumps({
+            "queries": [
+                {"id": "S01", "text": "甲"}, {"id": "s01", "text": "乙"},
+            ],
+            "brand": {"name": "x"},
+        }),
+        encoding="utf-8",
+    )
+    with pytest.raises(PipelineError, match="id 重复"):
+        load_query_config(dup)
+
+    nobrand = tmp_path / "nb.json"
+    nobrand.write_text(json.dumps({"queries": [{"id": "S01", "text": "x"}]}), encoding="utf-8")
+    with pytest.raises(PipelineError, match="brand.name"):
+        load_query_config(nobrand)
+
+
+def test_load_product_broken_and_empty_facts(tmp_path, data_dir):
+    qcfg = load_query_config(_write_queries(tmp_path))
+
+    broken = data_dir / "products" / "broken"
+    broken.mkdir(parents=True)
+    (broken / "facts.json").write_text("{坏", encoding="utf-8")
+    with pytest.raises(PipelineError, match="产品库损坏"):
+        load_product("broken", data_dir, qcfg.brand)
+
+    empty = data_dir / "products" / "empty"
+    empty.mkdir(parents=True)
+    (empty / "facts.json").write_text('{"facts": []}', encoding="utf-8")
+    with pytest.raises(PipelineError, match="空的"):
+        load_product("empty", data_dir, qcfg.brand)
+
+
+def test_load_product_review_gate_can_be_skipped_explicitly(tmp_path, data_dir, clock):
+    """require_reviewed=False 是测试/调试旁路：显式关才关，默认必须拦。"""
+    _make_product(data_dir, clock, reviewed=False)
+    qcfg = load_query_config(_write_queries(tmp_path))
+    product = load_product("deepparser", data_dir, qcfg.brand, require_reviewed=False)
+    assert product.product_id == "deepparser"
+
+
+def test_load_product_missing_review_file(tmp_path, data_dir, clock):
+    _make_product(data_dir, clock, reviewed=False)
+    (data_dir / "products" / "deepparser" / "REVIEW.md").unlink()
+    qcfg = load_query_config(_write_queries(tmp_path))
+    with pytest.raises(PipelineError, match="缺 REVIEW.md"):
+        load_product("deepparser", data_dir, qcfg.brand)
+
+
+def test_render_lead_budget_exhausted_raises():
+    """问句 + 实体名太长，首段压不进 80 字 → 大声失败，不写残稿。"""
+    long_query = Query(id="S02", text="很" * 60, intent="场景", priority="P1")
+    product = Product("deepparser", "DeepParser", (_fact("短事实"),), Path("."))
+    with pytest.raises(PipelineError, match="无法压进"):
+        _render_lead(long_query, product, _BRAND)
+
+
+def test_render_lead_skips_oversized_clause_for_shorter_one():
+    """首条无数字事实太长就放过去找短的——80 字预算比「用第一条」重要。"""
+    product = Product(
+        "deepparser",
+        "DeepParser",
+        (
+            _fact("这是一段特别特别长的能力描述" + "长" * 40),  # 超预算
+            _fact("开箱即用"),  # 短到能进首段
+        ),
+        Path("."),
+    )
+    lead = _render_lead(_QUERY, product, _BRAND)
+    assert "开箱即用" in lead
+    assert "特别特别长" not in lead
+
+
+def test_render_section_untrimmable_raises():
+    """单条 claim 就顶穿 400 字：先砍填充句，砍无可砍就报错让产品库拆分。"""
+    frame = _Frame("怎么看这件事？", "先看引导。", ("B",))
+    giant = _fact("巨" * 500)
+    with pytest.raises(PipelineError, match="无法再剪"):
+        _render_section(frame, [giant], _ctx(), 0)
+
+
+def test_render_faq_loop_exhaustion_and_trim(monkeypatch):
+    """短事实 + 抬高 SECTION_MIN：四条 FAQ 全用完也不够 300 字（循环自然结束，
+    无提前 break）；长事实：顶破 400 字 → 保前 3 条（数量下限优先于字数上限）。"""
+    from geopublish.write import pipeline as pipeline_mod
+
+    monkeypatch.setattr(pipeline_mod, "SECTION_MIN", 300)  # 四条模板 ~216 字，永达不到 → 不 break
+    tiny_query = Query(id="S01", text="提取", intent="场景", priority="P0")
+    short_facts = tuple(Fact(claim=f"能{i}", source="s", tier="B", date="2026-10-26") for i in range(6))
+    used = {i: 0 for i in range(len(short_facts))}
+    faq = _render_faq(tiny_query, Product("deepparser", "DeepParser", short_facts, Path(".")), _BRAND, used)
+    assert faq.count("**问：") == 4  # 循环跑满 4 条模板，没有提前 break
+
+    monkeypatch.undo()  # 长事实半边用真实常量
+    long_facts = tuple(_fact("长" * 120) for _ in range(6))
+    used = {i: 0 for i in range(len(long_facts))}
+    faq = _render_faq(_QUERY, Product("deepparser", "DeepParser", long_facts, Path(".")), _BRAND, used)
+    assert faq.count("**问：") == 3  # 顶破 400 字 → 只保前 3 条
+
+
+def test_build_body_refuses_beyond_physical_capacity(tmp_path, data_dir, clock):
+    """word_min 高过版面物理容量（首段 80 + 11 节 × 400 封顶 = 4480）时：
+    每节顶到 400 后补不动（585 continue）、一轮零增长（589 break）、
+    总量仍不够 → 592 报错，不注水。"""
+    from geopublish.write.pipeline import _build_body
+
+    facts = tuple(_fact(f"短事实{i}", tier="A") for i in range(30))
+    product = Product("deepparser", "DeepParser", facts, Path("."))
+    # 实测容量 4746 字（含 markdown 符号与引用标记）：word_min 抬过它就永远够不着
+    platform = PlatformConfig(name="csdn", word_min=5000, word_max=6000)
+    with pytest.raises(PipelineError, match="撑不起这篇稿"):
+        _build_body(_QUERY, product, _BRAND, platform)
+
+
+# --- _assert_structure：八条断言各自的拒绝面（用通过稿做底，一次弄坏一处）
+
+
+@pytest.fixture(scope="module")
+def structure_kit(produced):
+    result, body, qcfg = produced
+    facts = tuple(
+        Fact.from_json(f)
+        for f in json.loads(
+            (result.draft_dir.parent.parent / "products" / "deepparser" / "facts.json")
+            .read_text(encoding="utf-8")
+        )["facts"]
+    )
+    product = Product("deepparser", "DeepParser", facts, result.draft_dir)
+    return body, product, qcfg.brand, qcfg.query("S01")
+
+
+def test_assert_structure_accepts_produced_body(structure_kit):
+    body, product, brand, query = structure_kit
+    _assert_structure(body, product, brand, query)  # 不抛即通过
+
+
+def test_assert_structure_rejects_too_few_h2(structure_kit):
+    body, product, brand, query = structure_kit
+    lead = extract_lead(body)
+    first_h2 = body.split("\n## ")[1]
+    mutilated = lead + "\n\n## " + first_h2
+    with pytest.raises(PipelineError, match="H2 章节"):
+        _assert_structure(mutilated, product, brand, query)
+
+
+def test_assert_structure_rejects_non_question_h2(structure_kit):
+    body, product, brand, query = structure_kit
+    mutilated = body.replace("## ", "## 陈述句标题\n\n", 1)
+    # 把第一个问句 H2 换成陈述句：问句标题行被吃掉，新标题不是问句
+    with pytest.raises(PipelineError, match="非问句 H2"):
+        _assert_structure(mutilated, product, brand, query)
+
+
+def test_assert_structure_rejects_section_out_of_range(structure_kit):
+    body, product, brand, query = structure_kit
+    sections = iter_sections(body)
+    lead = extract_lead(body)
+    h2, _ = sections[0]
+    mutilated = lead + "\n\n## " + h2 + "\n\n太短了\n\n" + "\n\n".join(
+        f"## {h}\n\n{t}" for h, t in sections[1:]
+    ) + "\n"
+    with pytest.raises(PipelineError, match="不在 .* 区间"):
+        _assert_structure(mutilated, product, brand, query)
+
+
+def test_assert_structure_rejects_too_few_faq(structure_kit):
+    """FAQ 节只留一条但字数撑够：绕过节长检查，单独命中「FAQ 不足」。"""
+    body, product, brand, query = structure_kit
+    faq_start = body.index("**问：")
+    second_item = body.index("**问：", faq_start + 1)
+    mutilated = body[:second_item] + "补充说明。" * 40 + "\n"  # FAQ 节 ≥200 字但只剩 1 条
+    with pytest.raises(PipelineError, match="FAQ 不足"):
+        _assert_structure(mutilated, product, brand, query)
+
+
+def test_assert_structure_rejects_long_lead(structure_kit):
+    body, product, brand, query = structure_kit
+    mutilated = "超长的首段" * 20 + "\n\n## " + body.split("\n## ", 1)[1]
+    with pytest.raises(PipelineError, match="超过 80 字"):
+        _assert_structure(mutilated, product, brand, query)
+
+
+def test_assert_structure_rejects_unsourced_number(structure_kit):
+    body, product, brand, query = structure_kit
+    with pytest.raises(PipelineError, match="无出处数字"):
+        _assert_structure(body + "\n\n附录：命中率 87%。\n", product, brand, query)
+
+
+def test_assert_structure_rejects_alias_leak(structure_kit):
+    body, product, brand, query = structure_kit
+    with pytest.raises(PipelineError, match="别名"):
+        _assert_structure(body + "\n\n补一句：JOTO 的方案。\n", product, brand, query)
+
+
+def test_assert_structure_rejects_low_entity_density(structure_kit):
+    body, product, brand, query = structure_kit
+    mutilated = body.replace("上海聚托", "某公司").replace("DeepParser", "某产品")
+    with pytest.raises(PipelineError, match="实体仅出现"):
+        _assert_structure(mutilated, product, brand, query)
+
+
+# --- 标题压缩（680/682）与 CLI 错误分支
+
+
+def test_title_compressed_once_when_over_limit(tmp_path, data_dir, clock):
+    """title_max 收紧一档：先换短模板（680 行）；压得下就照常出稿。
+    原始标题 37 字，短模板 34 字——35 正好卡住「压一次就够」的区间。"""
+    _make_product(data_dir, clock)
+    qcfg = load_query_config(_write_queries(tmp_path))
+    platform = PlatformConfig(name="csdn", word_min=3000, word_max=5000, title_max=35)
+    result = write_article(
+        "deepparser", "S01",
+        data_root=data_dir, query_config=qcfg, platform=platform, clock=clock,
+    )
+    meta = json.loads(result.meta_path.read_text(encoding="utf-8"))
+    assert len(meta["title"]) <= 35
+    assert meta["title"].endswith("答案")
+
+
+def test_title_uncompressible_raises(tmp_path, data_dir, clock):
+    _make_product(data_dir, clock)
+    qcfg = load_query_config(_write_queries(tmp_path))
+    platform = PlatformConfig(name="csdn", word_min=3000, word_max=5000, title_max=10)
+    with pytest.raises(PipelineError, match="无法再压缩"):
+        write_article(
+            "deepparser", "S01",
+            data_root=data_dir, query_config=qcfg, platform=platform, clock=clock,
+        )
+
+
+def test_cli_write_bad_config_is_exit_3(tmp_path, capsys):
+    from geopublish.cli import EXIT_CONFIG_ERROR, main
+
+    rc = main([
+        "write", "deepparser", "--query", "S01",
+        "--queries", str(tmp_path / "q.json"), "--config", str(tmp_path / "no.json"),
+    ])
+    assert rc == EXIT_CONFIG_ERROR
+    assert "配置错误" in capsys.readouterr().err
+
+
+def test_cli_write_rejected_is_exit_6_with_hit_details(tmp_path, data_dir, clock, capsys):
+    """自检不过退 6，且前几条命中明细要打到 stderr——改稿的人靠它定位。"""
+    from geopublish.cli import EXIT_FAILED, main
+
+    src = tmp_path / "poison.md"
+    lines = ["<!-- page 1 -->"]
+    for i in range(15):
+        lines.append(f"- 第{i}条事实：本产品是最好的企业级文档解析工具，支持私有化部署")
+    src.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    result = ingest(src, "poison", data_dir, clock=clock)
+    review = result.product_dir / "REVIEW.md"
+    text = review.read_text(encoding="utf-8")
+    text = re.sub(r"^reviewed_by:[ \t]*$", "reviewed_by: 拾一米", text, count=1, flags=re.M)
+    text = re.sub(r"^reviewed_at:[ \t]*$", "reviewed_at: 2026-10-26T10:00:00+08:00", text, count=1, flags=re.M)
+    review.write_text(text, encoding="utf-8")
+
+    queries = _write_queries(tmp_path)
+    config = _write_config(tmp_path, data_dir)
+    rc = main([
+        "write", "poison", "--query", "S01",
+        "--queries", str(queries), "--data-dir", str(data_dir), "--config", str(config),
+    ])
+    err = capsys.readouterr().err
+    assert rc == EXIT_FAILED
+    assert "自检未通过" in err and "[absolute]" in err

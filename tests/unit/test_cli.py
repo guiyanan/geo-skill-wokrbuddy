@@ -625,3 +625,175 @@ def test_publish_content_rejected_in_draft_mode_is_exit_6(
     err = capsys.readouterr().err
     assert code == EXIT_FAILED
     assert "敏感词" in err
+
+
+# ------------------------------------------------- T-15：cover 封面生成与人工抽检
+
+from _imgfactory import png_bytes  # noqa: E402
+from test_cover import FULL_FONT  # noqa: E402
+
+from geopublish.adapters.base import CoverSpec  # noqa: E402
+from geopublish.write.cover import (  # noqa: E402
+    CoverNotApproved,
+    CoverShooterUnavailable,
+    load_record,
+    render_cover,
+)
+
+
+class _FakeShooter:
+    """写死 PNG 字节的渲染器：CLI 冒烟不开浏览器。"""
+
+    def __init__(self, error=None):
+        self.error = error
+        self.calls = []
+
+    def shoot(self, html, width, height, out):
+        self.calls.append((width, height))
+        if self.error is not None:
+            raise self.error
+        Path(out).write_bytes(png_bytes(width, height))
+
+
+def _shooter_factory(monkeypatch, shooter, captured):
+    def _factory(channel=None):
+        captured["channel"] = channel
+        return shooter
+
+    monkeypatch.setattr("geopublish.cli.PlaywrightShooter", _factory)
+
+
+@pytest.fixture
+def cover_draft(tmp_path):
+    """带主视觉与字体的稿件目录（CSDN 规格 1140x640 来自真实 meta.json）。"""
+    root = tmp_path / "draft"
+    (root / "assets").mkdir(parents=True)
+    (root / "meta.json").write_text(
+        json.dumps({"slug": "t15-cli", "title": "封面标题探针", "ai_involvement": "generated"}),
+        encoding="utf-8",
+    )
+    (root / "csdn.md").write_text("正文" * 50, encoding="utf-8")
+    (root / "assets" / "visual.png").write_bytes(png_bytes(1140, 640))
+    font = tmp_path / "font.ttf"
+    font.write_bytes(FULL_FONT)
+    return root, font
+
+
+def test_cover_render_ok(monkeypatch, capsys, cover_draft):
+    root, font = cover_draft
+    captured: dict = {}
+    _shooter_factory(monkeypatch, _FakeShooter(), captured)
+
+    code = main(["cover", str(root), "--font", str(font)])
+
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert captured["channel"] == "chrome", "默认复用系统 Chrome 渲染"
+    assert (root / "cover.png").read_bytes() == png_bytes(1140, 640)
+    assert "封面已生成" in out and "--approve" in out
+    assert "未确认的封面不进入发布流程" in out
+    meta = json.loads((root / "meta.json").read_text(encoding="utf-8"))
+    assert meta["cover"] == "cover.png"
+
+
+def test_cover_render_custom_title_and_bundled_channel(monkeypatch, capsys, cover_draft):
+    root, font = cover_draft
+    captured: dict = {}
+    _shooter_factory(monkeypatch, _FakeShooter(), captured)
+
+    code = main([
+        "cover", str(root), "--font", str(font),
+        "--title", "换标题不重渲主视觉", "--channel", "bundled",
+    ])
+
+    assert code == EXIT_OK
+    assert captured["channel"] is None, "bundled 要把 channel 抹掉，走 playwright 自带 chromium"
+    assert load_record(root).title == "换标题不重渲主视觉"
+
+
+def test_cover_render_missing_visual_is_usage(cover_draft, capsys):
+    root, font = cover_draft
+    (root / "assets" / "visual.png").unlink()
+
+    code = main(["cover", str(root), "--font", str(font)])
+
+    assert code == EXIT_USAGE
+    assert "主视觉" in capsys.readouterr().err
+
+
+def test_cover_shooter_unavailable_is_env(monkeypatch, cover_draft, capsys):
+    root, font = cover_draft
+    _shooter_factory(monkeypatch, _FakeShooter(error=CoverShooterUnavailable("没装浏览器")), {})
+
+    code = main(["cover", str(root), "--font", str(font)])
+
+    assert code == EXIT_ENV
+    assert "没装浏览器" in capsys.readouterr().err
+
+
+def test_cover_unknown_platform_is_usage(cover_draft, capsys):
+    root, font = cover_draft
+
+    code = main(["cover", str(root), "--font", str(font), "--platform", "nope"])
+
+    assert code == EXIT_USAGE
+    assert "未知平台" in capsys.readouterr().err
+
+
+def test_cover_platform_without_spec_is_usage(monkeypatch, cover_draft, capsys):
+    """平台 meta.json 没给 cover 规格 → 不猜尺寸，用法错。"""
+    import types
+
+    monkeypatch.setattr(
+        "geopublish.cli._adapter_for",
+        lambda platform: types.SimpleNamespace(cover_spec=None),
+    )
+    root, font = cover_draft
+
+    code = main(["cover", str(root), "--font", str(font)])
+
+    assert code == EXIT_USAGE
+    assert "cover 规格" in capsys.readouterr().err
+
+
+def test_cover_approve_writes_record(monkeypatch, cover_draft, capsys):
+    root, font = cover_draft
+    render_cover(root, spec=CoverSpec(width=1140, height=640, max_bytes=5_242_880),
+                 font=font, shooter=_FakeShooter())
+
+    code = main(["cover", str(root), "--approve", "--by", "拾一米"])
+
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "封面已确认" in out and "拾一米" in out
+    record = load_record(root)
+    assert record.approved and record.approved_by == "拾一米"
+
+
+def test_cover_approve_requires_by(cover_draft, capsys):
+    root, _ = cover_draft
+
+    code = main(["cover", str(root), "--approve"])
+
+    assert code == EXIT_USAGE
+    assert "--by" in capsys.readouterr().err
+
+
+def test_cover_approve_without_record_is_usage(cover_draft, capsys):
+    root, _ = cover_draft
+
+    code = main(["cover", str(root), "--approve", "--by", "x"])
+
+    assert code == EXIT_USAGE
+    assert "cover.json" in capsys.readouterr().err
+
+
+def test_publish_cover_not_approved_is_exit_6(monkeypatch, capsys, config_file, draft_dir):
+    """G2 闸的 CLI 面：封面未过人工抽检，publish 退 6 并把处置说清。"""
+    _stub_publish(monkeypatch, error=CoverNotApproved("封面未经人工确认（G2）：先跑 cover --approve"))
+
+    code = main(["publish", str(draft_dir), "--mode", "publish", "--config", str(config_file())])
+
+    err = capsys.readouterr().err
+    assert code == EXIT_FAILED
+    assert "封面未确认" in err

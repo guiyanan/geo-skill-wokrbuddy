@@ -9,6 +9,7 @@
 - `geopublish publish <draft_dir> --mode draft`：把稿件投进草稿箱（T-09）
 - `geopublish ingest <资料>`：产品资料入库，产出 facts.json + REVIEW.md（T-13）
 - `geopublish write <product_id> --query <QID>`：成稿五步，过 R4 自检才落盘（T-14）
+- `geopublish cover <draft_dir>`：封面生成（T-15）；`--approve --by 名字` 落人工抽检结论（G2）
 
 退出码约定：
   0 成功（含 SKIPPED_DUPLICATE：已发过，幂等跳过）/ 1 用法错误 / 2 需重新授权 /
@@ -59,6 +60,14 @@ from .core.snapshot import (
     capture,
 )
 from .publish import DraftLoadError, GateClosed, load_draft, publish_draft
+from .write.cover import (
+    CoverNotApproved,
+    CoverRenderError,
+    CoverShooterUnavailable,
+    PlaywrightShooter,
+    approve_cover,
+    render_cover,
+)
 from .write.ingest import IngestError, ingest
 from .write.pipeline import DraftRejected, PipelineError, load_query_config, write_article
 
@@ -209,6 +218,45 @@ def build_parser() -> argparse.ArgumentParser:
     )
     write_cmd.add_argument("--platform", default="csdn", help="目标平台（默认 csdn）")
 
+    cover_cmd = sub.add_parser(
+        "cover",
+        help="生成稿件封面（T-15：主视觉+代码叠字）；--approve 落人工抽检结论（G2）",
+    )
+    cover_cmd.add_argument(
+        "draft_dir", help="稿件目录（含 meta.json；主视觉默认 <dir>/assets/visual.png）"
+    )
+    cover_cmd.add_argument(
+        "--title",
+        default=None,
+        help="封面标题（缺省取 meta.json 的 title；改标题只重渲染，不重新生主视觉）",
+    )
+    cover_cmd.add_argument(
+        "--visual",
+        default=None,
+        help="主视觉 PNG（AI 生成、无文字）；给定后固化进 <dir>/assets/visual.png",
+    )
+    cover_cmd.add_argument(
+        "--font",
+        default=None,
+        help="叠字字体 .ttf/.otf/.ttc（缺省按系统候选清单找；缺字形会 fail fast）",
+    )
+    cover_cmd.add_argument(
+        "--platform",
+        default="csdn",
+        help="平台名（封面规格从该平台 meta.json 读，不硬编码）",
+    )
+    cover_cmd.add_argument(
+        "--channel",
+        default="chrome",
+        help="渲染浏览器：chrome=复用系统 Chrome（默认）；bundled=playwright 自带 chromium",
+    )
+    cover_cmd.add_argument(
+        "--approve",
+        action="store_true",
+        help="人工抽检通过后确认（必须配 --by；未确认的封面不进入发布流程）",
+    )
+    cover_cmd.add_argument("--by", default=None, help="抽检人姓名（--approve 时必填，留痕用）")
+
     return parser
 
 
@@ -230,6 +278,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _ingest(args)
     if args.command == "write":
         return _write(args)
+    if args.command == "cover":
+        return _cover(args)
 
     # 没给子命令不是「打印帮助然后成功」，是用法错了。
     # 退 0 会让 cron 以为今天跑过了 —— 静默成功比报错危险得多。
@@ -338,6 +388,11 @@ def _publish(args: argparse.Namespace) -> int:
     except GateClosed as exc:
         print(f"闸门关闭：{exc}", file=sys.stderr)
         return EXIT_CONFIG_ERROR
+    except CoverNotApproved as exc:
+        # T-15 / G2：封面没过人工抽检，发布在开浏览器之前就被拦下了。
+        # 处置是去跑 cover --approve，与「发布未确认成功」同码——都归人处理。
+        print(f"封面未确认：{exc}", file=sys.stderr)
+        return EXIT_FAILED
     except (InjectFailed, MetaError, CoverError, SubmitBlocked, EditorReadError, ContentRejected) as exc:
         # publish 模式的失败已由 core/errors.py 分类处置（T-12），不会走到这里；
         # 这里只剩 draft 模式（不写日志，异常原样上来）和极少见的逃逸路径。
@@ -438,7 +493,67 @@ def _write(args: argparse.Namespace) -> int:
     print(f"  字数     = {result.word_count}")
     print(f"  锚定问句 = {args.query}")
     print(f"  自检     = 通过（{result.selfcheck_path.name}）")
-    print("  下一步   = geopublish publish %s --mode draft" % result.draft_dir)
+    print("  下一步   = geopublish cover %s（生成封面）" % result.draft_dir)
+    return EXIT_OK
+
+
+def _cover(args: argparse.Namespace) -> int:
+    """封面生成与确认（T-15）。
+
+    退出码：输入类问题（缺主视觉/字体缺字形/产物不合格/审批冲突/平台没规格）
+    退 1——要改的是这次输入；浏览器不可用退 5——修机器，不是改稿子。
+    """
+    if args.approve:
+        if not (args.by or "").strip():
+            print("用法错误：--approve 必须配 --by <抽检人>（G2 抽检要留痕）", file=sys.stderr)
+            return EXIT_USAGE
+        try:
+            record = approve_cover(Path(args.draft_dir), by=args.by)
+        except CoverRenderError as exc:
+            print(f"确认失败：{exc}", file=sys.stderr)
+            return EXIT_USAGE
+        print(f"封面已确认：{record.title}")
+        print(f"  抽检人    = {record.approved_by} @ {record.approved_at}")
+        print(f"  cover_sha = {record.cover_sha}")
+        return EXIT_OK
+
+    try:
+        adapter = _adapter_for(args.platform)
+    except SessionError as exc:
+        print(f"用法错误：{exc}", file=sys.stderr)
+        return EXIT_USAGE
+    spec = getattr(adapter, "cover_spec", None)
+    if spec is None:
+        print(
+            f"用法错误：平台 {args.platform} 的 meta.json 未提供 cover 规格"
+            "（width/height/max_bytes）：没有规格就不渲染，不猜",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+
+    channel = None if str(args.channel).strip().lower() in {"bundled", "none", ""} else args.channel
+    try:
+        result = render_cover(
+            Path(args.draft_dir),
+            spec=spec,
+            visual=args.visual,
+            title=args.title,
+            font=args.font,
+            shooter=PlaywrightShooter(channel=channel),
+        )
+    except CoverRenderError as exc:
+        print(f"封面生成失败：{exc}", file=sys.stderr)
+        return EXIT_USAGE
+    except CoverShooterUnavailable as exc:
+        print(f"环境不可用：{exc}", file=sys.stderr)
+        return EXIT_ENV
+
+    print(f"封面已生成：{result.cover_path}")
+    print(f"  尺寸     = {result.width}x{result.height}（{result.size_bytes} 字节）")
+    print(f"  预览     = {result.preview_path}")
+    print("  ⚠️ 打开预览页人工核对两项（标题无错别字 / 主视觉无水印），通过后：")
+    print(f"     geopublish cover {result.draft_dir} --approve --by <你的名字>")
+    print("     未确认的封面不进入发布流程（G2）")
     return EXIT_OK
 
 

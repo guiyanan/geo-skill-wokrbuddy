@@ -108,13 +108,36 @@ def _opener(log: list[str], page: StubPage | None = None):
     return open_page, stub
 
 
-def _loaded(tmp_path: Path, *, cover: bool = False) -> LoadedDraft:
+def _loaded(tmp_path: Path, *, cover: bool = False, cover_approved: bool = True) -> LoadedDraft:
     root = tmp_path / "draft"
     root.mkdir(exist_ok=True)
     meta = dict(META)
     if cover:
         meta["cover"] = "cover.png"
-        (root / "cover.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 32)
+        cover_bytes = b"\x89PNG\r\n\x1a\n" + b"0" * 32
+        (root / "cover.png").write_bytes(cover_bytes)
+        # T-15 / G2：publish 模式带封面必须已过人工抽检（cover.json 绑定 sha）。
+        # 助手默认给「已确认」的记录；要测拦截路径就传 cover_approved=False。
+        import hashlib
+
+        from geopublish.write.cover import CoverRecord
+
+        record = CoverRecord(
+            title=meta["title"],
+            width=1140,
+            height=640,
+            size_bytes=len(cover_bytes),
+            visual_sha="0" * 64,
+            cover_sha=hashlib.sha256(cover_bytes).hexdigest(),
+            font="test-font",
+            rendered_at="2026-10-21T00:00:00+08:00",
+            approved=cover_approved,
+            approved_by="测试员" if cover_approved else "",
+            approved_at="2026-10-21T00:01:00+08:00" if cover_approved else "",
+        )
+        (root / "cover.json").write_text(
+            json.dumps(record.to_json(), ensure_ascii=False), encoding="utf-8"
+        )
     (root / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
     (root / "csdn.md").write_text("正文" * 100, encoding="utf-8")
     return load_draft(root)
@@ -198,6 +221,53 @@ def test_publish_mode_fills_meta_then_uploads_cover_and_passes_mode_down(tmp_pat
         ("submit", "publish"),
         ("verify", "publish"),
     ]
+
+
+# --------------------------------------------------------------- T-15 封面审批闸（G2）
+
+
+def test_publish_mode_with_unapproved_cover_is_blocked_before_browser(tmp_path):
+    """G2：封面没过人工抽检 → publish 模式在 open_page 之前拦下，浏览器不开。"""
+    from geopublish.write.cover import CoverNotApproved
+
+    adapter = RecordingAdapter()
+    opened: list[str] = []
+    loaded = _loaded(tmp_path, cover=True, cover_approved=False)
+
+    with pytest.raises(CoverNotApproved, match="--approve"):
+        publish_draft(
+            adapter, loaded, _cfg(), gate=Gate.PUBLISH,
+            open_page=_opener(opened)[0], mode="publish",
+            data_dir=tmp_path / "data",
+        )
+
+    assert opened == [], "未确认的封面不许启动浏览器"
+    assert adapter.calls == [], "adapter 一个动作都不该被调到"
+
+
+def test_publish_mode_with_missing_cover_record_is_blocked(tmp_path):
+    """cover.json 缺失（没跑过 cover 命令/被手删）同样拦住——缺记录 = 没抽检。"""
+    from geopublish.write.cover import CoverNotApproved
+
+    loaded = _loaded(tmp_path, cover=True)
+    (tmp_path / "draft" / "cover.json").unlink()
+
+    with pytest.raises(CoverNotApproved, match="未过人工抽检"):
+        publish_draft(
+            adapter=RecordingAdapter(), loaded=loaded, platform_cfg=_cfg(),
+            gate=Gate.PUBLISH, open_page=_opener([])[0], mode="publish",
+            data_dir=tmp_path / "data",
+        )
+
+
+def test_draft_mode_ignores_cover_approval(tmp_path):
+    """草稿链路不传封面（控件在发布对话框里），审批闸不该拦它。"""
+    adapter = RecordingAdapter()
+    loaded = _loaded(tmp_path, cover=True, cover_approved=False)
+
+    outcome = publish_draft(adapter, loaded, _cfg(), gate=Gate.DRAFT, open_page=_opener([])[0])
+
+    assert outcome.ok is True
 
 
 def test_publish_success_writes_receipt_csv_and_two_screenshots(tmp_path):
