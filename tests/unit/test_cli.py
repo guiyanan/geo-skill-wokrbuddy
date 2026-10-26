@@ -797,3 +797,47 @@ def test_publish_cover_not_approved_is_exit_6(monkeypatch, capsys, config_file, 
     err = capsys.readouterr().err
     assert code == EXIT_FAILED
     assert "封面未确认" in err
+
+
+# ------------------------------------------------- T-16：自检闸的 CLI 面
+
+def test_ut_16_03_cli_has_no_skip_guard_flag_anywhere():
+    """红线元测试：任何层级子命令都不许出现「跳过自检」类参数（PRD §9.5）。
+
+    这道闸的价值在于一刀切：与其等有人加了 --skip-guard 再在评审里扯皮，
+    不如让参数表本身被测试钉死。
+    """
+    from geopublish.cli import build_parser
+
+    def walk(parser):
+        for action in parser._actions:
+            yield from action.option_strings
+            choices = getattr(action, "choices", None)
+            if isinstance(choices, dict):
+                for sub in choices.values():
+                    yield from walk(sub)
+
+    flags = set(walk(build_parser()))
+    offenders = {
+        f for f in flags
+        if "guard" in f.lower() or "selfcheck" in f.lower() or "self-check" in f.lower()
+    }
+    assert not offenders, f"CLI 出现绕自检的参数：{offenders}"
+
+
+def test_publish_guard_rejected_is_exit_6(tmp_path, capsys, config_file):
+    """自检未过（真实 publish_draft，不 stub）：退 6，原因写清挂在哪个检查。"""
+    root = tmp_path / "baddraft"
+    root.mkdir()
+    (root / "meta.json").write_text(
+        json.dumps({"slug": "t16-cli", "title": "探针标题", "ai_involvement": "assisted"}),
+        encoding="utf-8",
+    )
+    (root / "csdn.md").write_text("我们是最好的方案。" + "正文" * 100, encoding="utf-8")
+    cfg = config_file(gate="publish", data_dir=str(tmp_path / "data"))
+
+    code = main(["publish", str(root), "--mode", "publish", "--config", str(cfg)])
+
+    err = capsys.readouterr().err
+    assert code == EXIT_FAILED
+    assert "R4 自检未通过" in err and "absolute" in err

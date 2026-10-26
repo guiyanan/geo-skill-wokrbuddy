@@ -747,3 +747,215 @@ def test_account_fallback_covers_non_csdn_url():
     assert _account_from_url("https://juejin.cn/post/123") == "default"
     assert _account_from_url("") == "default"
     assert _account_from_url("https://blog.csdn.net/probe/article/details/42") == "probe"
+
+
+# --------------------------------------------------------------- T-16 自检闸（R4 红线）
+
+from geopublish.core.state import PublishLog, Status  # noqa: E402
+from geopublish.core.models import LogEntry  # noqa: E402
+
+
+def _loaded_banned(tmp_path: Path) -> LoadedDraft:
+    """一篇混了绝对化用语 + 无出处数字的稿子：self_check 必挂（absolute + number_source）。"""
+    root = tmp_path / "draft"
+    if not root.exists():
+        root.mkdir()
+    (root / "meta.json").write_text(json.dumps(dict(META)), encoding="utf-8")
+    (root / "csdn.md").write_text(
+        "我们是最好的方案。转化率提升 87%，出处先欠着。" + "正文" * 100,
+        encoding="utf-8",
+    )
+    return load_draft(root)
+
+
+def test_ut_16_01_guard_failure_aborts_before_browser_in_publish_mode(tmp_path):
+    """自检未过 → 发布流程在启动浏览器之前中止（一个 adapter 动作都不许发生）。"""
+    adapter = RecordingAdapter()
+    opened: list[str] = []
+
+    outcome = publish_draft(
+        adapter, _loaded_banned(tmp_path), _cfg(), gate=Gate.PUBLISH,
+        open_page=_opener(opened)[0], mode="publish", data_dir=tmp_path / "data",
+    )
+
+    assert opened == [], "自检未过不许启动浏览器"
+    assert adapter.calls == []
+    assert not outcome.ok
+    assert "R4 自检未通过" in outcome.reason and "absolute" in outcome.reason
+
+
+def test_ut_16_01_draft_mode_is_gated_too(tmp_path):
+    """PRD 边界表：R4 同样管 R7 草稿投递——带病稿连草稿箱都不许进。"""
+    adapter = RecordingAdapter()
+    opened: list[str] = []
+
+    outcome = publish_draft(
+        adapter, _loaded_banned(tmp_path), _cfg(), gate=Gate.DRAFT,
+        open_page=_opener(opened)[0], data_dir=tmp_path / "data",
+    )
+
+    assert opened == [] and adapter.calls == []
+    assert not outcome.ok and "R4 自检未通过" in outcome.reason
+    assert not (tmp_path / "data" / "publish-log.csv").exists(), "draft 模式不写日志"
+
+
+def test_ut_16_02_rejected_row_lands_and_sticks(tmp_path):
+    """自检未过 → 状态 rejected 落日志；重跑被幂等裁决直接拒，不再堆行。"""
+    data = tmp_path / "data"
+    loaded = _loaded_banned(tmp_path)
+
+    publish_draft(
+        RecordingAdapter(), loaded, _cfg(), gate=Gate.PUBLISH,
+        open_page=_opener([])[0], mode="publish", data_dir=data,
+    )
+    log = PublishLog(data / "publish-log.csv")
+    assert [e.status for e in log.entries()] == [Status.REJECTED]
+    assert "absolute" in log.entries()[0].note
+
+    adapter = RecordingAdapter()
+    opened: list[str] = []
+    outcome = publish_draft(
+        adapter, loaded, _cfg(), gate=Gate.PUBLISH,
+        open_page=_opener(opened)[0], mode="publish", data_dir=data,
+    )
+    assert opened == [], "已 rejected 的稿子不许自动复活"
+    assert not outcome.ok and "rejected" in outcome.reason
+    assert len(log.entries()) == 1, "重复跑不许再往日志里堆 rejected 行"
+
+
+def test_ut_16_02_prior_failed_goes_pending_then_rejected(tmp_path):
+    """上次 failed（网络挂的）+ 本次重检不过：failed→rejected 没有直达边
+    （PRD §9.5：改状态机要先评审），先落 pending 回位行再落 rejected。"""
+    data = tmp_path / "data"
+    loaded = _loaded_banned(tmp_path)
+    log = PublishLog(data / "publish-log.csv")
+    log.append(
+        LogEntry(
+            ts=FakeClock("2026-10-22T09:00:00+08:00").now(),
+            platform="csdn",
+            account="default",
+            slug=loaded.draft.meta.slug,
+            idem_key=loaded.draft.idem_key("csdn", "default"),
+            status=Status.FAILED,
+            note="上次网络超时",
+        )
+    )
+
+    outcome = publish_draft(
+        RecordingAdapter(), loaded, _cfg(), gate=Gate.PUBLISH,
+        open_page=_opener([])[0], mode="publish", data_dir=data,
+    )
+
+    assert not outcome.ok
+    assert [e.status for e in log.entries()] == [Status.FAILED, Status.PENDING, Status.REJECTED]
+
+
+def test_ut_16_02_published_stays_terminal_even_if_wordlist_tightened(tmp_path):
+    """已发布的稿子不许被重判成 rejected：published 是终态，自检闸在幂等裁决之后。"""
+    data = tmp_path / "data"
+    loaded = _loaded_banned(tmp_path)  # 内容现在挂自检，但假设它「已发布过」
+    log = PublishLog(data / "publish-log.csv")
+    log.append(
+        LogEntry(
+            ts=FakeClock("2026-10-22T09:00:00+08:00").now(),
+            platform="csdn",
+            account="default",
+            slug=loaded.draft.meta.slug,
+            idem_key=loaded.draft.idem_key("csdn", "default"),
+            status=Status.PUBLISHED,
+            url="https://blog.csdn.net/x/article/details/1",
+        )
+    )
+
+    outcome = publish_draft(
+        RecordingAdapter(), loaded, _cfg(), gate=Gate.PUBLISH,
+        open_page=_opener([])[0], mode="publish", data_dir=data,
+    )
+
+    assert outcome.ok and outcome.skipped_duplicate, "已发布 → 幂等跳过，不重判"
+    assert [e.status for e in log.entries()] == [Status.PUBLISHED]
+
+
+def test_ut_16_04_selfcheck_json_lands_next_to_the_draft(tmp_path):
+    """自检未过 → selfcheck.json 回写稿件目录，每项检查的命中明细都在。"""
+    root = tmp_path / "draft"
+
+    publish_draft(
+        RecordingAdapter(), _loaded_banned(tmp_path), _cfg(), gate=Gate.PUBLISH,
+        open_page=_opener([])[0], mode="publish", data_dir=tmp_path / "data",
+    )
+
+    selfcheck = json.loads((root / "selfcheck.json").read_text(encoding="utf-8"))
+    assert selfcheck["passed"] is False and selfcheck["status"] == "rejected"
+    names = {c["name"] for c in selfcheck["checks"]}
+    assert names == {
+        "non_empty", "absolute", "marketing", "number_source", "platform_limits", "ai_involvement",
+    }
+    assert "absolute" in selfcheck["failed_checks"]
+    hit = next(h for h in selfcheck["hits"] if h["check"] == "absolute")
+    assert hit["term"] == "最好" and hit["excerpt"], "命中明细要能指到人看的位置"
+
+
+def test_ut_16_02_prior_pending_gets_plain_rejected(tmp_path):
+    """prior 是 pending（人工改稿放回队列后重检仍不过）：直接落 rejected，
+    不需要 failed 那种回位行。"""
+    data = tmp_path / "data"
+    loaded = _loaded_banned(tmp_path)
+    log = PublishLog(data / "publish-log.csv")
+    log.append(
+        LogEntry(
+            ts=FakeClock("2026-10-22T09:00:00+08:00").now(),
+            platform="csdn",
+            account="default",
+            slug=loaded.draft.meta.slug,
+            idem_key=loaded.draft.idem_key("csdn", "default"),
+            status=Status.PENDING,
+            note="人工改稿后回队列",
+        )
+    )
+
+    publish_draft(
+        RecordingAdapter(), loaded, _cfg(), gate=Gate.PUBLISH,
+        open_page=_opener([])[0], mode="publish", data_dir=data,
+    )
+
+    assert [e.status for e in log.entries()] == [Status.PENDING, Status.REJECTED]
+
+
+def test_ut_16_04_manual_loaded_draft_without_source_dir_skips_writeback(tmp_path):
+    """手动构造的 LoadedDraft（无 source_dir）：selfcheck 回写跳过，判定照常。"""
+    loaded = LoadedDraft(draft=_loaded_banned(tmp_path).draft, cover=None, source_dir=None)
+
+    outcome = publish_draft(
+        RecordingAdapter(), loaded, _cfg(), gate=Gate.PUBLISH,
+        open_page=_opener([])[0], mode="publish", data_dir=tmp_path / "data",
+    )
+
+    assert not outcome.ok and "R4 自检未通过" in outcome.reason
+
+
+def test_pending_prior_is_released_not_misread_as_rejected(tmp_path):
+    """回归（T-16 修掉的存量 bug）：人工把 needs_human 改回 pending 后，
+    下一次运行必须放行——此前 pending 会落进 rejected 拒发分支。"""
+    data = tmp_path / "data"
+    loaded = _loaded(tmp_path)
+    PublishLog(data / "publish-log.csv").append(
+        LogEntry(
+            ts=FakeClock("2026-10-22T09:00:00+08:00").now(),
+            platform="csdn",
+            account="default",
+            slug=loaded.draft.meta.slug,
+            idem_key=loaded.draft.idem_key("csdn", "default"),
+            status=Status.PENDING,
+            note="人工核对后放回队列",
+        )
+    )
+    adapter = RecordingAdapter()
+
+    outcome = publish_draft(
+        adapter, loaded, _cfg(), gate=Gate.PUBLISH,
+        open_page=_opener([])[0], mode="publish", data_dir=data,
+    )
+
+    assert outcome.ok, "pending = 在队列里，放行"
+    assert adapter.calls[0] == "wait_for_auth_signal", "真的走进了发布流程"

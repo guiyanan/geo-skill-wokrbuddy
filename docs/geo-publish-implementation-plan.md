@@ -184,7 +184,7 @@ geo-publish/
 - [x] T-13  产品库入库
 - [x] T-14  成稿五步
 - [x] T-15  封面生成
-- [ ] T-16  自检闸门串联
+- [x] T-16  自检闸门串联
 ```
 
 **P3 · 无人值守**
@@ -966,6 +966,26 @@ meta.json 带 content_sha，可被 `publish.load_draft` 原样回读。
 | UT-16-04 | `selfcheck.json` 记录每项检查的命中明细 |
 
 **DoD**：PRD §9.5 红线成立
+
+**实施记录（2026-10-26，两处偏差 + 一个顺手修掉的存量 bug）**
+
+1. **闸门挂在 `publish_draft` 编排层，两种模式同守**。位置是刻意选的：
+   在幂等裁决**之后**（published 是终态，已发布的稿子不许被词表更新重判成
+   rejected）、在 `_run` 之前（自检未过，浏览器一个像素都不开）。draft 模式
+   同守但不写日志（状态机无 drafted 态）——PRD 边界表「R4 → R7 能否放行」
+   的字面意思就是带病稿连草稿箱都不进。
+2. **failed → rejected 没有直达边，不动状态机**（PRD §9.5：改幂等状态机要
+   先评审）。上次停在 failed 的稿子重检不过时，先落一行 pending（重检回位）
+   再落 rejected——两行都是合法迁移，日志读起来就是「失败 → 重检 → 打回」。
+   prior 为 pending/None 时直接落 rejected。
+3. **存量 bug 顺手修掉**：`_idem_decision` 原来把 prior=pending 落进 rejected
+   兜底分支（「人工把 needs_human 改回 pending」这条路会被误拒）。补了
+   pending → 放行的显式分支 + 回归测试。这 bug 在 T-16 之前打不中——
+   那时引擎自己从不写 pending 行；自检闸的两步迁移让它变成了真路径。
+
+**落盘物**：自检未过时 `selfcheck.json` 回写稿件目录（UT-16-04），与 T-14
+成稿时那份同一文件同一格式——语义即「这篇稿子最近一次自检的结论」。
+CLI 无 `--skip-guard` 类参数，UT-16-03 走参数表递归断言钉死。
 
 ---
 

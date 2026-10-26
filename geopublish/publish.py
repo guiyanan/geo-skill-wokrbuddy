@@ -30,6 +30,12 @@ PRD §9.5 要求先评审 —— 草稿重复是已接受的低危缺口（草�
 平台拒稿转 needs_human 并把原话回写进稿件目录；网络超时按 2/4/8s 退避重试，
 到顶落 failed。重试只发生在 submit 之前：submitting 行落盘后出的任何异常，
 一律转 needs_human + 草稿箱残留检查（N5），绝不自动再来一遍。
+
+自检闸（T-16 / R4 红线）：两种模式在开浏览器之前都先跑 `core.guard.self_check`。
+自检未过 → publish 模式落 rejected 行（UT-16-02，幂等裁决随后会拒它复活），
+draft 模式直接拒投；selfcheck.json 回写稿件目录（UT-16-04）。
+闸门位置在幂等裁决**之后**：published 是终态，已发布的稿子不被重判。
+CLI 没有任何跳过自检的参数（UT-16-03 的参数表断言钉着）。
 """
 
 from __future__ import annotations
@@ -48,6 +54,7 @@ from .adapters.base import Page, SubmitMode
 from .core.clock import Clock, SystemClock
 from .core.config import Gate, PlatformConfig
 from .core.errors import RETRY_HARD_CAP, FailureKind, Verdict, backoff_delays, classify
+from .core.guard import GuardResult, self_check
 from .core.lock import platform_lock
 from .core.models import Draft, LogEntry, Meta, ModelError, Receipt
 from .core.session import check_login
@@ -257,6 +264,16 @@ def publish_draft(
         if mode is not SubmitMode.PUBLISH:
             # draft 模式不写日志（状态机无 drafted 态），失败分类也只作用于
             # publish 模式：草稿是交互式调试链路，异常原样抛给 CLI（退 6）。
+            # 但 R4 自检闸两模式同守（PRD 边界表：R4 → R7 能否放行）——
+            # 自检未过，草稿箱也不许进（UT-16-01 的另一面）。
+            guard = self_check(draft, platform_cfg, clock=clk)
+            if not guard.passed:
+                _record_selfcheck(loaded, guard)
+                return PublishOutcome(
+                    ok=False,
+                    reason=f"R4 自检未通过（{', '.join(guard.failed_checks)}）："
+                    "草稿链路同样不放行，改稿后重跑",
+                )
             return _run(
                 adapter, loaded, platform_cfg,
                 mode=mode, data_dir=data_dir, clk=clk, screenshot=screenshot,
@@ -273,6 +290,18 @@ def publish_draft(
             if decision is not None:
                 # SKIPPED_DUPLICATE / needs_human / rejected：一律不开浏览器
                 return decision
+            # T-16：R4 自检闸（UT-16-01/02）。位置是刻意选的——在幂等裁决之后：
+            # published 是终态，已发布的稿子不许被「重判」成 rejected；
+            # 在 _run 之前：自检未过，浏览器一个像素都不开。
+            guard = self_check(draft, platform_cfg, clock=clk)
+            if not guard.passed:
+                _record_selfcheck(loaded, guard)
+                _mark_rejected(log, draft, platform_cfg, prior, clk, guard)
+                return PublishOutcome(
+                    ok=False,
+                    reason=f"R4 自检未通过（{', '.join(guard.failed_checks)}）："
+                    "状态 rejected，不进队列；改稿后重新自检才能回来",
+                )
             try:
                 return _run(
                     adapter, loaded, platform_cfg,
@@ -628,6 +657,12 @@ def _idem_decision(
             ),
         )
 
+    if recovered is Status.PENDING:
+        # 在队列里 = 放行。pending 行的来源：人工把 needs_human 改回 pending，
+        # 或 T-16 自检闸的两步迁移（failed→pending→rejected）中途崩掉。
+        # 此前它会落进下面的 rejected 兜底——把「待办」误读成「打回」，T-16 修掉。
+        return None
+
     if recovered is Status.FAILED:
         # UT-12-05 全局上限：同一篇累计 failed 到顶就强制停。失败原因各自不同，
         # 但「这篇就是发不出去」这个事实已经够明确了——再放行就是拿账号去撞墙。
@@ -680,6 +715,47 @@ def _count_failures(log: PublishLog, draft: Draft, platform: str) -> int:
     return total
 
 
+# --------------------------------------------------------------- 自检闸（T-16）
+
+def _record_selfcheck(loaded: LoadedDraft, result: GuardResult) -> Path | None:
+    """自检结论回写稿件目录（UT-16-04）：命中明细留在稿子旁边，改稿的人抬头就看见。
+
+    与 T-14 成稿时写的那份是同一个文件——发布前重检覆盖它，是因为这份文件
+    的语义就是「这篇稿子最近一次自检的结论」。
+    """
+    if loaded.source_dir is None:
+        return None
+    target = loaded.source_dir / "selfcheck.json"
+    target.write_text(
+        json.dumps(result.to_json(), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return target
+
+
+def _mark_rejected(
+    log: PublishLog,
+    draft: Draft,
+    platform_cfg: PlatformConfig,
+    prior: LogEntry | None,
+    clock: Clock,
+    result: GuardResult,
+) -> None:
+    """落 rejected 行（UT-16-02）：自检未过的稿子停在这里，不进发布队列。
+
+    状态机没有 failed → rejected 的直达边（PRD §9.5：改状态机要先评审，不动它）。
+    上次停在 failed 时先落一行 pending（重检回位）再落 rejected——两行都是
+    合法迁移，日志读起来也通：失败 → 重检 → 打回。
+    """
+    note = f"R4 自检未过：{', '.join(result.failed_checks)}"
+    if prior is not None and prior.status is Status.FAILED:
+        prior = _append_state(
+            log, draft, platform_cfg, Status.PENDING, clock,
+            prior=prior, note="发布前重检：回位 pending 再判定",
+        )
+    _append_state(log, draft, platform_cfg, Status.REJECTED, clock, prior=prior, note=note)
+
+
 def _append_state(
     log: PublishLog,
     draft: Draft,
@@ -691,24 +767,26 @@ def _append_state(
     url: str = "",
     article_id: str = "",
     note: str = "",
-) -> None:
-    """写一行状态迁移。先过状态机校验（transition），非法迁移在这里就炸，
+) -> LogEntry:
+    """写一行状态迁移，并返回写入的行（调用方需要拿它当下一行的 prior）。
+
+    先过状态机校验（transition），非法迁移在这里就炸，
     不许烂在 csv 里等日报读到一行讲不通的状态。"""
     account = prior.account if prior is not None else _PRE_PUBLISH_ACCOUNT
     transition(prior.status if prior is not None else Status.PENDING, status)
-    log.append(
-        LogEntry(
-            ts=clock.now(),
-            platform=platform_cfg.key,
-            account=account,
-            slug=draft.meta.slug,
-            idem_key=draft.idem_key(platform_cfg.key, account),
-            status=status,
-            url=url,
-            article_id=article_id,
-            note=note,
-        )
+    entry = LogEntry(
+        ts=clock.now(),
+        platform=platform_cfg.key,
+        account=account,
+        slug=draft.meta.slug,
+        idem_key=draft.idem_key(platform_cfg.key, account),
+        status=status,
+        url=url,
+        article_id=article_id,
+        note=note,
     )
+    log.append(entry)
+    return entry
 
 
 def _snap(page: Any, screenshot: Screenshot, run_dir: Path, name: str) -> Path | None:
