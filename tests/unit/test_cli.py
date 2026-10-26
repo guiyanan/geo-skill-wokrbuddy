@@ -485,3 +485,143 @@ def test_publish_maps_each_failure_to_its_own_exit_code(
 
     assert main(["publish", str(draft_dir), "--config", str(config_file())]) == expected
     assert capsys.readouterr().err
+
+
+# ------------------------------------------------- T-11：幂等与并发锁
+
+from geopublish.core.lock import DEFAULT_LOCK_ROOT, LockError  # noqa: E402
+
+
+def test_publish_lock_conflict_exits_3_without_browser(monkeypatch, capsys, config_file, draft_dir):
+    """UT-11-02 CLI 面：另一进程持有平台锁 → 退 3（与配置错误同码：这次运行根本没开始）。
+
+    锁在 publish_draft 内部、open_page 之前拿 —— 这里 stub 掉 publish_draft，
+    锁冲突抛 LockError，PersistentBrowser 从头到尾只是被构造，open 不会被调。
+    """
+    _stub_publish(monkeypatch, error=LockError(Path("/fake/csdn.lock"), None))
+
+    code = main(["publish", str(draft_dir), "--config", str(config_file())])
+
+    assert code == EXIT_CONFIG_ERROR == 3
+    err = capsys.readouterr().err
+    assert "并发冲突" in err and "csdn.lock" in err
+
+
+def test_publish_skipped_duplicate_exits_0_and_says_so(monkeypatch, capsys, config_file, draft_dir):
+    """R9 验收原话：第二次输出 SKIPPED_DUPLICATE。退 0 —— 幂等命中不是失败。"""
+    _stub_publish(
+        monkeypatch,
+        outcome=PublishOutcome(
+            ok=True,
+            url="https://blog.csdn.net/probe/article/details/42",
+            article_id="42",
+            reason="SKIPPED_DUPLICATE",
+            skipped_duplicate=True,
+        ),
+    )
+
+    code = main(["publish", str(draft_dir), "--mode", "publish", "--config", str(config_file())])
+
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "SKIPPED_DUPLICATE" in out
+    assert "details/42" in out, "要把已发布的 URL 给人，方便核对"
+    assert "已发布：" not in out, "本次一行没发，不许说「已发布」"
+
+
+def test_cli_passes_default_lock_root_to_orchestration(monkeypatch, config_file, draft_dir):
+    """CLI 永远带锁跑（T-11）：lock_root 默认落到 ~/.geo-publish/locks。"""
+    seen = _stub_publish(monkeypatch)
+
+    main(["publish", str(draft_dir), "--config", str(config_file())])
+
+    assert seen["lock_root"] == DEFAULT_LOCK_ROOT
+
+
+def test_cli_lock_root_override(monkeypatch, config_file, draft_dir, tmp_path):
+    seen = _stub_publish(monkeypatch)
+
+    main(["publish", str(draft_dir), "--config", str(config_file()),
+          "--lock-root", str(tmp_path / "locks")])
+
+    assert seen["lock_root"] == tmp_path / "locks"
+
+
+def test_publish_skipped_duplicate_without_url_still_exits_0(
+    monkeypatch, capsys, config_file, draft_dir
+):
+    """幂等命中但历史行没 URL（早期数据形态）：照常退 0，只是少打一行 url。"""
+    _stub_publish(
+        monkeypatch,
+        outcome=PublishOutcome(ok=True, reason="SKIPPED_DUPLICATE", skipped_duplicate=True),
+    )
+
+    code = main(["publish", str(draft_dir), "--mode", "publish", "--config", str(config_file())])
+
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "SKIPPED_DUPLICATE" in out and "url" not in out
+
+
+# ------------------------------------------------- T-12：失败分类的 CLI 出口
+
+from geopublish.adapters.base import ContentRejected  # noqa: E402
+from geopublish.core.config import MAX_RETRY  # noqa: E402
+from geopublish.core.errors import FailureKind  # noqa: E402
+
+
+def test_publish_auth_expired_is_exit_2(monkeypatch, capsys, config_file, draft_dir):
+    """UT-12-02：登录失效 → 退 2，输出重新授权命令，且没有重试。"""
+    _stub_publish(
+        monkeypatch,
+        error=AuthRequired("csdn", AuthState.EXPIRED, "被踢回登录页"),
+    )
+
+    code = main(["publish", str(draft_dir), "--mode", "publish", "--config", str(config_file())])
+
+    err = capsys.readouterr().err
+    assert code == EXIT_AUTH
+    assert "需重新授权" in err and "login csdn" in err
+
+
+def test_publish_passes_retry_max_from_config(monkeypatch, config_file, draft_dir):
+    """T-12：运行内重试预算从配置读，默认 = MAX_RETRY（全局硬顶）。"""
+    seen = _stub_publish(monkeypatch)
+    main(["publish", str(draft_dir), "--config", str(config_file())])
+    assert seen["retry_max"] == MAX_RETRY
+
+    seen2 = _stub_publish(monkeypatch)
+    main(["publish", str(draft_dir), "--config", str(config_file(retry_max=1))])
+    assert seen2["retry_max"] == 1
+
+
+def test_publish_classified_failure_prints_kind_tag(monkeypatch, capsys, config_file, draft_dir):
+    """分类失败的输出带类别标签：人与 cron 一眼看出该扫码、改稿还是等网络。"""
+    _stub_publish(
+        monkeypatch,
+        outcome=PublishOutcome(
+            ok=False,
+            reason="平台拒稿：内容包含敏感词",
+            failure_kind=FailureKind.CONTENT_REJECTED,
+        ),
+    )
+
+    code = main(["publish", str(draft_dir), "--mode", "publish", "--config", str(config_file())])
+
+    err = capsys.readouterr().err
+    assert code == EXIT_FAILED
+    assert "[CONTENT_REJECTED]" in err
+    assert "敏感词" in err
+
+
+def test_publish_content_rejected_in_draft_mode_is_exit_6(
+    monkeypatch, capsys, config_file, draft_dir
+):
+    """draft 模式没有日志层，拒稿异常原样上来：退 6 且平台原话不丢。"""
+    _stub_publish(monkeypatch, error=ContentRejected("内容包含敏感词：「免费试用」"))
+
+    code = main(["publish", str(draft_dir), "--config", str(config_file())])
+
+    err = capsys.readouterr().err
+    assert code == EXIT_FAILED
+    assert "敏感词" in err

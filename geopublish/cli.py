@@ -9,9 +9,10 @@
 - `geopublish publish <draft_dir> --mode draft`：把稿件投进草稿箱（T-09）
 
 退出码约定：
-  0 成功 / 1 用法错误 / 2 需重新授权 / 3 配置错误 /
+  0 成功（含 SKIPPED_DUPLICATE：已发过，幂等跳过）/ 1 用法错误 / 2 需重新授权 /
+  3 配置错误 / 并发锁冲突（另一进程在跑，等它完）/
   4 现场已复现（replay 的预期结果）/ 5 环境不可用（缺浏览器驱动、抓不到内容）/
-  6 发布未确认成功（verify 没过、提交前复核被拦）
+  6 发布未确认成功（verify 没过、提交前复核被拦、上次 submitting 未决 → needs_human）
 
 「1 用法错误」包括**没给子命令**：cron 里跑 `geopublish` 忘写子命令如果退 0，
 监控会当成「今天跑过了」，第二天才发现一篇都没发。argparse 默认对解析失败退 2，
@@ -32,10 +33,11 @@ from pathlib import Path
 from typing import Sequence
 
 from . import __version__
-from .adapters.base import CoverError, InjectFailed, MetaError, SubmitBlocked
+from .adapters.base import ContentRejected, CoverError, InjectFailed, MetaError, SubmitBlocked
 from .adapters.csdn.flow import EditorReadError
 from .core.config import DEFAULT_CONFIG_PATH, Config, ConfigError, load_config
 from .core.incident import BundleNotFound, IncidentError, describe_failure, load
+from .core.lock import DEFAULT_LOCK_ROOT, LockError
 from .core.session import (
     DEFAULT_PROFILE_ROOT,
     AuthRequired,
@@ -55,6 +57,7 @@ from .core.snapshot import (
     capture,
 )
 from .publish import DraftLoadError, GateClosed, load_draft, publish_draft
+from .write.ingest import IngestError, ingest
 
 EXIT_OK = 0
 EXIT_USAGE = 1
@@ -153,6 +156,27 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=f"profile 根目录（默认 {DEFAULT_PROFILE_ROOT}）",
     )
+    publish_cmd.add_argument(
+        "--lock-root",
+        default=None,
+        help=f"平台锁目录（默认 {DEFAULT_LOCK_ROOT}；T-11 并发锁，一般不用动）",
+    )
+
+    ingest_cmd = sub.add_parser("ingest", help="把产品资料入库到产品库（T-13，facts.json + REVIEW.md）")
+    ingest_cmd.add_argument(
+        "source",
+        help="资料文件（.md/.txt/.pptx；条目式行文，页码用 <!-- page N --> 标记）",
+    )
+    ingest_cmd.add_argument(
+        "--product-id",
+        default=None,
+        help="产品 id（小写字母/数字/连字符；缺省从文件名推导，推导不出必须显式给）",
+    )
+    ingest_cmd.add_argument(
+        "--data-dir",
+        default="data",
+        help="数据根目录（默认 data；产品库落在 <data-dir>/products/<id>/）",
+    )
 
     return parser
 
@@ -171,6 +195,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _incident(args)
     if args.command == "publish":
         return _publish(args)
+    if args.command == "ingest":
+        return _ingest(args)
 
     # 没给子命令不是「打印帮助然后成功」，是用法错了。
     # 退 0 会让 cron 以为今天跑过了 —— 静默成功比报错危险得多。
@@ -261,7 +287,15 @@ def _publish(args: argparse.Namespace) -> int:
             mode=args.mode,
             data_dir=cfg.data_dir,
             screenshot=lambda page, path: page.screenshot(path=str(path)),
+            # T-11：CLI 永远带锁跑（UT-11-02：并发第二个进程退 3，不开浏览器）
+            lock_root=Path(args.lock_root) if args.lock_root else DEFAULT_LOCK_ROOT,
+            # T-12：网络瞬时故障的运行内重试预算（全局硬顶 RETRY_HARD_CAP，配置只能往小改）
+            retry_max=cfg.retry_max,
         )
+    except LockError as exc:
+        # 与配置错误共用 3：都是「这次运行根本没开始」，cron 语义一致
+        print(f"并发冲突：{exc}", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
     except AuthRequired as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_AUTH
@@ -271,13 +305,26 @@ def _publish(args: argparse.Namespace) -> int:
     except GateClosed as exc:
         print(f"闸门关闭：{exc}", file=sys.stderr)
         return EXIT_CONFIG_ERROR
-    except (InjectFailed, MetaError, CoverError, SubmitBlocked, EditorReadError) as exc:
-        # T-12 会把这张表搬进 core/errors.py；在那之前，能到这里就是这一组。
+    except (InjectFailed, MetaError, CoverError, SubmitBlocked, EditorReadError, ContentRejected) as exc:
+        # publish 模式的失败已由 core/errors.py 分类处置（T-12），不会走到这里；
+        # 这里只剩 draft 模式（不写日志，异常原样上来）和极少见的逃逸路径。
         print(f"发布失败：{exc}", file=sys.stderr)
         return EXIT_FAILED
 
+    if outcome.skipped_duplicate:
+        # R9 验收原话：第二次输出 SKIPPED_DUPLICATE。退 0 —— 这不是失败，
+        # 是幂等命中；cron 不该为一个「已经发过了」告警。
+        print(f"SKIPPED_DUPLICATE：{loaded.draft.meta.title}")
+        print(f"  平台     = {platform_cfg.key}（该幂等键已 published，本次未发）")
+        if outcome.url:
+            print(f"  url      = {outcome.url}")
+        return EXIT_OK
+
     if not outcome.ok:
-        print(f"未确认成功：{outcome.reason}", file=sys.stderr)
+        # T-12：分类失败带上类别标签（人机校验 / 平台拒稿 / 网络超时），
+        # 人与 cron 都能一眼看出该扫码、改稿还是等网络。
+        kind = f"[{outcome.failure_kind}] " if outcome.failure_kind else ""
+        print(f"未确认成功：{kind}{outcome.reason}", file=sys.stderr)
         if outcome.url:
             print(f"  当前页面：{outcome.url}", file=sys.stderr)
         return EXIT_FAILED
@@ -301,6 +348,26 @@ def _publish(args: argparse.Namespace) -> int:
         print(f"  url        = {outcome.url}")
     if outcome.run_dir:
         print(f"  截图       = {outcome.run_dir / 'draft.png'}")
+    return EXIT_OK
+
+
+def _ingest(args: argparse.Namespace) -> int:
+    """产品资料入库（T-13）。
+
+    失败全是「这次输入有问题」（文件不存在 / 格式不支持 / 零事实 / 出处缺失），
+    归 EXIT_USAGE；成功后必须提醒：REVIEW.md 未回填前不进自动成稿队列（G2）。
+    """
+    try:
+        result = ingest(Path(args.source), args.product_id, Path(args.data_dir))
+    except IngestError as exc:
+        print(f"入库失败：{exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    print(f"已入库：{result.product_id}")
+    print(f"  事实总数 = {result.facts_total}（本次新增 {result.facts_added}）")
+    print(f"  库位置   = {result.product_dir}")
+    print(f"  抽检单   = {result.product_dir / 'REVIEW.md'}")
+    print("  ⚠️ 人工回填 REVIEW.md 的 reviewed_by / reviewed_at 后，该产品才进入自动成稿队列")
     return EXIT_OK
 
 

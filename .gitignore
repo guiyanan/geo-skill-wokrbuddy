@@ -25,6 +25,7 @@ venv/
 *.egg-info/
 .pytest_cache/
 .pytest_tmp/
+.pytest-tmp/
 .coverage
 htmlcov/
 
