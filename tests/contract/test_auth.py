@@ -25,7 +25,7 @@ PAGE_URLS = {
     "editor": "https://mp.csdn.net/mp_blog/creation/editor",
     "login": "https://passport.csdn.net/login",
     "captcha": "https://passport.csdn.net/v1/register/pc/login/doLogin",
-    "success": "https://mp.csdn.net/mp_blog/creation/success",
+    "success": "https://blog.csdn.net/m0_61028198/article/details/169160036",
 }
 
 

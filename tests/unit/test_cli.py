@@ -317,17 +317,65 @@ def test_publish_draft_ok_prints_article_id(monkeypatch, capsys, config_file, dr
     assert seen["adapter"] == "csdn"
 
 
-def test_publish_mode_publish_is_refused_without_touching_the_platform(
+def test_publish_mode_publish_passes_through_to_orchestration(
     monkeypatch, capsys, config_file, draft_dir
 ):
-    """T-10 之前真实发布必须打不开：说清原因，且明确「什么都没点」。"""
-    _stub_publish(monkeypatch)
+    """T-10 起 publish 模式不再在参数层拒绝——原样传给编排层，闸门在 check_gate 守。"""
+    seen = _stub_publish(monkeypatch)
 
     code = main(["publish", str(draft_dir), "--mode", "publish", "--config", str(config_file())])
 
-    err = capsys.readouterr().err
-    assert code == EXIT_USAGE
-    assert "T-10" in err and "没有点任何按钮" in err
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert seen["mode"] == "publish"
+    assert "已发布" in out and "article_id = 1" in out
+
+
+def test_publish_mode_publish_prints_receipt_path(
+    monkeypatch, capsys, config_file, draft_dir, tmp_path
+):
+    """发布成功要打印回执路径（R10：一条命令出 URL + 回执落盘位置）。"""
+    receipt = tmp_path / "runs" / "20261022_100000" / "receipt.json"
+    _stub_publish(
+        monkeypatch,
+        outcome=PublishOutcome(
+            ok=True,
+            url="https://blog.csdn.net/probe/article/details/42",
+            article_id="42",
+            reason="命中",
+            run_dir=receipt.parent,
+            receipt_path=receipt,
+        ),
+    )
+
+    code = main(["publish", str(draft_dir), "--mode", "publish", "--config", str(config_file())])
+
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert str(receipt) in out
+    assert "before.png / after.png" in out
+
+
+def test_publish_mode_receipt_failed_warns_on_stderr(
+    monkeypatch, capsys, config_file, draft_dir
+):
+    """发成了但没存上证（receipt_failed）：退出码仍是 0，但 stderr 必须喊出来。"""
+    _stub_publish(
+        monkeypatch,
+        outcome=PublishOutcome(
+            ok=True,
+            url="https://blog.csdn.net/probe/article/details/42",
+            article_id="42",
+            reason="命中",
+            receipt_failed=True,
+        ),
+    )
+
+    code = main(["publish", str(draft_dir), "--mode", "publish", "--config", str(config_file())])
+
+    captured = capsys.readouterr()
+    assert code == EXIT_OK
+    assert "receipt_failed" in captured.err
 
 
 def test_publish_unconfirmed_is_exit_6(monkeypatch, capsys, config_file, draft_dir):

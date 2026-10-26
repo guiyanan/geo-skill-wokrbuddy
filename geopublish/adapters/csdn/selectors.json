@@ -1,5 +1,5 @@
 {
-  "version": "2026-10-22.1",
+  "version": "2026-10-22.2",
   "auth": {
     "login_form": ".login-box",
     "challenge": "#captchaImg, img.captcha-img",
@@ -17,21 +17,35 @@
     "modal_root": ".modal"
   },
   "meta": {
-    "category": "#category",
-    "tags": "#tag-input",
-    "summary": "#summary",
-    "original_declaration": "#original-declaration",
-    "ai_declaration": "#ai-declaration"
+    "category": ".modal__publish-article .tag__box[curlistflag]",
+    "category_option": ".modal__publish-article .tag__box[curlistflag] #tagList .el-tag, .modal__publish-article .tag__box[curlistflag] .tag__item",
+    "tags": ".mark_selection[typename=tags] .mark_selection_box input.el-input__inner",
+    "tags_add_button": ".mark_selection[typename=tags] .tag__btn-tag",
+    "tags_panel_close": ".mark_selection[typename=tags] .mark_selection_box .modal__close-button",
+    "summary": ".modal__publish-article textarea.el-textarea__inner",
+    "original_declaration": ".modal__publish-article #original",
+    "ai_declaration": ".modal__publish-article .creation-statement-select input.el-input__inner",
+    "ai_declaration_option": ".modal__publish-article .creation-statement-select .el-select-dropdown__item"
   },
   "cover": {
-    "upload_input": "#cover-upload",
-    "thumbnail": ".cover-thumbnail"
+    "upload_input": ".modal__publish-article .cover-upload-box input.el-upload__input",
+    "thumbnail": ".modal__publish-article .container-coverimage-box img.preview",
+    "crop_editor": ".modal__publish-article .vue-image-crop-upload .vicp-wrap",
+    "crop_confirm": ".modal__publish-article .vicp-operate-btn",
+    "remove_button": ".modal__publish-article .btn-remove-coverimg",
+    "done_marker": ".modal__publish-article .preview-box.hasImg"
+  },
+  "dialog": {
+    "root": ".modal__publish-article",
+    "confirm_button": ".publish-article-modal__footer button.btn-b-red",
+    "cancel_button": ".publish-article-modal__footer button.btn-b-normal"
   },
   "verify": {
     "article_id": "meta[name='article:id']",
     "success_marker": ".editor__success-tip",
     "draft_list_item": ".article_manage_list a.el_mcm-tooltip__trigger",
     "draft_list_tab": ".nav-link",
-    "draft_list_loading": ".article_manage_list .ma-mskLoading"
+    "draft_list_loading": ".article_manage_list .ma-mskLoading",
+    "published_link": "a[href*='article/details']"
   }
 }

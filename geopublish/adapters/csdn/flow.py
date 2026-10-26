@@ -1,7 +1,7 @@
 """CSDN 适配器。
 
 已实现：`check_auth` / `open_editor`（T-05）、`fill_content`（T-07 三级降级注入）、
-`fill_meta` / `upload_cover`（T-08）、`submit`（T-09，仅草稿）/ `verify`（T-09）。
+`fill_meta` / `upload_cover`（T-08）、`submit`（T-09 草稿 + T-10 发布）/ `verify`（T-09/T-10）。
 
 2026-10-21 真机校准（T-09b）：真实 CSDN 的默认编辑器是 CKEditor（正文在 iframe 里），
 Markdown 编辑器在独立地址 `editor.csdn.net/md`，正文是 `pre.editor__inner` 的
@@ -18,8 +18,20 @@ contenteditable（自研 cledit，非 CodeMirror）。关键实测结论：
 - 编辑器打开时可能弹「模版库」等弹窗，不关掉会挡住一切点击（内含「确定删除该
   模板？」的预渲染确认框——本适配器**只点关闭按钮**）。
 
-`submit(mode=publish)` **故意**抛 `NotImplementedError` 并写明归属工单 T-10：
-写 `pass` 是最危险的做法——流程会一路绿到「发布成功」，然后线上什么都没有。
+2026-10-22 真机校准（T-10，发布对话框，原料 data/l4/t10-dialog-dom.html）：
+
+- 对话框根是 `.modal__publish-article`；最终发布按钮是 footer 里**唯一**的
+  `button.btn-b-red`，取消是第一个 `.btn-b-normal`。
+- 标签是 el-autocomplete：点「添加文章标签」展开 `.mark_selection_box`，
+  在其 input 里键入 + Enter 收一个标签。
+- 创作声明（AI 参与度）是 el-select 四档，没有独立「AI 生成」档（generated
+  落到「部分内容由AI辅助生成」并 WARNING）。
+- 分类专栏是点击展开控件；**测试账号没有任何专栏**，有专栏账号的展开形态未校准。
+- 封面链：`input.el-upload__input` 塞文件 → `.vicp-wrap` 裁剪编辑器 →
+  `div.vicp-operate-btn`「确认上传」→ 异步上传完成信号是 `.preview-box.hasImg`。
+  已有封面时上传框从 DOM 消失，要先点 `.btn-remove-coverimg` 删掉再传。
+- 发布模式下 verify 的裁决变了：编辑器 URL 的 `?articleId=` 是草稿信号，
+  发布只认详情页 URL 或页面上的详情链接（`verify.published_link`）。
 """
 
 from __future__ import annotations
@@ -72,8 +84,14 @@ TYPING_DELAY_MS = 5.0
 TITLE_TYPING_DELAY_MS = 15.0
 # UT-08-04：上传后缩略图的等待上限（毫秒）。
 THUMBNAIL_TIMEOUT_MS = 10_000
+# 封面「确认上传」后服务端异步处理，完成信号是 .preview-box 长出 .hasImg（T-10 实测）。
+COVER_UPLOAD_TIMEOUT_MS = 30_000
 # 点「保存草稿」后等 URL 长出 articleId 的上限。等不到不算失败——判定权在 verify。
 SUBMIT_TIMEOUT_MS = 15_000
+# 点最终「发布文章」后等跳详情页的上限。等不到不算失败——判定权同样在 verify。
+PUBLISH_TIMEOUT_MS = 20_000
+# 发布对话框打开的上限（点开是异步渲染）。
+DIALOG_OPEN_TIMEOUT_MS = 10_000
 
 # article_id 藏在哪儿：实测草稿地址是 editor.csdn.net/md?...&articleId=<id>，
 # 详情页是 /article/details/<id>。查询参数优先，路径兜底。
@@ -85,6 +103,15 @@ _ARTICLE_ID_PATH_RE = re.compile(r"/(?:article/details|creation/editor|editor)/(
 _SAVE_DRAFT_LABEL = "保存草稿"
 # 内容管理页的草稿箱 tab 文案（文本里带数量，如「草稿箱(4)」，匹配用包含）。
 _DRAFT_TAB_LABEL = "草稿箱"
+
+# 创作声明（AI 参与度）的落档映射（T-10 真机校准）：平台的下拉只有四档
+# 「无声明 / 部分内容由AI辅助生成 / 内容来源网络，进行整合/再创作 / 个人观点，仅供参考」，
+# 没有独立的「AI 生成」档——generated 落到最近的 AI 档并 WARNING，不静默。
+_AI_DECLARATION_TEXT: Mapping[str, str] = {
+    "human": "无声明",
+    "assisted": "部分内容由AI辅助生成",
+    "generated": "部分内容由AI辅助生成",
+}
 
 # 选择器一律经参数传入，代码里不出现裸选择器——.precommit/check_no_naked_selectors.py
 # 盯着这个目录。
@@ -196,6 +223,33 @@ _FOCUS_JS = """/* op=focus */
 }
 """
 
+# 温和版关弹窗：只点可见的关闭按钮，**不从 DOM 摘 .modal 节点**。
+# 为什么需要它（T-10 真机实测 2026-10-26）：发布对话框的挂载点本身就是一个
+# .modal 容器——_CLOSE_MODALS_JS 的 remove() 会把它一起摘掉，之后点发布入口
+# 对话框永远渲染不出来（10s 超时）。开对话框前只能点关闭，不能摘节点。
+_CLICK_CLOSE_BUTTONS_JS = """/* op=closebuttons */
+(closeSel) => {
+  const visible = (el) => {
+    const s = getComputedStyle(el);
+    return s.display !== "none" && s.visibility !== "hidden" && el.getClientRects().length > 0;
+  };
+  const closers = Array.from(document.querySelectorAll(closeSel)).filter(visible);
+  closers.forEach(b => b.click());
+  return {ok: true, closed: closers.length};
+}
+"""
+
+# 通用 JS 点击：不挑可见性、不做指针命中检查——遮罩层拦截对它无效。
+# 只用于「点一下让控件出现」这类触发动作；需要真实指针语义的场合不用它。
+_CLICK_JS = """/* op=jsclick */
+(sel) => {
+  const el = document.querySelector(sel);
+  if (!el) return {ok: false, reason: "点击目标未命中"};
+  el.click();
+  return {ok: true};
+}
+"""
+
 # 存草稿：点保存按钮唤出 popover，再点里面的「保存草稿」。JS 点击不挑可见性——
 # el-popover 的链接在 DOM 里常驻但带 hide 类，Playwright 的可见性检查会卡死。
 _SAVE_DRAFT_JS = """/* op=savedraft */
@@ -212,7 +266,6 @@ _SAVE_DRAFT_JS = """/* op=savedraft */
 
 # 元信息填入：直接写 value 并派发 input/change —— 这类表单受框架控制，
 # 只改 value 不派发事件，页面上看着填好了，提交时状态仍是空的。
-# （发布对话框的控件，选择器待 T-10 真机校准）
 _SET_VALUE_JS = """/* op=setvalue */
 ([sel, text]) => {
   const el = document.querySelector(sel);
@@ -232,17 +285,92 @@ _SET_VALUE_JS = """/* op=setvalue */
 }
 """
 
-# 分类可选项必须从页面读：平台会改栏目，硬编码一份清单等于给自己埋定时炸弹。
-_CATEGORY_OPTIONS_JS = """/* op=categories */
-(sel) => {
-  const el = document.querySelector(sel);
-  if (!el) return {ok: false, reason: "分类控件不存在（meta.category 未命中）"};
-  const list = el.options ? Array.from(el.options) : Array.from(el.querySelectorAll("option"));
-  const options = list.map(o => ({value: o.value, text: (o.textContent || "").trim()}));
-  if (!options.length) return {ok: false, reason: "分类下拉没有任何可选项"};
-  return {ok: true, options};
+# ---- T-10：发布对话框（全部按 2026-10-22 真机抓取校准，原料 data/l4/t10-dialog-dom.html）
+
+# 打开对话框：点编辑器导航栏的「发布文章」入口（button.btn-publish）。
+# 对话框是 .modal 的子树——打开前必须先 close_modals 清掉欢迎弹窗，
+# 但**打开之后绝不能再 close_modals**（那会把发布对话框自己从 DOM 摘掉）。
+_OPEN_DIALOG_JS = """/* op=opendialog */
+(btnSel) => {
+  const btn = document.querySelector(btnSel);
+  if (!btn) return {ok: false, reason: "发布入口按钮未命中（editor.publish_button）"};
+  btn.click();
+  return {ok: true};
 }
 """
+
+# 文章类型确保「原创」：radio 默认态不保证（草稿可能带历史状态），没选中就点一下。
+_ENSURE_ORIGINAL_JS = """/* op=original */
+(sel) => {
+  const el = document.querySelector(sel);
+  if (!el) return {ok: false, reason: "文章类型「原创」控件未命中（meta.original_declaration）"};
+  if (!el.checked) el.click();
+  return {ok: true, checked: !!el.checked};
+}
+"""
+
+# 创作声明：el-select 是只读 input + 内嵌 dropdown 列表。点 input 展开，
+# 按文本命中 li 并点击。选项永远先从页面读——平台改措辞时这里给的是
+# 「页面实际有哪几档」，不是一份硬编码清单的幻觉。
+_AI_DECLARE_JS = """/* op=aideclare */
+([inputSel, optionSel, text]) => {
+  const input = document.querySelector(inputSel);
+  if (!input) return {ok: false, reason: "创作声明控件未命中（meta.ai_declaration）"};
+  input.click();
+  const items = Array.from(document.querySelectorAll(optionSel));
+  const texts = items.map(i => (i.textContent || "").trim()).filter(Boolean);
+  if (!texts.length) return {ok: false, reason: "创作声明下拉没有任何选项"};
+  const hit = items.find(i => (i.textContent || "").trim() === text);
+  if (!hit) return {ok: false, reason: "创作声明下拉里没有「" + text + "」", options: texts};
+  hit.click();
+  return {ok: true};
+}
+"""
+
+# 分类专栏：点击展开的控件（不是 <select>）。展开层异步渲染、且**本账号没有任何
+# 专栏**（T-10 实测：点了没弹层），所以可选项恒为空 → MetaError。有专栏账号的
+# 展开列表形态未校准——拿到那样的账号后第一件事是重抓这段 DOM。
+_CATEGORY_PICK_JS = """/* op=categorypick */
+([boxSel, optionSel, category]) => {
+  const box = document.querySelector(boxSel);
+  if (!box) return {ok: false, reason: "分类专栏控件未命中（meta.category）"};
+  box.click();
+  const items = Array.from(document.querySelectorAll(optionSel))
+    .filter(e => (e.textContent || "").trim());
+  const options = items.map(e => (e.textContent || "").trim());
+  const hit = items.find(e => (e.textContent || "").trim() === category);
+  if (!hit) return {ok: false, reason: "可选项里没有「" + category + "」", options};
+  hit.click();
+  return {ok: true};
+}
+"""
+
+# 点最终「发布文章」按钮。走 JS 点击：footer 可能被其他浮层压住，
+# Playwright 的 actionability 检查会卡到超时，而 JS click 不挑遮挡。
+_PUBLISH_CLICK_JS = """/* op=publishclick */
+(confirmSel) => {
+  const btn = document.querySelector(confirmSel);
+  if (!btn) return {ok: false, reason: "最终发布按钮未命中（dialog.confirm_button）"};
+  btn.click();
+  return {ok: true};
+}
+"""
+
+
+def _canonical_article_url(url: str, article_id: str) -> str:
+    """把详情页 URL 归一成裸形态：去掉 sharetype/sharerId 等追踪参数。
+
+    回执和日志要的是文章的身份，不是一次分享的追踪链（T-10 实测：发布跳转的
+    URL 带一串 share* 参数，原样落盘会让同一篇的 URL 每次都不一样）。
+    """
+    parts = urlsplit(str(url or ""))
+    segs = [s for s in parts.path.split("/") if s]
+    if "article" in segs and "details" in segs:
+        i = segs.index("article")
+        account = "/".join(segs[:i])
+        prefix = f"/{account}" if account else ""
+        return f"{parts.scheme}://{parts.netloc}{prefix}/article/details/{article_id}"
+    return str(url or "")
 
 
 def _article_id_from_url(url: str) -> str:
@@ -326,6 +454,23 @@ def _wait_hidden(page: Page, sel: str, timeout_ms: int) -> None:
         direct(sel, timeout_ms=timeout_ms)
         return
     page.wait_for_selector(sel, state="hidden", timeout=timeout_ms)
+
+
+def _wait_selector(page: Page, sel: str, timeout_ms: int) -> None:
+    """等元素出现的统一入口。协议的参数叫 `timeout_ms`，真机 Playwright 叫
+    `timeout`——假页面掩盖过这层差异（T-09b 的协议假象同款），这里一次收掉。"""
+    try:
+        page.wait_for_selector(sel, timeout_ms=timeout_ms)
+    except TypeError:
+        page.wait_for_selector(sel, timeout=timeout_ms)
+
+
+def _wait_url(page: Page, pattern: str, timeout_ms: int) -> None:
+    """等 URL 变形的统一入口，参数名差异同 `_wait_selector`。"""
+    try:
+        page.wait_for_url(pattern, timeout_ms=timeout_ms)
+    except TypeError:
+        page.wait_for_url(pattern, timeout=timeout_ms)
 
 
 def _type_in_segments(page: Page, content_sel: str, text: str) -> dict[str, Any]:
@@ -626,7 +771,9 @@ class CsdnAdapter:
         - 标题控件是双层的：先点 display 展示层，真实 input 才出现，再 fill。
           `value=` 赋值会被前端模型无视（实测），只能走真实输入管线。
         - AI 参与度为空 → `MetaError`。guard（T-03）保证非空，这里是不变的第二道防线。
-        - **不点原创声明**：那是账号级风险决策，交给人工或后续工单，不在这层偷偷勾。
+        - 发布模式确保文章类型=原创（_ensure_original，T-10）：本平台默认即原创，
+          这只在草稿带历史状态（转载/翻译）时纠回来。转载/翻译是另一种内容决策，
+          Meta 模型没有对应字段，本平台发布的都是原创稿——要发转载得先改模型。
         """
         if draft is None:
             raise TypeError("fill_meta 需要 draft（open_editor 才允许 None）")
@@ -652,8 +799,14 @@ class CsdnAdapter:
             title = title[: limits.title_max]
         # 弹窗会在注入正文后再冒出来（实测：open_editor 关过一轮，fill 完又被挡住）。
         # 点标题 display 之前必须再关一轮，否则 Playwright 卡到超时。
-        self.close_modals(page)
-        self._fill_title(page, title)
+        # T-10 真机实测（2026-10-26）：发布模式只能用温和版（点关闭按钮）——
+        # close_modals 的 DOM 摘除会连发布对话框的 .modal 挂载点一起摘掉，
+        # 之后点发布入口对话框永远渲染不出来。
+        if mode is SubmitMode.PUBLISH:
+            page.evaluate(_CLICK_CLOSE_BUTTONS_JS, self.selectors("editor", "modal_close"))
+        else:
+            self.close_modals(page)
+        self._fill_title(page, title, js_click=mode is SubmitMode.PUBLISH)
 
         if mode is SubmitMode.DRAFT:
             logger.info(
@@ -662,11 +815,13 @@ class CsdnAdapter:
             )
             return
 
-        # ---- 以下只在发布模式执行；控件在发布对话框里，选择器待 T-10 真机校准 ----
+        # ---- 发布模式：控件全在「发布文章」对话框里（2026-10-22 真机校准）----
+        self._ensure_dialog_open(page)
+        self._ensure_original(page)
+
         if meta.category.strip():
             self._fill_category(page, meta.category.strip())
 
-        tags_sel = self.selectors("meta", "tags")
         tags = list(meta.tags)[: limits.tags_max]
         if len(meta.tags) > limits.tags_max:
             logger.warning(
@@ -677,22 +832,21 @@ class CsdnAdapter:
                 len(tags),
                 "、".join(tags),
             )
-        for tag in tags:
-            _type_text(page, tags_sel, tag, delay_ms=TYPING_DELAY_MS)
-            page.press(tags_sel, "Enter")
+        if tags:
+            self._fill_tags(page, tags)
 
         if meta.summary.strip():
             self._set_value(page, "meta", "summary", meta.summary)
 
-        self._set_value(page, "meta", "ai_declaration", involvement)
+        self._fill_ai_declaration(page, involvement)
         logger.info(
-            "fill_meta 完成：标题 %d 字、分类 %r、标签 %d 个",
+            "fill_meta（发布模式）完成：标题 %d 字、分类 %r、标签 %d 个",
             len(title),
             meta.category or "（未设置）",
             len(tags),
         )
 
-    def _fill_title(self, page: Page, title: str) -> None:
+    def _fill_title(self, page: Page, title: str, *, js_click: bool = False) -> None:
         """双层标题控件 + 受控模型 + **异步草稿恢复**：点 display → 点 input →
         清空 → 真实键盘输入 → blur → 回读模型态。
 
@@ -704,21 +858,38 @@ class CsdnAdapter:
            打快了会被恢复覆盖（实测只剩前两个字、甚至全灭）。恢复只发生一次，
            所以回读不符时**重打一次**——第二次落在已稳定的编辑器上。重打仍不符
            才是 MetaError（那时多半是改版，不是时序）。
+
+        `js_click=True`（发布模式，T-10）：点 display/input 走 JS 点击。
+        发布模式不能做 DOM 摘除（会摘掉发布对话框挂载点），而残留的遮罩层会
+        拦截 Playwright 的指针点击（2026-10-26 实测卡 30s 超时）。JS 点击不做
+        命中检查，天然免疫；键入仍是真实键盘事件，模型照认。
         """
         display_sel = self.selectors("editor", "title_display")
         input_sel = self.selectors("editor", "title")
+
+        def _reveal(sel: str) -> None:
+            if js_click:
+                outcome = page.evaluate(_CLICK_JS, sel)
+                if not isinstance(outcome, Mapping) or not outcome.get("ok"):
+                    reason = outcome.get("reason") if isinstance(outcome, Mapping) else "脚本无返回"
+                    raise MetaError(f"点不开标题控件（{sel}）：{reason}")
+            else:
+                page.click(sel)
+
         actual = ""
         for attempt in (1, 2):
             try:
-                page.click(display_sel)
+                _reveal(display_sel)
                 # display 点击只负责让 input 出现，焦点要显式点进 input（照实测路径）；
                 # 之后全选清空、逐字键入。延迟 15ms：5ms 时受控模型会丢字。
-                page.click(input_sel)
+                _reveal(input_sel)
                 page.press(input_sel, "Meta+A")
                 page.press(input_sel, "Backspace")
                 _type_text(page, input_sel, title, delay_ms=TITLE_TYPING_DELAY_MS)
                 # blur 走 DOM focus：Playwright click 可能被残存遮罩拦到超时（实测）
                 page.evaluate(_FOCUS_JS, self.selectors("editor", "content"))
+            except MetaError:
+                raise
             except Exception as exc:
                 raise MetaError(f"填不进 editor.title：{type(exc).__name__}: {exc}") from exc
 
@@ -743,27 +914,126 @@ class CsdnAdapter:
             reason = outcome.get("reason") if isinstance(outcome, Mapping) else "页面脚本无返回"
             raise MetaError(f"填不进 {group}.{key}: {reason}")
 
-    def _fill_category(self, page: Page, category: str) -> None:
-        """分类必须命中页面上的真实可选项（UT-08-03）。"""
-        sel = self.selectors("meta", "category")
-        outcome = page.evaluate(_CATEGORY_OPTIONS_JS, [sel])
+    # ----------------------------------------------------------- T-10 发布对话框
+
+    def _ensure_dialog_open(self, page: Page) -> None:
+        """确保「发布文章」对话框已打开。meta/cover/submit 三段共用——它们都住在
+        对话框里，而编排层是先 upload_cover 再 fill_meta 最后 submit，任何一段
+        都可能是第一个进来的。
+
+        已开就直接返回（幂等）。没开：点掉欢迎弹窗的关闭按钮（**不摘 .modal
+        节点**——发布对话框的挂载点就是 .modal，摘了就再也渲染不出来），
+        点入口，等对话框根节点渲染出来。
+
+        **对话框打开后绝不再 close_modals**：发布对话框本身就是 .modal，
+        那套脚本会把它一起从 DOM 摘掉。
+        """
+        if page.query_selector(self.selectors("dialog", "root")) is not None:
+            return
+        # 只点关闭按钮、不摘 .modal 节点：发布对话框的挂载点就是 .modal，
+        # 摘掉它对话框永远渲染不出来（2026-10-26 真机踩出）。
+        page.evaluate(_CLICK_CLOSE_BUTTONS_JS, self.selectors("editor", "modal_close"))
+        outcome = page.evaluate(
+            _OPEN_DIALOG_JS, self.selectors("editor", "publish_button")
+        )
         if not isinstance(outcome, Mapping) or not outcome.get("ok"):
             reason = outcome.get("reason") if isinstance(outcome, Mapping) else "页面脚本无返回"
-            raise MetaError(f"读不到分类可选项：{reason}")
-        options = outcome["options"]
-        if not isinstance(options, list) or not options:
-            raise MetaError("分类可选项为空：页面没渲染完或控件改版")
-        texts = [str(o.get("text") or "") for o in options if isinstance(o, Mapping)]
-        matched = [
-            o for o in options
-            if isinstance(o, Mapping)
-            and (o.get("text") == category or o.get("value") == category)
-        ]
-        if not matched:
+            raise SubmitBlocked(f"发布对话框打不开：{reason}")
+        try:
+            _wait_selector(page, self.selectors("dialog", "root"), DIALOG_OPEN_TIMEOUT_MS)
+        except Exception as exc:
+            raise SubmitBlocked(
+                f"点了发布入口，但对话框 {DIALOG_OPEN_TIMEOUT_MS // 1000}s 内没出现"
+                f"（{type(exc).__name__}）：可能改版，先抓现场"
+            ) from exc
+
+    def _ensure_original(self, page: Page) -> None:
+        """文章类型确保选中「原创」。草稿可能带历史状态（转载/翻译），默认态不赌。"""
+        outcome = page.evaluate(
+            _ENSURE_ORIGINAL_JS, self.selectors("meta", "original_declaration")
+        )
+        if not isinstance(outcome, Mapping) or not outcome.get("ok"):
+            reason = outcome.get("reason") if isinstance(outcome, Mapping) else "页面脚本无返回"
+            raise MetaError(f"文章类型选不中「原创」：{reason}")
+
+    def _fill_tags(self, page: Page, tags: list[str]) -> None:
+        """标签：点「添加文章标签」展开面板 → 逐条键入 + Enter → 关面板。
+
+        面板是 el-autocomplete（T-10 实测）：输入框在展开层 `.mark_selection_box` 里，
+        Enter 把当前文本收成一个自定义标签。展开层不收会盖住下面的控件。
+        """
+        add_sel = self.selectors("meta", "tags_add_button")
+        input_sel = self.selectors("meta", "tags")
+        try:
+            page.click(add_sel)
+            _wait_selector(page, input_sel, DIALOG_OPEN_TIMEOUT_MS)
+        except Exception as exc:
             raise MetaError(
-                f"分类「{category}」不在 {self.name} 的可选项里，可选项有：{'、'.join(texts)}"
+                f"标签面板展不开（{type(exc).__name__}）：{exc}"
+            ) from exc
+        for tag in tags:
+            _type_text(page, input_sel, tag, delay_ms=TYPING_DELAY_MS)
+            page.press(input_sel, "Enter")
+        # 收面板：点它自己的关闭按钮。失败不拦——面板浮在对话框内部，不挡 footer。
+        try:
+            page.click(self.selectors("meta", "tags_panel_close"))
+        except Exception:
+            logger.debug("标签面板关闭按钮没点成（不阻断流程）")
+
+    def _fill_category(self, page: Page, category: str) -> None:
+        """分类必须命中页面上的真实可选项（UT-08-03）。
+
+        T-10 真机校准：分类专栏是点击展开的控件（不是 <select>），且测试账号
+        **没有任何专栏**——点了没弹层，可选项恒为空。空选项必须报 MetaError，
+        不能静默跳过：「以为选了分类其实没选」比明确的失败难查得多。
+        """
+        outcome = page.evaluate(
+            _CATEGORY_PICK_JS,
+            [
+                self.selectors("meta", "category"),
+                self.selectors("meta", "category_option"),
+                category,
+            ],
+        )
+        if not isinstance(outcome, Mapping):
+            raise MetaError("分类专栏选择脚本无返回")
+        if outcome.get("ok"):
+            return
+        options = outcome.get("options")
+        if isinstance(options, list) and not options:
+            raise MetaError(
+                "分类专栏可选项为空：本账号没有任何专栏（T-10 实测），"
+                "或有专栏账号的展开形态尚未校准。请到平台后台先建专栏，"
+                "或把 meta.category 留空跳过"
             )
-        self._set_value(page, "meta", "category", category)
+        reason = outcome.get("reason", "未知原因")
+        available = "、".join(str(o) for o in options) if isinstance(options, list) else ""
+        raise MetaError(
+            f"分类「{category}」选不中：{reason}"
+            + (f"。当前可选项：{available}" if available else "")
+        )
+
+    def _fill_ai_declaration(self, page: Page, involvement: str) -> None:
+        """创作声明（AI 参与度）：el-select 按文本点选，档位映射见 _AI_DECLARATION_TEXT。"""
+        text = _AI_DECLARATION_TEXT[involvement]  # 上游已校验取值，KeyError 就是 bug
+        if involvement == "generated":
+            logger.warning(
+                "平台没有独立的「AI 生成」档，落到最近的「%s」（T-10 校准的四档里没有更贴切的）",
+                text,
+            )
+        outcome = page.evaluate(
+            _AI_DECLARE_JS,
+            [
+                self.selectors("meta", "ai_declaration"),
+                self.selectors("meta", "ai_declaration_option"),
+                text,
+            ],
+        )
+        if not isinstance(outcome, Mapping) or not outcome.get("ok"):
+            reason = outcome.get("reason") if isinstance(outcome, Mapping) else "页面脚本无返回"
+            options = outcome.get("options") if isinstance(outcome, Mapping) else None
+            detail = f"；页面当前档位：{'、'.join(options)}" if options else ""
+            raise MetaError(f"创作声明选不中「{text}」：{reason}{detail}")
 
     # ----------------------------------------------------------- T-08 封面
 
@@ -775,7 +1045,7 @@ class CsdnAdapter:
         后台就多了一张要人工清理的垃圾封面。
         规格只认 meta.json 的 cover 字段（PRD：尺寸从平台读取，不得硬编码）。
 
-        注意：真实 CSDN 的封面上传框在**发布对话框**里（T-10 校准），
+        注意：封面上传框在**发布对话框**里（T-10 真机校准），
         草稿模式不该走到这里——publish.py 会跳过。
         """
         path = Path(path)
@@ -802,17 +1072,50 @@ class CsdnAdapter:
                 f"封面 {size} 字节超过上限 {spec.max_bytes} 字节：本地拒绝，未上传"
             )
 
+        self._ensure_dialog_open(page)
+
+        # 已有封面时上传框从 DOM 里消失（T-10 实测），只剩删除入口——先删再传。
+        if page.query_selector(self.selectors("cover", "done_marker")) is not None:
+            try:
+                page.click(self.selectors("cover", "remove_button"))
+            except Exception as exc:
+                raise CoverError(f"旧封面删不掉（cover.remove_button）：{exc}") from exc
+            try:
+                _wait_selector(
+                    page, self.selectors("cover", "upload_input"), THUMBNAIL_TIMEOUT_MS
+                )
+            except Exception as exc:
+                raise CoverError(f"删掉旧封面后上传框没回来：{type(exc).__name__}") from exc
+
         try:
             page.set_input_files(self.selectors("cover", "upload_input"), path)
         except Exception as exc:
             raise CoverError(f"封面塞不进上传框（cover.upload_input）：{exc}") from exc
+
+        # 选文件后弹出裁剪编辑器；「确认上传」是 div.vicp-operate-btn（不是 button）
         try:
-            page.wait_for_selector(
-                self.selectors("cover", "thumbnail"), timeout_ms=THUMBNAIL_TIMEOUT_MS
+            _wait_selector(page, self.selectors("cover", "crop_editor"), THUMBNAIL_TIMEOUT_MS)
+        except Exception as exc:
+            raise CoverError(
+                f"选文件后裁剪编辑器 {THUMBNAIL_TIMEOUT_MS // 1000}s 内未出现"
+                f"（{type(exc).__name__}）：控件改版或文件被拒"
+            ) from exc
+        try:
+            page.click(self.selectors("cover", "crop_confirm"))
+        except Exception as exc:
+            raise CoverError(f"裁剪编辑器的「确认上传」点不动：{exc}") from exc
+
+        # 上传是异步的（按钮转 loading），完成信号是 .preview-box 长出 .hasImg。
+        # 别拿 img.preview 的 .src 属性判断——空 src 会被浏览器解析成页面 URL
+        # （假阳性，T-10 探针踩过）；hasImg 是组件自己加的类，没有歧义。
+        try:
+            _wait_selector(
+                page, self.selectors("cover", "done_marker"), COVER_UPLOAD_TIMEOUT_MS
             )
         except Exception as exc:
             raise CoverError(
-                f"封面上传后缩略图 {THUMBNAIL_TIMEOUT_MS // 1000}s 内未出现：{exc}"
+                f"封面确认上传后 {COVER_UPLOAD_TIMEOUT_MS // 1000}s 内未完成"
+                f"（{type(exc).__name__}）：已停手，文章未发布"
             ) from exc
         logger.info("封面已上传：%s（%dx%d，%d 字节）", path.name, width, height, size)
 
@@ -856,14 +1159,14 @@ class CsdnAdapter:
         return actual
 
     def submit(self, page: Page, *, mode: SubmitMode | str = SubmitMode.DRAFT) -> SubmitResult:
-        """存草稿（T-09）。真实发布属于 T-10，这里**明确拒绝**而不是半套实现。
+        """草稿走「保存草稿」两步（T-09）；发布走对话框的最终按钮（T-10）。
 
-        顺序是硬的：复核正文 → 关弹窗 → 点保存。弹窗不关的话点击会被拦截
-        （真机实测：模版库弹窗挡在按钮前面，Playwright 卡到超时）。
+        顺序是硬的：复核正文 → （草稿：关弹窗）→ 点按钮。发布模式**不**关弹窗——
+        发布对话框自己就是 .modal，close_modals 会把它从 DOM 摘掉。
         """
         mode = SubmitMode(mode)
-        if mode is not SubmitMode.DRAFT:
-            raise NotImplementedError("publish 模式未实现：真实发布与回执属于 T-10")
+        if mode is SubmitMode.PUBLISH:
+            return self._submit_publish(page)
 
         self.check_content_length(page)
         self.close_modals(page)
@@ -886,7 +1189,7 @@ class CsdnAdapter:
 
         # 真机实测的成功信号：URL 长出 articleId 参数
         try:
-            page.wait_for_url("**articleId=*", timeout_ms=SUBMIT_TIMEOUT_MS)
+            _wait_url(page, "**articleId=*", SUBMIT_TIMEOUT_MS)
         except Exception as exc:
             if page.url != before_url:
                 return SubmitResult(
@@ -903,6 +1206,62 @@ class CsdnAdapter:
             state=SubmitState.SUBMITTED, reason=f"URL 已带 articleId：{page.url}"
         )
 
+    def _submit_publish(self, page: Page) -> SubmitResult:
+        """真实发布（T-10）：复核正文 → 确认对话框开着 → 点 footer 的「发布文章」。
+
+        两道刹车：
+        1. `check_content_length`——页面正文必须还是注入时那一份（R7）；
+        2. 对话框必须在——它不在，说明 fill_meta/upload_cover 没跑成或被意外
+           关掉，这时点任何按钮都是盲发，直接 SubmitBlocked。
+
+        发布模式不调 close_modals：发布对话框本身就是 .modal。
+        """
+        self.check_content_length(page)
+
+        if page.query_selector(self.selectors("dialog", "root")) is None:
+            raise SubmitBlocked(
+                "发布对话框未打开：fill_meta/upload_cover 没跑成，或对话框被意外关闭。"
+                "拒绝在状态不明时点发布——一个按钮都没点"
+            )
+
+        before_url = page.url
+        outcome = page.evaluate(
+            _PUBLISH_CLICK_JS, self.selectors("dialog", "confirm_button")
+        )
+        if not isinstance(outcome, Mapping) or not outcome.get("ok"):
+            reason = outcome.get("reason") if isinstance(outcome, Mapping) else "点击脚本无返回"
+            return SubmitResult(
+                state=SubmitState.UNKNOWN,
+                reason=f"最终「发布文章」没点成（{reason}）：交给 verify 判定",
+            )
+
+        # 成功形态（待 IT-10-01 真机确认优先级）：跳详情页，或页面长出详情链接
+        try:
+            _wait_url(page, "**/article/details/*", PUBLISH_TIMEOUT_MS)
+            return SubmitResult(
+                state=SubmitState.SUBMITTED, reason=f"已跳详情页：{page.url}"
+            )
+        except Exception:
+            pass
+        link = page.query_selector(self.selectors("verify", "published_link"))
+        if link is not None:
+            href = (link.get_attribute("href") or "").strip()
+            if _article_id_from_url(href):
+                return SubmitResult(
+                    state=SubmitState.SUBMITTED, reason=f"页面出现详情链接：{href}"
+                )
+        if page.url != before_url:
+            return SubmitResult(
+                state=SubmitState.SUBMITTED, reason=f"点击后页面已变化：{page.url}"
+            )
+        return SubmitResult(
+            state=SubmitState.UNKNOWN,
+            reason=(
+                f"点击后 {PUBLISH_TIMEOUT_MS // 1000}s 内没有成功信号"
+                "（没跳详情页、没出现详情链接）：交给 verify 判定"
+            ),
+        )
+
     def verify(self, page: Page, *, mode: SubmitMode | str = SubmitMode.DRAFT) -> VerifyResult:
         """回读确认：拿到 article_id 才算成功（UT-09-01）。
 
@@ -914,20 +1273,55 @@ class CsdnAdapter:
 
         **有成功提示但没有 id 一律判失败**：那正是「以为发出去了、其实列表里没有」
         的形态，比明确的报错危险得多。
+
+        发布模式另有一套裁决（T-10）：编辑器 URL 上的 `?articleId=` 是**草稿**
+        信号（存草稿阶段就长出来了），拿它当发布成功就是假阳性。发布只认
+        详情页 URL 或页面上的详情链接。
         """
         mode = SubmitMode(mode)
+        if mode is SubmitMode.PUBLISH:
+            return self._verify_publish(page)
+
         url = page.url
         article_id = self._read_article_id(page) or _article_id_from_url(url)
         if article_id:
             return VerifyResult(
                 ok=True, url=url, article_id=article_id, reason="从页面标记或 URL 读到 article_id"
             )
-        if mode is not SubmitMode.DRAFT:
-            # 已发布的文章不在草稿箱里，拿草稿列表兜底只会得到一个假阴性
-            return VerifyResult(
-                ok=False, url=url, reason="发布模式下拿不到 article_id：不走草稿列表兜底"
-            )
         return self._verify_via_draft_list(page)
+
+    def _verify_publish(self, page: Page) -> VerifyResult:
+        """发布成功的裁决：详情页 URL → 页面上的详情链接，两条都没有就是没发成。
+
+        已发布的文章不在草稿箱里，拿草稿列表兜底只会得到假阴性（原逻辑保留此判断）。
+        """
+        url = page.url
+        if "/article/details/" in url:
+            article_id = self._read_article_id(page) or _article_id_from_url(url)
+            if article_id:
+                return VerifyResult(
+                    ok=True, url=_canonical_article_url(url, article_id), article_id=article_id,
+                    reason="已跳详情页并读到 article_id",
+                )
+            return VerifyResult(
+                ok=False, url=url,
+                reason="在详情页却读不到 article_id：页面结构改版，先抓现场",
+            )
+
+        link = page.query_selector(self.selectors("verify", "published_link"))
+        if link is not None:
+            href = (link.get_attribute("href") or "").strip()
+            article_id = _article_id_from_url(href)
+            if article_id:
+                full = _canonical_article_url(urljoin(url, href), article_id)
+                return VerifyResult(
+                    ok=True, url=full, article_id=article_id,
+                    reason="从页面详情链接读到 article_id",
+                )
+        return VerifyResult(
+            ok=False, url=url,
+            reason="没有发布成功信号（既没跳详情页，页面上也没有详情链接）：不走草稿列表兜底",
+        )
 
     def _read_article_id(self, page: Page) -> str:
         """读 DOM 里的文章 id。元素在但没 content 就退回文本内容，都没有算没读到。"""

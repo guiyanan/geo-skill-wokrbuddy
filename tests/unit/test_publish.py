@@ -176,13 +176,16 @@ def test_cover_step_is_skipped_when_the_draft_has_none(tmp_path):
     assert not [c for c in adapter.calls if isinstance(c, tuple) and c[0] == "upload_cover"]
 
 
-def test_publish_mode_uploads_cover_and_passes_mode_down(tmp_path):
-    """发布模式：封面上传在元信息之前，且 mode 一路传到 fill_meta/submit/verify。"""
+def test_publish_mode_fills_meta_then_uploads_cover_and_passes_mode_down(tmp_path):
+    """发布模式（T-10 真机约束）：元信息在封面**之前**——标题必须在发布对话框
+    打开前填（对话框是遮罩层，会挡住编辑器页点击），封面控件在对话框里。
+    mode 一路传到 fill_meta/submit/verify。"""
     adapter = RecordingAdapter()
 
     publish_draft(
         adapter, _loaded(tmp_path, cover=True), _cfg(), gate=Gate.PUBLISH,
         open_page=_opener([])[0], mode="publish",
+        data_dir=tmp_path / "data",  # 不传会写真仓库的 data/——csv 污染就是这么来的
     )
 
     assert adapter.calls == [
@@ -190,11 +193,71 @@ def test_publish_mode_uploads_cover_and_passes_mode_down(tmp_path):
         "check_auth",
         "open_editor",
         "fill_content",
-        ("upload_cover", "cover.png"),
         ("fill_meta", "publish"),
+        ("upload_cover", "cover.png"),
         ("submit", "publish"),
         ("verify", "publish"),
     ]
+
+
+def test_publish_success_writes_receipt_csv_and_two_screenshots(tmp_path):
+    """R10 编排层：发布成功 → receipt.json 四字段 + csv 一行 + before/after 两张截图，
+    时间字段全部来自注入时钟（UT-10-01/02/04）。"""
+    adapter = RecordingAdapter()
+    shots: list[Path] = []
+    data_dir = tmp_path / "data"
+    clock = FakeClock("2026-10-22T10:00:00+08:00")
+
+    outcome = publish_draft(
+        adapter,
+        _loaded(tmp_path),
+        _cfg(),
+        gate=Gate.PUBLISH,
+        open_page=_opener([])[0],
+        mode="publish",
+        data_dir=data_dir,
+        clock=clock,
+        screenshot=lambda page, path: (path.parent.mkdir(parents=True, exist_ok=True),
+                                       path.write_bytes(b"\x89PNG"), shots.append(path)),
+    )
+
+    assert outcome.ok is True
+    run_dir = data_dir / "runs" / "20261022_100000"
+    # UT-10-01：receipt.json 含 url/article_id/published_at/screenshot 四字段
+    receipt = json.loads((run_dir / "receipt.json").read_text(encoding="utf-8"))
+    for key in ("url", "article_id", "published_at", "screenshot"):
+        assert key in receipt, f"receipt.json 缺 {key}"
+    assert receipt["article_id"] == "1"
+    # UT-10-04：时间来自注入时钟，不是系统时间
+    assert receipt["published_at"] == "2026-10-22T10:00:00+08:00"
+    # R10：before/after 双截图
+    assert sorted(p.name for p in shots) == ["after.png", "before.png"]
+    assert (run_dir / "before.png").is_file() and (run_dir / "after.png").is_file()
+    # UT-10-02：csv 追加一行且列顺序固定
+    csv_lines = (data_dir / "publish-log.csv").read_text(encoding="utf-8").splitlines()
+    assert len(csv_lines) == 2, f"表头 + 一行数据，实际 {len(csv_lines)} 行"
+    assert csv_lines[0] == "ts,platform,account,slug,idem_key,status,url,article_id,screenshot,indexed_at,note"
+    row = dict(zip(csv_lines[0].split(","), csv_lines[1].split(",")))
+    assert row["ts"] == "2026-10-22T10:00:00+08:00"
+    assert row["status"] == "published" and row["article_id"] == "1"
+    assert outcome.receipt_path == run_dir / "receipt.json"
+    assert outcome.receipt_failed is False
+
+
+def test_publish_gate_blocks_real_publish_when_gate_is_draft(tmp_path):
+    """闸门（R8 前置刹车）：gate=draft 时 --mode publish 必须在开浏览器之前被拦。"""
+    adapter = RecordingAdapter()
+    opened: list[str] = []
+
+    with pytest.raises(GateClosed) as exc:
+        publish_draft(
+            adapter, _loaded(tmp_path), _cfg(), gate=Gate.DRAFT,
+            open_page=_opener(opened)[0], mode="publish",
+        )
+
+    assert "不允许真实发布" in str(exc.value)
+    assert opened == [], "闸门拦下的运行连浏览器都不许开"
+    assert adapter.calls == []
 
 
 def test_default_mode_is_draft(tmp_path):
@@ -506,3 +569,106 @@ def test_no_body_file_lists_every_candidate(tmp_path):
     message = str(exc.value)
     for name in ("csdn.md", "body.md", "draft.md"):
         assert name in message, f"要告诉人找过哪些名字：{name}"
+
+
+# --------------------------------------------------------------- T-10 回执的失败形态
+
+def test_publish_screenshot_failure_does_not_change_the_verdict(tmp_path):
+    """截图回调抛异常 → 降级为告警，发布成功结论不变（存证不该拖垮判定）。"""
+    adapter = RecordingAdapter()
+
+    def _broken(page, path):
+        raise RuntimeError("磁盘满了")
+
+    outcome = publish_draft(
+        adapter, _loaded(tmp_path), _cfg(), gate=Gate.PUBLISH,
+        open_page=_opener([])[0], mode="publish",
+        data_dir=tmp_path / "data", clock=FakeClock("2026-10-22T10:00:00+08:00"),
+        screenshot=_broken,
+    )
+
+    assert outcome.ok is True, "截图失败不许改判定"
+    # 回执照写，screenshot 字段为空串（没截到就是不截到）
+    import json as _json
+    receipt = _json.loads(
+        (tmp_path / "data/runs/20261022_100000/receipt.json").read_text(encoding="utf-8")
+    )
+    assert receipt["screenshot"] == ""
+
+
+def test_publish_receipt_write_failure_marks_receipt_failed(tmp_path, caplog):
+    """run_dir 被文件占住（磁盘满形态）→ 发布成功不变，outcome 带 receipt_failed。"""
+    adapter = RecordingAdapter()
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    (data_dir / "runs").write_text("我不是目录", encoding="utf-8")  # runs/ 是文件
+
+    with caplog.at_level(logging.WARNING, logger="geopublish.publish"):
+        outcome = publish_draft(
+            adapter, _loaded(tmp_path), _cfg(), gate=Gate.PUBLISH,
+            open_page=_opener([])[0], mode="publish",
+            data_dir=data_dir, clock=FakeClock("2026-10-22T10:00:00+08:00"),
+        )
+
+    assert outcome.ok is True, "回执失败不许掩盖发布成功"
+    assert outcome.receipt_failed is True
+    assert outcome.receipt_path is None
+    assert any("receipt_failed" in r.message for r in caplog.records)
+
+
+def test_account_falls_back_to_default_when_url_has_no_account_segment(tmp_path):
+    """URL 里挖不出账号段 → csv 的 account 写 default（必填列不许留空）。"""
+    adapter = RecordingAdapter()
+    adapter.verify = lambda page, *, mode=SubmitMode.DRAFT: VerifyResult(  # type: ignore[method-assign]
+        ok=True, url="https://mp.csdn.net/", article_id="7", reason="命中"
+    )
+
+    publish_draft(
+        adapter, _loaded(tmp_path), _cfg(), gate=Gate.PUBLISH,
+        open_page=_opener([])[0], mode="publish",
+        data_dir=tmp_path / "data", clock=FakeClock("2026-10-22T10:00:00+08:00"),
+    )
+
+    import csv as _csv
+    with open(tmp_path / "data/publish-log.csv", encoding="utf-8", newline="") as fh:
+        rows = list(_csv.DictReader(fh))
+    assert rows[0]["account"] == "default"
+    assert rows[0]["article_id"] == "7"
+
+
+def test_account_fallback_also_covers_article_path_without_account(tmp_path):
+    """blog.csdn.net/article/details/<id>（无账号段的非常规形态）→ account=default。"""
+    adapter = RecordingAdapter()
+    adapter.verify = lambda page, *, mode=SubmitMode.DRAFT: VerifyResult(  # type: ignore[method-assign]
+        ok=True, url="https://blog.csdn.net/article/details/9", article_id="9", reason="命中"
+    )
+
+    publish_draft(
+        adapter, _loaded(tmp_path), _cfg(), gate=Gate.PUBLISH,
+        open_page=_opener([])[0], mode="publish",
+        data_dir=tmp_path / "data", clock=FakeClock("2026-10-22T10:00:00+08:00"),
+    )
+
+    import csv as _csv
+    with open(tmp_path / "data/publish-log.csv", encoding="utf-8", newline="") as fh:
+        rows = list(_csv.DictReader(fh))
+    assert rows[0]["account"] == "default"
+    assert rows[0]["article_id"] == "9"
+
+
+def test_account_fallback_covers_non_csdn_url():
+    """非 csdn 域名（未来多平台形态）→ account=default。直接钉 _account_from_url。"""
+    from geopublish.publish import _account_from_url
+
+    assert _account_from_url("https://juejin.cn/post/123") == "default"
+    assert _account_from_url("") == "default"
+    assert _account_from_url("https://blog.csdn.net/probe/article/details/42") == "probe"
+
+
+def test_account_fallback_covers_non_csdn_url():
+    """非 csdn 域名（未来多平台形态）→ account=default。直接钉 _account_from_url。"""
+    from geopublish.publish import _account_from_url
+
+    assert _account_from_url("https://juejin.cn/post/123") == "default"
+    assert _account_from_url("") == "default"
+    assert _account_from_url("https://blog.csdn.net/probe/article/details/42") == "probe"

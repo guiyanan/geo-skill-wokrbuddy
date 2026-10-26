@@ -2,59 +2,195 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <title>发布文章 - CSDN（占位快照）</title>
+  <title>发布文章 - CSDN</title>
 </head>
 <body class="mp-editor-page">
   <!--
-    ⚠️ 占位快照（未经真机校准）：发布对话框的真实 DOM 还没抓过——抓它需要点
-    「发布文章」打开对话框（不点最终发布按钮），属于 T-10 的第一步现场工作。
-    本文件里的控件 id/类名沿用手工约定，meta/cover 组的契约测试只证明
-    「选择器语法有效且形状自洽」，不证明「对线上有效」。
-    T-10 抓到真实对话框后，第一件事就是替换本文件并看着契约测试红/绿。
+    2026-10-22 T-10 真机校准：按真实发布对话框重建（原料 data/l4/t10-dialog-dom.html，
+    探针 data/l4/t10_probe_dialog.py 抓取，SVG/base64 已剥除，结构/类名/id 保真）。
+
+    实测要点：
+    - 对话框根是 .modal > .modal__inner-1.modal__publish-article；body 是
+      .modal__content.publish-article-modal__body，footer 是
+      .modal__button-bar.publish-article-modal__footer。
+    - 最终发布按钮是 footer 里唯一的 button.btn-b-red（文案「发布文章」）；
+      编辑器页入口是 button.btn-publish（文案也是「发布文章」），两者靠容器区分。
+    - 标签：点 .tag__btn-tag「添加文章标签」后展开 .mark_selection_box，
+      输入框是其中的 input.el-input__inner（Enter 确认一个自定义标签）。
+      本快照呈现的是「面板已展开」状态。
+    - 分类专栏是 .tag__box[curlistflag] 的点击展开控件（不是 <select>）；
+      测试账号没有任何专栏，展开列表形态未验证（详见 flow._fill_category 注释）。
+    - 创作声明是 el-select：只读 input + 内嵌 .el-select-dropdown 列表，
+      选项为「无声明 / 部分内容由AI辅助生成 / 内容来源网络，进行整合/再创作 /
+      个人观点，仅供参考」（没有独立的「AI 生成」档）。
+    - 封面：input.el-upload__input 选文件后弹出 .vicp-wrap 裁剪编辑器，
+      点 div.vicp-operate-btn「确认上传」后异步上传；完成信号是
+      .preview-box 长出 .hasImg（img.preview 的 src 属性非空）。
+      已有封面时上传框消失，只剩 a.btn-remove-coverimg 删除入口。
   -->
 
-  <div class="publish-dialog">
-    <div class="panel-item">
-      <label class="panel-item__label" for="category">分类专栏</label>
-      <!-- 选择器 meta.category -->
-      <select id="category" class="panel-item__select">
-        <option value="0">请选择专栏</option>
-        <option value="123">技术分享</option>
-      </select>
-    </div>
+  <div class="modal">
+    <div class="modal__inner-1 modal__publish-article">
+      <div class="publish-article-modal__header">发布文章</div>
+      <button class="modal__close-button button not-tabbable"></button>
 
-    <div class="panel-item">
-      <label class="panel-item__label" for="tag-input">添加标签</label>
-      <!-- 选择器 meta.tags -->
-      <div class="tag-area">
-        <input id="tag-input" class="tag-input" placeholder="最多添加 5 个标签">
+      <div class="modal__content publish-article-modal__body">
+
+        <div class="form-entry flex form-tag-box required">
+          <label class="form-entry__label">文章标签</label>
+          <div>
+            <div class="mark_selection" typename="tags">
+              <div class="mark_selection_title_el_tag">
+                <span><span class="el-tag el-tag--light mark_selection_box_el_tag">人工智能<i class="el-tag__close el-icon-close"></i></span></span>
+                <!-- 选择器 meta.tags_add_button -->
+                <button class="tag__btn-tag">添加文章标签</button>
+              </div>
+              <div class="mark_selection_box" style="top: 38px;">
+                <div class="mark_title">标签</div>
+                <div class="mark_selection_box_header">
+                  <div role="combobox" class="el-autocomplete">
+                    <div class="el-input el-input--suffix">
+                      <!-- 选择器 meta.tags：键入后 Enter 确认一个标签 -->
+                      <input type="text" autocomplete="off"
+                             placeholder="请输入文字搜索，Enter键入可添加自定义标签"
+                             class="el-input__inner" role="textbox">
+                    </div>
+                  </div>
+                </div>
+                <div class="mark_selection_box_body">
+                  <!-- 选择器 meta.tags_panel_close -->
+                  <button title="关闭" aria-label="关闭" class="modal__close-button button"></button>
+                  <div class="mark_add_tag">
+                    <ul class="mark_add_tag_left">
+                      <li class="active">推荐</li>
+                      <li class="">Python</li>
+                      <li class="">人工智能</li>
+                    </ul>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="form-entry flex form-tag-box">
+          <label class="form-entry__label">添加封面</label>
+          <!--
+            契约说明：封面区有两个互斥的真实状态——「未传」（有上传框）与
+            「已有封面」（.preview-box 长出 .hasImg、上传框消失、只剩删除入口）。
+            静态快照把两个状态并置，让 cover 组选择器全部可命中；
+            线上任一时刻只会出现其中一种。
+          -->
+          <div class="container-coverimage-box">
+            <div class="preview-box hasImg">
+              <!-- 选择器 cover.thumbnail：上传完成后 src 属性非空（读属性，不是 .src） -->
+              <img src="https://i-blog.csdnimg.cn/direct/example-cover.png" alt="" class="preview">
+              <div class="vue-image-crop-upload" aria-hidden="true" style="display: none;">
+                <!-- 选择器 cover.crop_editor -->
+                <div class="vicp-wrap">
+                  <p class="title">图片编辑</p>
+                  <div class="vicp-close"><i class="vicp-icon4"></i></div>
+                  <div class="vicp-step2">
+                    <div class="vicp-crop">
+                      <div class="vicp-crop-left"><div class="vicp-img-container"></div></div>
+                      <div class="vicp-crop-right"><div class="vicp-preview"><div class="vicp-preview-item"><span>封面图预览</span></div></div></div>
+                    </div>
+                    <div class="vicp-operate">
+                      <!-- 选择器 cover.crop_confirm（注意：div，不是 button） -->
+                      <div class="vicp-operate-btn">确认上传</div>
+                    </div>
+                  </div>
+                  <canvas width="356" height="200" aria-hidden="true" style="display: none;"></canvas>
+                </div>
+              </div>
+              <!-- 选择器 cover.remove_button：已有封面时只剩这个删除入口 -->
+              <a class="btn-remove-coverimg"><i class="el-icon-close"></i></a>
+            </div>
+            <div class="cover-upload-box">
+              <div tabindex="0" class="el-upload el-upload--text">
+                <button type="button" class="upload-img-box">从本地上传</button>
+                <!-- 选择器 cover.upload_input（display:none，Playwright 可直接塞文件） -->
+                <input type="file" name="file" accept=".png,.jpg,.jpeg,.gif" class="el-upload__input">
+              </div>
+            </div>
+            <div class="img-selection-box"><div class="no-data">暂无内容图片，请在正文中添加图片</div></div>
+          </div>
+        </div>
+
+        <div class="form-entry flex form-tag-box">
+          <label class="form-entry__label">文章摘要</label>
+          <div class="el-textarea">
+            <!-- 选择器 meta.summary -->
+            <textarea class="el-textarea__inner"
+                      placeholder="本内容会在各展现列表中展示，帮助读者快速了解内容。若不填，则默认提取正文前256个字。"></textarea>
+          </div>
+          <button class="el-button btn-getdistill el-button--default"><span>AI提取摘要</span></button>
+        </div>
+
+        <div class="form-entry flex form-tag-box">
+          <label class="form-entry__label">分类专栏</label>
+          <div class="form-entry__field" style="overflow: unset;">
+            <!-- 选择器 meta.category：点击展开控件（不是 <select>） -->
+            <div class="tag__box" curlistflag="true">
+              <input type="hidden" name="categories">
+              <div class="flex-box">
+                <div id="tagList" class="tag__item-list">
+                  <!-- 选择器 meta.category_option：已选中的专栏以 el-tag 呈现
+                      （契约并置形态；本测试账号实际无专栏） -->
+                  <span class="el-tag el-tag--light">技术分享</span>
+                  <button class="tag__btn-tag">新建分类专栏</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="form-entry flex form-entry__field-switch-box">
+          <label class="form-entry__label">文章类型</label>
+          <div class="form-entry__field">
+            <!-- 选择器 meta.original_declaration：原创单选（同组 #repost/#translated） -->
+            <input type="radio" id="original" class="form-control form-control-sm chk-switch" checked>
+            <label for="original">原创</label>
+            <input type="radio" id="repost" class="form-control form-control-sm chk-switch">
+            <label for="repost">转载</label>
+            <input type="radio" id="translated" class="form-control form-control-sm chk-switch">
+            <label for="translated">翻译</label>
+          </div>
+        </div>
+
+        <div class="form-entry flex">
+          <label class="form-entry__label">创作声明</label>
+          <!-- 选择器 meta.ai_declaration（只读 input，点击展开下拉） -->
+          <div class="el-select creation-statement-select">
+            <div class="el-input el-input--suffix">
+              <input type="text" readonly="readonly" autocomplete="off" placeholder="无声明" class="el-input__inner">
+            </div>
+            <div class="el-select-dropdown el-popper" aria-hidden="true" style="display: none; min-width: 200px;">
+              <div class="el-scrollbar">
+                <div class="el-select-dropdown__wrap el-scrollbar__wrap">
+                  <ul class="el-scrollbar__view el-select-dropdown__list">
+                    <!-- 选择器 meta.ai_declaration_option：按文本点选 -->
+                    <li class="el-select-dropdown__item selected"><span>无声明</span></li>
+                    <li class="el-select-dropdown__item"><span>部分内容由AI辅助生成</span></li>
+                    <li class="el-select-dropdown__item"><span>内容来源网络，进行整合/再创作</span></li>
+                    <li class="el-select-dropdown__item"><span>个人观点，仅供参考</span></li>
+                  </ul>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
       </div>
-    </div>
 
-    <div class="panel-item">
-      <label class="panel-item__label" for="summary">摘要</label>
-      <!-- 选择器 meta.summary -->
-      <textarea id="summary" class="panel-item__textarea" placeholder="不填则默认提取正文前 256 字"></textarea>
-    </div>
-
-    <div class="panel-item">
-      <!-- 选择器 meta.original_declaration -->
-      <input id="original-declaration" type="checkbox">
-      <label for="original-declaration">原创声明</label>
-      <!-- 选择器 meta.ai_declaration -->
-      <select id="ai-declaration">
-        <option value="">请选择 AI 参与度</option>
-        <option value="human">未使用 AI</option>
-        <option value="assisted">AI 辅助</option>
-        <option value="generated">AI 生成</option>
-      </select>
-    </div>
-
-    <div class="panel-item">
-      <label>封面</label>
-      <!-- 选择器 cover.upload_input / cover.thumbnail -->
-      <input id="cover-upload" type="file" accept="image/png,image/jpeg">
-      <img class="cover-thumbnail" src="" alt="封面预览" hidden>
+      <div class="modal__button-bar publish-article-modal__footer">
+        <!-- 选择器 dialog.cancel_button（第一个 .btn-b-normal 即「取消」） -->
+        <button class="button btn-b-normal">取消</button>
+        <button class="button btn-b-normal ml16">保存为草稿</button>
+        <button class="button btn-b-normal ml16">定时发布</button>
+        <!-- 选择器 dialog.confirm_button：最终发布按钮，footer 里唯一的 btn-b-red -->
+        <button class="button btn-b-red ml16">发布文章</button>
+      </div>
     </div>
   </div>
 </body>

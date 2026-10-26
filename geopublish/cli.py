@@ -127,7 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
     replay_cmd = incident_sub.add_parser("replay", help="回放一个现场包（预期退出 4）")
     replay_cmd.add_argument("path", help="现场包目录")
 
-    publish_cmd = sub.add_parser("publish", help="把一篇稿件投到平台（T-09：草稿投递）")
+    publish_cmd = sub.add_parser("publish", help="把一篇稿件投到平台（draft=存草稿；publish=真实发布）")
     publish_cmd.add_argument(
         "draft_dir", help="稿件目录（含 meta.json，正文为 <platform>.md / body.md / draft.md）"
     )
@@ -135,7 +135,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--mode",
         default="draft",
         choices=("draft", "publish"),
-        help="draft=只存草稿（默认）；publish=真实发布，由 T-10 提供，现在会明确拒绝",
+        help="draft=只存草稿（默认）；publish=真实发布并落回执（需配置 gate=publish）",
     )
     publish_cmd.add_argument("--platform", default="csdn", help="平台名（默认 csdn）")
     publish_cmd.add_argument(
@@ -219,20 +219,12 @@ def _adapter_for(platform: str) -> object:
 
 
 def _publish(args: argparse.Namespace) -> int:
-    """一条命令把稿件投进草稿箱（T-09 P0 里程碑）。
+    """一条命令投递稿件：draft 进草稿箱（T-09）；publish 真实发布 + 回执（T-10）。
 
     失败全部转成退出码，不给 cron 丢 traceback。这里**没有重试**：
-    提交前复核被拦、verify 没过，重试只会多留一篇草稿（幂等是 T-11 的事）。
+    提交前复核被拦、verify 没过，重试只会多留一篇（幂等是 T-11 的事）。
+    publish 模式还有配置闸门：gate 不是 publish 会在 check_gate 被拦（GateClosed）。
     """
-    if args.mode != "draft":
-        # 真实发布的按钮不是「多一个 if」就能开的：它还要回执、幂等、失败分类。
-        # 所以在参数层就拒绝，并且明说「什么都没点」——否则人会以为已经发出去了。
-        print(
-            "发布模式（--mode publish）属于 T-10：本次未连接平台，也没有点任何按钮",
-            file=sys.stderr,
-        )
-        return EXIT_USAGE
-
     try:
         cfg = load_config(Path(args.config))
         platform_cfg = cfg.platform(args.platform)
@@ -289,6 +281,19 @@ def _publish(args: argparse.Namespace) -> int:
         if outcome.url:
             print(f"  当前页面：{outcome.url}", file=sys.stderr)
         return EXIT_FAILED
+
+    if args.mode == "publish":
+        print(f"已发布：{loaded.draft.meta.title}")
+        print(f"  article_id = {outcome.article_id}")
+        print(f"  url        = {outcome.url}")
+        if outcome.receipt_path:
+            print(f"  回执       = {outcome.receipt_path}")
+        if outcome.receipt_failed:
+            # 发成了但没存上证：单独喊出来，后续靠这条线索去平台后台核对
+            print("  ⚠️ 回执写盘失败（receipt_failed）：发布状态不变，请人工核对平台后台", file=sys.stderr)
+        if outcome.run_dir:
+            print(f"  截图       = {outcome.run_dir}（before.png / after.png）")
+        return EXIT_OK
 
     print(f"草稿已保存：{loaded.draft.meta.title}")
     print(f"  article_id = {outcome.article_id}")

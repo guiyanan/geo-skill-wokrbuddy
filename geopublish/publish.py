@@ -1,18 +1,23 @@
-"""发布编排（T-09：草稿投递）。
+"""发布编排（T-09：草稿投递；T-10：真实发布与回执）。
 
-一条命令把「一个稿件目录」变成「平台草稿箱里的一篇」：
+一条命令把「一个稿件目录」变成「平台草稿箱里的一篇」（draft），
+或「平台上一篇公开文章 + 一份回执」（publish）：
 
     load_draft → open_page → check_login → open_editor → fill_content
-    → upload_cover → fill_meta → submit → verify
+    → fill_meta → upload_cover → submit → verify →（publish）回执落盘
+
+发布模式的顺序有个真机约束（T-10 校准）：标题必须在发布对话框打开**之前**填
+（对话框是遮罩层，会挡住编辑器页的点击），而封面、分类、标签、摘要、声明都在
+对话框**里面**。fill_meta 内部先填标题再开对话框，所以发布模式是
+meta 在前、cover 在后——与架构 §5 的草稿期直觉相反，以真机 DOM 为准。
 
 分层纪律：这里不认识 DOM（那是 adapter 的事），也不认识命令行参数（那是 cli.py 的事）。
 所以它可以用假 adapter + 假 page 原样跑，不需要浏览器 —— 顺序错了、少了一步，
-单测会直接抓到，而不是等真机上发现「封面没传就点了存草稿」。
+单测会直接抓到，而不是等真机上发现「封面没传就点了发布」。
 
 **不做的事**（都另有工单，半套实现比没实现更危险）：
-- 幂等与并发锁（R9）→ T-11。这里连跑两次会在草稿箱留两篇，是已知缺口。
-- 回执落盘 `receipt.json` → T-10。这里只在成功时留一张截图。
-- 真实发布（`--mode publish`）→ T-10。
+- 幂等与并发锁（R9）→ T-11。这里连跑两次会发两遍，是已知缺口。
+- 失败分类与红线（R12/R13）→ T-12。
 """
 
 from __future__ import annotations
@@ -24,12 +29,14 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .adapters.base import Page, SubmitMode
 from .core.clock import Clock, SystemClock
 from .core.config import Gate, PlatformConfig
-from .core.models import Draft, Meta, ModelError
+from .core.models import Draft, LogEntry, Meta, ModelError, Receipt
 from .core.session import check_login
+from .core.state import Status
 
 __all__ = [
     "DraftLoadError",
@@ -84,6 +91,10 @@ class PublishOutcome:
     article_id: str = ""
     reason: str = ""
     run_dir: Path | None = None
+    # T-10 回执：写成功是路径；写失败是 None + receipt_failed=True
+    # （发成了但没存上证——与「没发成」是两种处置，必须分开表达）。
+    receipt_path: Path | None = None
+    receipt_failed: bool = False
 
 
 # --------------------------------------------------------------- 装载
@@ -187,7 +198,7 @@ def publish_draft(
     clock: Clock | None = None,
     screenshot: Screenshot | None = None,
 ) -> PublishOutcome:
-    """按架构 §5 的顺序把一篇稿子投出去（T-09 只到草稿）。
+    """按架构 §5 的顺序把一篇稿子投出去；publish 模式额外落回执（T-10 / R10）。
 
     `open_page` 是「开一次浏览器会话」的工厂（CLI 传 `PersistentBrowser.open`），
     注入之后单测用假会话跑同一条路径 —— 顺序即被测对象。
@@ -195,6 +206,7 @@ def publish_draft(
     mode = SubmitMode(mode)
     check_gate(gate, platform_cfg, mode)
     draft = loaded.draft
+    clk = clock or SystemClock()
 
     with open_page() as page:
         # 新开的会话停在空白页上，check_auth 在空白页只能判出 unknown。
@@ -211,23 +223,46 @@ def publish_draft(
         check_login(adapter, page)
         adapter.open_editor(page, draft)
         adapter.fill_content(page, draft)
-        if loaded.cover is not None:
-            if mode is SubmitMode.PUBLISH:
-                # 顺序照架构 §5：封面在元信息之前，缩略图等待期间还能顺手发现上传框改版
+
+        if mode is SubmitMode.PUBLISH:
+            # 真机约束（T-10）：标题要在发布对话框打开前填（对话框是遮罩层，
+            # 会挡住编辑器页的点击），封面在对话框里。所以发布模式 meta 在前。
+            adapter.fill_meta(page, draft, platform_cfg, mode=mode)
+            if loaded.cover is not None:
                 adapter.upload_cover(page, loaded.cover)
-            else:
+        else:
+            if loaded.cover is not None:
                 # 真机校准（T-09b）：封面上传框在「发布文章」对话框里，编辑器页面上
                 # 没有这个控件。草稿模式强行上传只会撞选择器超时，明说跳过。
-                logger.warning("草稿模式不上传封面（封面控件在发布对话框里，T-10）：%s", loaded.cover)
-        adapter.fill_meta(page, draft, platform_cfg, mode=mode)
+                logger.warning("草稿模式不上传封面（封面控件在发布对话框里）：%s", loaded.cover)
+            adapter.fill_meta(page, draft, platform_cfg, mode=mode)
+
+        run_dir: Path | None = None
+        receipt_path: Path | None = None
+        receipt_failed = False
+
+        if mode is SubmitMode.PUBLISH and screenshot is not None:
+            # R10：before.png 在点发布按钮之前截——之后页面什么样谁都不知道。
+            run_dir = _run_dir(data_dir, clk)
+            _snap(page, screenshot, run_dir, "before.png")
 
         submitted = adapter.submit(page, mode=mode)
         logger.info("submit 返回 %s：%s", submitted.state.value, submitted.reason)
 
         result = adapter.verify(page, mode=mode)
-        run_dir = None
-        if screenshot is not None and result.ok:
-            run_dir = _capture(page, screenshot, data_dir, clock)
+
+        if result.ok:
+            if mode is SubmitMode.PUBLISH:
+                if screenshot is not None:
+                    # 不变量：publish + screenshot 时 run_dir 在 before.png 处已建
+                    assert run_dir is not None
+                    _snap(page, screenshot, run_dir, "after.png")
+                record = _record_publish(
+                    draft, platform_cfg, result, run_dir, data_dir, clk
+                )
+                receipt_path, receipt_failed = record.receipt_path, record.failed
+            elif screenshot is not None:
+                run_dir = _capture(page, screenshot, data_dir, clk)
 
     logger.info(
         "verify %s：%s（article_id=%r）",
@@ -241,7 +276,89 @@ def publish_draft(
         article_id=result.article_id,
         reason=result.reason,
         run_dir=run_dir,
+        receipt_path=receipt_path,
+        receipt_failed=receipt_failed,
     )
+
+
+def _run_dir(data_dir: str | Path, clock: Clock) -> Path:
+    """本次运行的存证目录：data/runs/<ts>/。时间只走注入时钟（UT-10-04）。"""
+    return Path(data_dir) / "runs" / clock.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _snap(page: Any, screenshot: Screenshot, run_dir: Path, name: str) -> Path | None:
+    """截一张图。**截图失败不改判定**：发了就是发了，别让存证拖垮结论。"""
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        target = run_dir / name
+        screenshot(page, target)
+    except Exception as exc:  # noqa: BLE001 - 存证失败的形态太多，一律降级为告警
+        logger.warning("截图失败（不影响发布判定）：%s", exc)
+        return None
+    return target
+
+
+def _account_from_url(url: str) -> str:
+    """从已发布 URL 里取账号段（blog.csdn.net/<account>/article/details/<id>）。
+
+    取不到用 "default"：account 是日志的必填列，宁可标注缺失也不能写空串
+    混进历史数据。多账号支持留给真有那么一天再说。
+    """
+    parts = urlsplit(str(url or ""))
+    if parts.netloc.endswith("csdn.net"):
+        segs = [s for s in parts.path.split("/") if s]
+        if segs and segs[0] not in {"article", "mp_blog"}:
+            return segs[0]
+    return "default"
+
+
+def _record_publish(
+    draft: Draft,
+    platform_cfg: PlatformConfig,
+    result: Any,
+    run_dir: Path | None,
+    data_dir: str | Path,
+    clock: Clock,
+) -> Any:
+    """发布成功后的回执：receipt.json + publish-log.csv 一行（R10）。
+
+    回执写失败不掩盖发布成功（UT-10-03）：core/receipt.save_receipt 会把
+    note 记成 receipt_failed 并照常写日志行。两个时间字段都走注入时钟。
+    """
+    from .core.receipt import save_receipt
+    from .core.state import PublishLog
+
+    shot = ""
+    if run_dir is not None and (run_dir / "after.png").is_file():
+        shot = str(run_dir / "after.png")
+    account = _account_from_url(result.url)
+    receipt = Receipt(
+        url=result.url,
+        article_id=result.article_id,
+        published_at=clock.now(),
+        screenshot=shot,
+        content_sha=draft.content_sha,
+    )
+    entry = LogEntry(
+        ts=clock.now(),
+        platform=platform_cfg.key,
+        account=account,
+        slug=draft.meta.slug,
+        idem_key=draft.idem_key(platform_cfg.key, account),
+        status=Status.PUBLISHED,
+        url=result.url,
+        article_id=result.article_id,
+        screenshot=shot,
+    )
+    record = save_receipt(
+        receipt,
+        run_dir if run_dir is not None else _run_dir(data_dir, clock),
+        PublishLog(Path(data_dir) / "publish-log.csv"),
+        entry,
+    )
+    if record.failed:
+        logger.warning("回执写盘失败（receipt_failed）：发布成功状态不变")
+    return record
 
 
 def _capture(

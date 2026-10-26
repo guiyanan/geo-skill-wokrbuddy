@@ -18,6 +18,7 @@ from geopublish.adapters.base import (
     REQUIRED_SELECTORS,
     SelectorError,
     Selectors,
+    SubmitBlocked,
     SubmitMode,
     assert_adapter,
 )
@@ -115,25 +116,19 @@ def test_protocol_is_runtime_checkable():
     assert isinstance(CsdnAdapter(), PlatformAdapter)
 
 
-@pytest.mark.parametrize(
-    "call, ticket, method",
-    [
-        (lambda a: a.submit(object(), mode="publish"), "T-10", "submit"),
-        (lambda a: a.submit(object(), mode=SubmitMode.PUBLISH), "T-10", "submit"),
-    ],
-)
-def test_unimplemented_modes_name_their_ticket(call, ticket, method):
-    """没实现就要**说出来属于哪张工单**。
+@pytest.mark.parametrize("mode", ["publish", SubmitMode.PUBLISH])
+def test_publish_submit_is_blocked_without_injection_record(mode):
+    """T-10 起 publish 已实现——但**没有注入记录时拒绝点任何按钮**。
 
-    最危险的是写个 `pass` —— 流程会一路绿到「发布成功」，然后线上什么都没有。
-    （T-09 之后只剩真实发布这一段：`submit(mode=publish)` 归 T-10。）
+    这条替换了原来的「NotImplementedError 标注工单」测试：实现之后，守门的
+    从「没实现」变成「复核不过就不许发」。空页面（没有注入记录）调用
+    submit(publish) 必须在第一步就被 SubmitBlocked 拦下。
     """
     adapter = CsdnAdapter()
-    with pytest.raises(NotImplementedError) as exc:
-        call(adapter)
+    with pytest.raises(SubmitBlocked) as exc:
+        adapter.submit(object(), mode=mode)
 
-    assert ticket in str(exc.value), f"{method} 的报错必须指出 {ticket}"
-    assert "publish" in str(exc.value)
+    assert "注入" in str(exc.value)
 
 
 # --------------------------------------------------- open_editor

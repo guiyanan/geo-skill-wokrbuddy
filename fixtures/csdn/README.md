@@ -6,10 +6,10 @@
 | 文件 | 对应线上页面 | 用来钉什么 |
 |---|---|---|
 | `editor.html` | `editor.csdn.net/md` MD 编辑器（已登录）。**2026-10-21 按真机勘查重建** | 标题双层控件 / cledit 正文 / 保存草稿两步 / 发布按钮 / 模版库弹窗 / 头像 |
-| `publish-dialog.html` | 「发布文章」对话框（⚠️ **占位，未经真机校准**——抓取属于 T-10 第一步） | 分类 / 标签 / 摘要 / 声明 / 封面上传框 |
+| `publish-dialog.html` | 「发布文章」对话框（**2026-10-22 T-10 按真机抓取重建**，原料 `data/l4/t10-dialog-dom.html`） | 分类 / 标签 / 摘要 / 创作声明 / 封面上传链 / 最终发布与取消按钮 |
 | `login.html` | `passport.csdn.net` 登录页 | 被踢回登录 → `expired` |
 | `captcha.html` | 风控验证页（⚠️ 占位，未见过真实风控页） | 有人机校验 → `unknown` + `has_challenge=True`，**且优先于登录表单判定** |
-| `success.html` | 发布成功页（⚠️ 占位，等 T-10 真发布后校准） | 回读用的 `article_id` / `success_marker` 能命中 |
+| `success.html` | 发布成功 = 跳转详情页（**2026-10-26 T-10 按 articleId=169160036 真实详情页重建**；无独立成功页、无 `article:id` meta，id 走 URL 路径） | 详情页正文容器 `article.baidu_pl` 在 |
 | `drafts.html` | `mp.csdn.net/mp_blog/manage/article` 草稿箱（⚠️ 占位——列表行结构未抓到，当时勘查脚本没等够加载时间） | verify 兜底：列表行命中 `draft_list_item`，且每行带得出 href |
 
 **词汇说明**：选择器键叫 `auth.challenge`、结果字段叫 `has_challenge`，不叫
@@ -41,11 +41,15 @@ geopublish snapshot "https://passport.csdn.net/login" csdn/login --out fixtures
 ## 校准状态（2026-10-21 T-09b 真机勘查后）
 
 **已校准**（按真实页面重建/确认）：`editor.html`（MD 编辑器）、`login.html` 的 `.login-box`、
-登录态头像 `img.img-user-avatar`、存草稿两步流程、URL `?articleId=` 成功信号。
+登录态头像 `img.img-user-avatar`、存草稿两步流程、URL `?articleId=` 成功信号、
+`publish-dialog.html`（2026-10-22 T-10 抓取：meta/cover/dialog 三组选择器全部按真实 DOM
+重写；标签=autocomplete 输入框+Enter、创作声明=el-select 四档、封面=裁剪编辑器+
+`.vicp-operate-btn` 确认+`.preview-box.hasImg` 完成信号、最终发布=footer 唯一 `.btn-b-red`）。
 
-**仍是占位**（明确标注在文件头注释里）：`publish-dialog.html`、`success.html`、
-`drafts.html`、`captcha.html`。它们的选择器打不中真站时，契约测试不会红——
-这是已知缺口，堵法是 T-10 现场抓取替换（那时打不中会先红，而不是以为发出去其实没有）。
+**仍是占位**（明确标注在文件头注释里）：`drafts.html`、`captcha.html`。
+它们的选择器打不中真站时，契约测试不会红——这是已知缺口，堵法是
+下次真机窗口现场抓取替换（那时打不中会先红，而不是以为发出去其实没有）。
+`success.html` 已于 2026-10-26 T-10 按真实详情页重建（发布成功 = 跳转详情页）。
 
 真机实测还要记住三条（写进了 adapter 注释）：
 1. 编辑器**会恢复上次未保存内容**——注入前必须清场。

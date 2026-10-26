@@ -174,7 +174,7 @@ geo-publish/
 
 **P1 · 全自动**
 ```
-- [ ] T-10  发布与回执
+- [x] T-10  发布与回执
 - [ ] T-11  幂等与并发锁（落地）
 - [ ] T-12  失败分类与红线
 ```
@@ -692,8 +692,9 @@ UT-03-07/08 确保 R4 五项**全部**与 `rejected` 联动，而不只是前三
 `press_sequentially` 与 `wait_for_hidden` 的真机 API 兼容、弹窗 `position:fixed`/`display:contents`
 两种拦截形态（点关闭+摘遮罩+DOM focus 三件套）、草稿列表 tab 的异步渲染等待。
 
-**L4 未验证**（等 T-10 或下次真机窗口）：发布对话框控件与封面规格（发布才会点开），
-`publish-dialog.html` / `success.html` / `captcha.html` 三个 fixture 仍是标注占位；
+**L4 未验证**（等下次真机窗口）：有专栏账号的分类专栏展开形态（本账号无专栏，
+`fill_meta` 遇空可选项会明确 MetaError 而不是静默跳过）；
+`drafts.html` / `captcha.html` 两个 fixture 仍是标注占位；
 草稿箱里现存 4 篇测试草稿（含 1 篇【无标题】）待人工清理。
 
 
@@ -702,6 +703,22 @@ UT-03-07/08 确保 R4 五项**全部**与 `rejected` 联动，而不只是前三
 ### T-10 发布与回执
 
 **交付**：`submit(mode=publish)`、`core/receipt.py`
+
+**IT-10-01 真机验收（2026-10-26，DoD 达成）**：
+`geopublish publish data/l4/draft-t09 --mode publish` 一条命令端到端 **25s**（<5 分钟），
+发布 articleId=169160036（`https://blog.csdn.net/m0_61028198/article/details/169160036`），
+无痕（无 Cookie 全新 context，有头）可读正文 2723 字。回执 `data/runs/20261026_063439/`：
+receipt.json + before/after 双截图；publish-log.csv 一行落账（account 从 URL 解析出
+m0_61028198）。⚠️ headless Chrome 访问详情页会被 CSDN 反爬 403——无痕验证要用有头。
+
+**真机新增教训（全部已写进代码注释 + 测试钉死）**：
+1. close_modals 的 DOM 摘除会连发布对话框的 .modal 挂载点一起摘掉（对话框永不开）——
+   发布链路只点关闭按钮（closebuttons），标题的 display/input 点击走 JS 点击免疫遮罩。
+2. 「确认上传」是 div.vicp-operate-btn（不是 button）；上传完成信号是
+   .preview-box 长出 .hasImg（img.preview 的 .src 属性有空 src→页面 URL 的假阳性）。
+3. 发布成功直接跳详情页（无独立成功页）；URL 带 share* 追踪参数，回执前必须归一化。
+4. 创作声明只有四档且无独立「AI 生成」档（generated → 部分内容由AI辅助生成 + WARNING）。
+5. 测试不传 data_dir 会把假行写进真实 publish-log.csv——已修并清洗（41 行假数据）。
 
 **单元测试**
 | 编号 | 断言 |

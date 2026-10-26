@@ -94,13 +94,12 @@ def test_every_selector_in_group_hits_on_editor_page(fixture_dom, group):
     assert not missed, f"{group} 组这些选择器没命中：{missed}"
 
 
-@pytest.mark.parametrize("group", ["meta", "cover"])
+@pytest.mark.parametrize("group", ["meta", "cover", "dialog"])
 def test_meta_and_cover_hit_on_the_publish_dialog(fixture_dom, group):
-    """meta/cover 组的控件在发布对话框里。
+    """meta/cover/dialog 组的控件在发布对话框里。
 
-    ⚠️ publish-dialog.html 目前是**占位快照**（未经真机校准，见 fixtures README）——
-    这条测试只保证「选择器语法有效、形状自洽」，T-10 抓到真实对话框后替换 fixture，
-    那时打不中会在这里先红。
+    2026-10-22 T-10 真机校准：fixture 已按真实对话框 DOM 重建
+    （原料 data/l4/t10-dialog-dom.html）。选择器打不中 = 线上改版，在这里先红。
     """
     from dom import StaticPage
 
@@ -145,20 +144,21 @@ def test_avatar_selector_hits_exactly_one_element(fixture_dom):
     assert len(hits) == 1, f"命中 {len(hits)} 个，选择器太松：{hits}"
 
 
-def test_verify_selectors_hit_on_the_success_page(fixture_dom):
-    """回读用的两个选择器也要有 DOM 证明。
+def test_verify_publish_evidence_on_the_details_page(fixture_dom):
+    """T-10 真机校准：发布成功 = 跳转详情页。verify(publish) 的裁决不依赖
+    DOM 里的 article_id（详情页没有那个 meta），靠 URL 路径；DOM 侧证据是
+    正文容器 article.baidu_pl 在。
 
-    没有断言过的选择器等于「写在 JSON 里的一句愿望」——T-09 真去回读时才发现打不中，
-    那时已经发完文章了，代价高得多。
+    2026-10-26 之前的版本断言 meta[name='article:id'] 与 .editor__success-tip
+    会命中——那是按 CMS 惯例占位的形态，真机证明它不存在，已按真实详情页重建。
     """
     from dom import StaticPage
 
-    adapter = CsdnAdapter()
     page = StaticPage(fixture_dom("csdn", "success"))
 
-    for key in ("article_id", "success_marker"):
-        assert page.query_selector(adapter.selectors("verify", key)) is not None, key
-    assert page.query_selector(adapter.selectors("verify", "success_marker")).text_content().strip()
+    article = page.query_selector("article.baidu_pl")
+    assert article is not None, "详情页正文容器不在：fixture 或平台改版"
+    assert article.text_content().strip(), "详情页正文是空的"
 
 
 def test_draft_list_item_hits_on_the_draft_list_page(fixture_dom):

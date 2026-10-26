@@ -2,21 +2,26 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <title>文章发布成功 - CSDN</title>
-  <!-- 发布成功后平台会把文章 id 写进这个 meta。选择器 verify.article_id -->
-  <meta name="article:id" content="139821477">
-</head>
-<body class="mp-editor-page">
-  <header class="marketing-nav">
-    <div class="marketing-nav__user">
-      <a class="user-avatar" href="//i.csdn.net/user/personal">拾一米</a>
-    </div>
-  </header>
+  <title>文档解析为什么是RAG 的第一道工序-CSDN博客</title>
+  <!--
+    2026-10-26 T-10 真机校准：CSDN 发布成功的真实形态是**直接跳转详情页**
+    （blog.csdn.net/<account>/article/details/<id>?sharetype=...），
+    没有独立的「发布成功页」，也没有 meta[name='article:id']——
+    article_id 从 URL 路径读，verify(publish) 的 DOM 侧证据是正文容器
+    article.baidu_pl 存在。
 
-  <div class="editor">
-    <div class="editor__success-tip">
-      发布成功，<a href="//blog.csdn.net/shiyimi/article/details/139821477">查看文章</a>
-    </div>
-  </div>
+    本文件按 articleId=169160036 的真实详情页骨架重建（正文从略）。
+  -->
+  <link rel="canonical" href="https://blog.csdn.net/m0_61028198/article/details/169160036">
+</head>
+<body>
+  <main>
+    <article class="baidu_pl">
+      <h1 class="title-article">文档解析为什么是RAG 的第一道工序</h1>
+      <div id="content_views">
+        <p>做 RAG 系统的人，大多经历过同一个错觉……（正文从略）</p>
+      </div>
+    </article>
+  </main>
 </body>
 </html>

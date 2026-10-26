@@ -14,9 +14,8 @@
    「登录过期」和「遇到验证码」需要不同的处置（前者让人扫码，后者必须停手），
    一个 bool 表达不了，而回到裸字符串就是回到字符串比较。
 
-七方法的分工见架构 §3.2。截至 T-09 已落地 6 个（check_auth / open_editor /
-fill_content / fill_meta / upload_cover / submit(draft) / verify）；
-`submit(mode=publish)` 仍用 `NotImplementedError` 明确标注归属 T-10——**绝不写 `pass`**。
+七方法的分工见架构 §3.2。T-10 起七个方法全部落地（submit 的 publish 分支
+走发布对话框的最终按钮，并交付 core/receipt.py 回执落盘）。
 """
 
 from __future__ import annotations
@@ -74,6 +73,9 @@ REQUIRED_SELECTORS: Mapping[str, tuple[str, ...]] = {
     ),
     "meta": ("category", "tags", "summary", "original_declaration", "ai_declaration"),
     "cover": ("upload_input", "thumbnail"),
+    # T-10：发布对话框本身也是契约——入口点开后，根容器在不在、最终发布按钮和
+    # 取消按钮各是哪一个，打不中就是改版，必须在契约测试里先红。
+    "dialog": ("root", "confirm_button", "cancel_button"),
     "verify": (
         "article_id",
         "success_marker",
