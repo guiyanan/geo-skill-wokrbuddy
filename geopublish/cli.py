@@ -7,6 +7,8 @@
 - `geopublish snapshot <url> <name>`：把页面存成 fixture（T-04）
 - `geopublish incident replay <dir>`：回放现场包（T-04，repro.sh 调的就是它）
 - `geopublish publish <draft_dir> --mode draft`：把稿件投进草稿箱（T-09）
+- `geopublish ingest <资料>`：产品资料入库，产出 facts.json + REVIEW.md（T-13）
+- `geopublish write <product_id> --query <QID>`：成稿五步，过 R4 自检才落盘（T-14）
 
 退出码约定：
   0 成功（含 SKIPPED_DUPLICATE：已发过，幂等跳过）/ 1 用法错误 / 2 需重新授权 /
@@ -58,6 +60,7 @@ from .core.snapshot import (
 )
 from .publish import DraftLoadError, GateClosed, load_draft, publish_draft
 from .write.ingest import IngestError, ingest
+from .write.pipeline import DraftRejected, PipelineError, load_query_config, write_article
 
 EXIT_OK = 0
 EXIT_USAGE = 1
@@ -68,6 +71,10 @@ EXIT_ENV = 5
 EXIT_FAILED = 6
 
 DEFAULT_SNAPSHOT_DIR = Path("data/snapshots")
+
+# 问句口径与 geo-monitor 同源（PRD R17：不另建问句表）。默认指向本机
+# geo-monitor 技能的配置；不在时要靠 --queries 显式给，不静默猜。
+DEFAULT_QUERIES_PATH = Path.home() / ".workbuddy" / "skills" / "geo-monitor" / "config" / "joto.json"
 
 
 class _ArgumentParser(argparse.ArgumentParser):
@@ -178,6 +185,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="数据根目录（默认 data；产品库落在 <data-dir>/products/<id>/）",
     )
 
+    write_cmd = sub.add_parser("write", help="从产品库生成一篇稿件（T-14 成稿五步，过 R4 自检才落盘）")
+    write_cmd.add_argument("product_id", help="产品库 id（data/products/<id>/，须已回填 REVIEW.md）")
+    write_cmd.add_argument(
+        "--query",
+        required=True,
+        help="锚定问句 id（C/D/S 类需求侧问句；B/P 类品牌词不做，SOV 已 83% 无增量）",
+    )
+    write_cmd.add_argument(
+        "--queries",
+        default=str(DEFAULT_QUERIES_PATH),
+        help=f"问句配置路径（默认 {DEFAULT_QUERIES_PATH}，与 geo-monitor 同源）",
+    )
+    write_cmd.add_argument(
+        "--data-dir",
+        default="data",
+        help="数据根目录（默认 data；稿件落在 <data-dir>/drafts/<slug>/）",
+    )
+    write_cmd.add_argument(
+        "--config",
+        default=str(DEFAULT_CONFIG_PATH),
+        help=f"配置文件路径（默认 {DEFAULT_CONFIG_PATH}，取平台字数/标题/标签上限）",
+    )
+    write_cmd.add_argument("--platform", default="csdn", help="目标平台（默认 csdn）")
+
     return parser
 
 
@@ -197,6 +228,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _publish(args)
     if args.command == "ingest":
         return _ingest(args)
+    if args.command == "write":
+        return _write(args)
 
     # 没给子命令不是「打印帮助然后成功」，是用法错了。
     # 退 0 会让 cron 以为今天跑过了 —— 静默成功比报错危险得多。
@@ -368,6 +401,44 @@ def _ingest(args: argparse.Namespace) -> int:
     print(f"  库位置   = {result.product_dir}")
     print(f"  抽检单   = {result.product_dir / 'REVIEW.md'}")
     print("  ⚠️ 人工回填 REVIEW.md 的 reviewed_by / reviewed_at 后，该产品才进入自动成稿队列")
+    return EXIT_OK
+
+
+def _write(args: argparse.Namespace) -> int:
+    """成稿（T-14）。配置错误退 3；问句非法/产品未抽检/字数撑不够退 1；
+    R4 自检不过退 6 —— 稿子已落盘（含 selfcheck.json），是「改稿」不是「改用法」。
+    """
+    try:
+        cfg = load_config(Path(args.config))
+        platform_cfg = cfg.platform(args.platform)
+    except (ConfigError, KeyError) as exc:
+        print(f"配置错误：{exc}", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
+
+    try:
+        qcfg = load_query_config(Path(args.queries))
+        result = write_article(
+            args.product_id,
+            args.query,
+            data_root=Path(args.data_dir),
+            query_config=qcfg,
+            platform=platform_cfg,
+        )
+    except DraftRejected as exc:
+        print(f"自检未通过：{exc}", file=sys.stderr)
+        for hit in exc.result.hits[:5]:
+            print(f"  [{hit.check}] {hit.term}（{hit.excerpt}）", file=sys.stderr)
+        return EXIT_FAILED
+    except PipelineError as exc:
+        print(f"成稿失败：{exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    print(f"成稿完成：{result.slug}")
+    print(f"  目录     = {result.draft_dir}")
+    print(f"  字数     = {result.word_count}")
+    print(f"  锚定问句 = {args.query}")
+    print(f"  自检     = 通过（{result.selfcheck_path.name}）")
+    print("  下一步   = geopublish publish %s --mode draft" % result.draft_dir)
     return EXIT_OK
 
 

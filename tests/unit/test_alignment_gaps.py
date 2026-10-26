@@ -8,8 +8,8 @@
 断言分三层：
 - 文档层：实施方案里每条补洞用例都带「补 Gx」追溯标记（双向追溯的锚点）；
 - PRD 层：§7 分期表 P4 只写「监测回填」，掘金矛盾不得回归；
-- 代码层：已开工工单（T-03）的补洞用例必须真的在测试代码里。
-  未开工工单（T-10/12/13/14/15/18/19）的用例随各自工单落地，
+- 代码层：已开工工单（T-03、T-14）的补洞用例必须真的在测试代码里。
+  未开工工单（T-10/15/18/19）的用例随各自工单落地，
   由工单 DoD 把关，这里不提前造一堆红测试卡死 CI。
 """
 
@@ -21,6 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 PLAN_PATH = REPO_ROOT / "docs" / "geo-publish-implementation-plan.md"
 PRD_PATH = REPO_ROOT / "docs" / "geo-publish-PRD.md"
 GUARD_TESTS_PATH = REPO_ROOT / "tests" / "unit" / "test_guard.py"
+PIPELINE_TESTS_PATH = REPO_ROOT / "tests" / "unit" / "test_pipeline.py"
 
 # Gx → 该缺口的补洞用例编号（与 alignment-review §3 缺口清单一一对应）。
 # G2 是 DoD 人工抽检清单，不是用例编号，单独在下面测。
@@ -80,3 +81,17 @@ def test_g5_gap_cases_exist_in_test_code(test_name: str):
     """G5 是唯一宿主模块已开工的缺口：两条用例必须在 test_guard.py 里真的存在。"""
     assert test_name in GUARD_TESTS_PATH.read_text(encoding="utf-8"), \
         f"{test_name} 不在 test_guard.py —— G5 的代码层修复丢了"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "test_name",
+    [
+        "test_ut_14_08_body_length_within_platform_range",
+        "test_ut_14_09_entity_density_and_single_canonical_name",
+    ],
+)
+def test_g3_gap_cases_exist_in_test_code(test_name: str):
+    """G3 的宿主工单 T-14 已开工（2026-10-26）：两条用例必须在 test_pipeline.py 里。"""
+    assert test_name in PIPELINE_TESTS_PATH.read_text(encoding="utf-8"), \
+        f"{test_name} 不在 test_pipeline.py —— G3 的代码层修复丢了"
