@@ -1,5 +1,5 @@
 {
-  "version": "2026-10-22.2",
+  "version": "2026-10-26.1",
   "auth": {
     "login_form": ".login-box",
     "challenge": "#captchaImg, img.captcha-img",
@@ -46,6 +46,7 @@
     "draft_list_item": ".article_manage_list a.el_mcm-tooltip__trigger",
     "draft_list_tab": ".nav-link",
     "draft_list_loading": ".article_manage_list .ma-mskLoading",
-    "published_link": "a[href*='article/details']"
+    "published_link": "a[href*='article/details']",
+    "rejection_toast": ".el-message--error .el-message__content"
   }
 }

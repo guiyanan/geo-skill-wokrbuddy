@@ -47,6 +47,7 @@ from ..base import (
     AdapterMeta,
     AuthResult,
     AuthState,
+    ContentRejected,
     CoverError,
     InjectAttempt,
     InjectFailed,
@@ -1119,6 +1120,26 @@ class CsdnAdapter:
             ) from exc
         logger.info("封面已上传：%s（%dx%d，%d 字节）", path.name, width, height, size)
 
+    # ----------------------------------------------------------- T-12 拒稿检测
+
+    def raise_if_rejected(self, page: Page) -> None:
+        """读平台上的拒稿提示（含敏感词/违规 toast），有就抛 `ContentRejected`。
+
+        只做一次即时读，**不等待**：这类提示（Element UI 的 el-message 错误 toast）
+        几秒后自动消失，等它反而可能等到一个已消失的；客户端校验类的拒绝在点击后
+        几乎立刻出现。判定时机紧贴在点击之后（见 submit / _submit_publish）。
+
+        选择器是平台事实，在 selectors.json 的 verify.rejection_toast；
+        形态待真机校准（与 publish-dialog fixture 同流程），契约测试固定在
+        fixtures/csdn/rejected.html 上。
+        """
+        el = page.query_selector(self.selectors("verify", "rejection_toast"))
+        if el is None:
+            return
+        text = (el.text_content() or "").strip()
+        if text:
+            raise ContentRejected(text)
+
     # ----------------------------------------------------------- T-09 提交
 
     def check_content_length(self, page: Page) -> int:
@@ -1181,6 +1202,8 @@ class CsdnAdapter:
             ],
         )
         if not isinstance(outcome, Mapping) or not outcome.get("ok"):
+            # 点保存被拒（含敏感词等）时平台会弹错误 toast：先把原话带出来（T-12）
+            self.raise_if_rejected(page)
             reason = outcome.get("reason") if isinstance(outcome, Mapping) else "保存脚本无返回"
             return SubmitResult(
                 state=SubmitState.UNKNOWN,
@@ -1195,6 +1218,8 @@ class CsdnAdapter:
                 return SubmitResult(
                     state=SubmitState.SUBMITTED, reason=f"点击后页面已变化：{page.url}"
                 )
+            # 页面纹丝不动 + 错误 toast = 平台拒稿：原话必须带出来（T-12）
+            self.raise_if_rejected(page)
             return SubmitResult(
                 state=SubmitState.UNKNOWN,
                 reason=(
@@ -1229,11 +1254,17 @@ class CsdnAdapter:
             _PUBLISH_CLICK_JS, self.selectors("dialog", "confirm_button")
         )
         if not isinstance(outcome, Mapping) or not outcome.get("ok"):
+            # 点发布被拒（含敏感词等）时平台会弹错误 toast：先把原话带出来（T-12）
+            self.raise_if_rejected(page)
             reason = outcome.get("reason") if isinstance(outcome, Mapping) else "点击脚本无返回"
             return SubmitResult(
                 state=SubmitState.UNKNOWN,
                 reason=f"最终「发布文章」没点成（{reason}）：交给 verify 判定",
             )
+
+        # 客户端校验类的拒稿几乎立刻弹 toast（如含敏感词），先判一次再等成功信号——
+        # 不然要等满整个 PUBLISH_TIMEOUT 才罢休，而 toast 早就自动消失了（T-12）
+        self.raise_if_rejected(page)
 
         # 成功形态（待 IT-10-01 真机确认优先级）：跳详情页，或页面长出详情链接
         try:
@@ -1254,6 +1285,8 @@ class CsdnAdapter:
             return SubmitResult(
                 state=SubmitState.SUBMITTED, reason=f"点击后页面已变化：{page.url}"
             )
+        # 所有成功信号都没出现：最后再认一次拒稿 toast（响应慢的拒稿会走到这里）
+        self.raise_if_rejected(page)
         return SubmitResult(
             state=SubmitState.UNKNOWN,
             reason=(

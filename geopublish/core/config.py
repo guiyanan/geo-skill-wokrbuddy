@@ -30,8 +30,10 @@ __all__ = [
 
 DEFAULT_CONFIG_PATH = Path("config/geopublish.json")
 
-# 全局硬上限：同一篇一次运行最多重试 2 次（架构 §3.6），配置只能往小改
-MAX_RETRY = 2
+# 全局硬上限：同一篇一次运行最多重试 3 次（退避 2/4/8s），配置只能往小改。
+# 数值与 core/errors.py 的 RETRY_HARD_CAP 同源（架构 §3.6 矩阵行 + UT-12-04/05）——
+# 架构文档里「单次运行 ≤ 2」是旧口径，T-12 起以实现方案的 UT 为准（3 次）。
+MAX_RETRY = 3
 
 _TOP_LEVEL_KEYS = {"gate", "platforms", "report", "data_dir", "retry_max", "refresh_days"}
 

@@ -233,11 +233,15 @@ def test_publish_success_writes_receipt_csv_and_two_screenshots(tmp_path):
     # R10：before/after 双截图
     assert sorted(p.name for p in shots) == ["after.png", "before.png"]
     assert (run_dir / "before.png").is_file() and (run_dir / "after.png").is_file()
-    # UT-10-02：csv 追加一行且列顺序固定
+    # UT-10-02 + T-11：csv 追加两行（submitting 锚点在前，published 在后）且列顺序固定
     csv_lines = (data_dir / "publish-log.csv").read_text(encoding="utf-8").splitlines()
-    assert len(csv_lines) == 2, f"表头 + 一行数据，实际 {len(csv_lines)} 行"
+    assert len(csv_lines) == 3, f"表头 + submitting + published，实际 {len(csv_lines)} 行"
     assert csv_lines[0] == "ts,platform,account,slug,idem_key,status,url,article_id,screenshot,indexed_at,note"
-    row = dict(zip(csv_lines[0].split(","), csv_lines[1].split(",")))
+    header = csv_lines[0].split(",")
+    submitting = dict(zip(header, csv_lines[1].split(",")))
+    assert submitting["status"] == "submitting", "T-11：点发布前必先落 submitting 锚点"
+    assert submitting["url"] == "", "锚点落盘时还没有 URL（有 URL 的是恢复补记）"
+    row = dict(zip(header, csv_lines[2].split(",")))
     assert row["ts"] == "2026-10-22T10:00:00+08:00"
     assert row["status"] == "published" and row["article_id"] == "1"
     assert outcome.receipt_path == run_dir / "receipt.json"
@@ -416,6 +420,7 @@ def test_publish_mode_passes_the_gate_and_travels_down_as_publish(tmp_path):
     publish_draft(
         adapter, _loaded(tmp_path), _cfg(), gate=Gate.PUBLISH,
         open_page=_opener([])[0], mode="publish",
+        data_dir=tmp_path / "data",  # T-11 起 publish 模式必碰 publish-log.csv，不传会污染真仓库
     )
 
     assert ("submit", "publish") in adapter.calls
@@ -631,7 +636,7 @@ def test_account_falls_back_to_default_when_url_has_no_account_segment(tmp_path)
 
     import csv as _csv
     with open(tmp_path / "data/publish-log.csv", encoding="utf-8", newline="") as fh:
-        rows = list(_csv.DictReader(fh))
+        rows = [r for r in _csv.DictReader(fh) if r["status"] == "published"]
     assert rows[0]["account"] == "default"
     assert rows[0]["article_id"] == "7"
 
@@ -651,7 +656,7 @@ def test_account_fallback_also_covers_article_path_without_account(tmp_path):
 
     import csv as _csv
     with open(tmp_path / "data/publish-log.csv", encoding="utf-8", newline="") as fh:
-        rows = list(_csv.DictReader(fh))
+        rows = [r for r in _csv.DictReader(fh) if r["status"] == "published"]
     assert rows[0]["account"] == "default"
     assert rows[0]["article_id"] == "9"
 

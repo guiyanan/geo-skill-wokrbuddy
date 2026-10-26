@@ -76,10 +76,20 @@ def test_secrets_not_committed():
 
 @pytest.mark.unit
 def test_no_captcha_code_in_source():
-    """红线元测试：源码中不得出现验证码处理实现。"""
+    """红线元测试（UT-12-06）：源码中不得出现验证码识别/绕过/破解实现。
+
+    词表与 .precommit/check_no_captcha_code.py 对齐（T-12 起含 solve/bypass 等），
+    两处任何一处加词，另一处必须同步 —— 这道门禁的价值正在于「一刀切、不给例外」。
+    本测试是 CI 里的冗余保险：即使提交时跳过 pre-commit，CI 也会拦下。
+    """
     import re
 
-    tokens = ["capt" + "cha", "gee" + "test", "yi" + "dun", "ddd" + "docr"]
+    tokens = [
+        "capt" + "cha", "gee" + "test", "yi" + "dun", "sli" + "der", "slide_",
+        "verify_" + "code", "verify" + "code", "byp" + "ass", "cra" + "ck",
+        r"\bsolve_", "anti_" + "bot", "anti" + "bot", "yo" + "lo",
+        "dddd" + "ocr", "muggle_" + "ocr",
+    ]
     pattern = re.compile("|".join(tokens), re.IGNORECASE)
     for py in (REPO_ROOT / "geopublish").rglob("*.py"):
         if ".precommit" in str(py):

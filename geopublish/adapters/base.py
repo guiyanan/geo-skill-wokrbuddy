@@ -45,6 +45,7 @@ __all__ = [
     "REQUIRED_SELECTORS",
     "SelectorError",
     "Selectors",
+    "ContentRejected",
     "SubmitBlocked",
     "SubmitMode",
     "SubmitResult",
@@ -224,6 +225,19 @@ class SubmitBlocked(RuntimeError):
     发出去的是残稿。「拦在按钮之前」是这条异常唯一的价值，所以它不是普通的失败：
     失败可以重试，拦下来是**保护**。
     """
+
+
+class ContentRejected(RuntimeError):
+    """平台明确拒稿（含敏感词/违规提示），携带平台提示原文。
+
+    与 SubmitBlocked 的分工：Blocked 是「我们自己拦下的，一个按钮都没点」；
+    Rejected 是「点了，平台说不」。稿子没发出去，但平台原话必须留住——
+    改稿的人要看的正是这一句（T-12：原文回写进 publish-log 与稿件目录）。
+    """
+
+    def __init__(self, platform_text: str) -> None:
+        self.platform_text = str(platform_text).strip()
+        super().__init__(f"平台拒绝发布：{self.platform_text or '（无提示原文）'}")
 
 
 # --------------------------------------------------------------- 页面抽象

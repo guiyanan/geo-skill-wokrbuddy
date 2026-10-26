@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>写文章-CSDN博客</title>
+</head>
+<body>
+  <!-- 平台拒稿现场（T-12）：点了「发布文章」，平台弹出错误 toast。
+       结构按 CSDN 创作后台所用 Element UI 的 el-message 错误形态构造
+       （div.el-message.el-message--error > p.el-message__content），
+       **待真机校准**——真机上撞一次拒稿后，用 geopublish snapshot 重建本文件，
+       流程同 publish-dialog.html 的 2026-10-22 校准。 -->
+  <div class="el-message el-message--error" role="alert">
+    <i class="el-message__icon el-icon-error"></i>
+    <p class="el-message__content">发布失败：内容包含敏感词，请修改后重新发布</p>
+  </div>
+</body>
+</html>

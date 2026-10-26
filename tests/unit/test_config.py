@@ -85,7 +85,7 @@ def test_ut_01_02_daily_limit_out_of_range(bad):
 
 @pytest.mark.parametrize("bad", [-1, MAX_RETRY + 1])
 def test_ut_01_02_retry_max_out_of_range(bad):
-    """重试上限是全局硬规则（同篇 ≤2 次），配置不许放宽。"""
+    """重试上限是全局硬规则（同篇单次运行 ≤3 次，T-12 起与 RETRY_HARD_CAP 同源），配置不许放宽。"""
     with pytest.raises(ConfigError) as exc:
         Config.from_dict(payload(retry_max=bad))
 
