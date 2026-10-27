@@ -841,3 +841,231 @@ def test_publish_guard_rejected_is_exit_6(tmp_path, capsys, config_file):
     err = capsys.readouterr().err
     assert code == EXIT_FAILED
     assert "R4 自检未通过" in err and "absolute" in err
+
+
+# ------------------------------------------------- T-17：map / pick
+
+T17_QUERIES = {
+    "brand": {
+        "name": "上海聚托",
+        "aliases": ["上海聚托", "聚托科技", "聚托", "JOTO"],
+        "products": ["DeepParser"],
+    },
+    "queries": [
+        {"id": "B01", "text": "上海聚托 是什么公司", "intent": "认知", "priority": "P0"},
+        {"id": "C01", "text": "国内有哪些 AI 文档解析工具", "intent": "评估", "priority": "P0"},
+        {"id": "D01", "text": "中小企业怎么选 AI 解决方案供应商", "intent": "决策", "priority": "P0"},
+        {"id": "S01", "text": "PDF 里的表格怎么自动提取成结构化数据", "intent": "场景", "priority": "P0"},
+    ],
+}
+
+# 测试替身脚本：pick 的真实排序依赖 geo-master，CI 上没有它；
+# CLI 层要验的是「接线正确」，不是打分公式（那是 picker 单测的事）
+FAKE_PRIORITIZER = '''
+def prioritize(rows):
+    out = []
+    for i, r in enumerate(rows):
+        out.append({"缺口": r["缺口"], "优先级分": 100.0 - i,
+                    "档位": "P0 立即做", "象限": "攻坚区", "处理": "x"})
+    return out
+'''
+
+
+def _t17_env(tmp_path):
+    """一套可跑 pick 的最小环境：已抽检产品 + 问句表 + 监测样本 + 替身打分脚本。"""
+    import re
+
+    from geopublish.core.clock import FakeClock
+    from geopublish.write.ingest import ingest
+
+    data_dir = tmp_path / "data"
+    (data_dir / "products").mkdir(parents=True)
+    result = ingest(
+        REPO_ROOT / "fixtures" / "products" / "deepparser-pitch.md",
+        "deepparser",
+        data_dir,
+        clock=FakeClock("2026-10-26T10:00:00+08:00"),
+    )
+    review = result.product_dir / "REVIEW.md"
+    text = review.read_text(encoding="utf-8")
+    text = re.sub(r"^reviewed_by:[ \t]*$", "reviewed_by: 拾一米", text, count=1, flags=re.M)
+    text = re.sub(
+        r"^reviewed_at:[ \t]*$", "reviewed_at: 2026-10-26T10:00:00+08:00", text, count=1, flags=re.M
+    )
+    review.write_text(text, encoding="utf-8")
+
+    queries = tmp_path / "joto.json"
+    queries.write_text(json.dumps(T17_QUERIES, ensure_ascii=False), encoding="utf-8")
+    samples = tmp_path / "samples.json"
+    samples.write_text(
+        json.dumps(
+            [
+                {"query_id": "C01", "cited": True, "mentioned": True, "competitors_seen": []},
+                {"query_id": "D01", "cited": True, "mentioned": True, "competitors_seen": []},
+                {"query_id": "S01", "cited": False, "mentioned": False, "competitors_seen": []},
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    prio = tmp_path / "fake_prioritizer.py"
+    prio.write_text(FAKE_PRIORITIZER, encoding="utf-8")
+    return data_dir, queries, samples, prio
+
+
+def test_map_writes_qa_json(tmp_path, capsys):
+    data_dir, queries, _, _ = _t17_env(tmp_path)
+    code = main(["map", "deepparser", "--queries", str(queries), "--data-dir", str(data_dir)])
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    qa = json.loads((data_dir / "products" / "deepparser" / "qa.json").read_text(encoding="utf-8"))
+    assert qa["product_id"] == "deepparser"
+    assert qa["queries"] and qa["queries"][0]["query_id"] == "S01"
+    assert "人工增删" in out
+
+
+def test_map_unknown_product_is_usage_error(tmp_path, capsys):
+    _, queries, _, _ = _t17_env(tmp_path)
+    code = main(["map", "ghost", "--queries", str(queries), "--data-dir", str(tmp_path / "data")])
+    assert code == EXIT_USAGE
+    assert "产品库不存在" in capsys.readouterr().err
+
+
+def test_map_missing_queries_is_usage_error(tmp_path, capsys):
+    data_dir, _, _, _ = _t17_env(tmp_path)
+    code = main(
+        ["map", "deepparser", "--queries", str(tmp_path / "nope.json"), "--data-dir", str(data_dir)]
+    )
+    assert code == EXIT_USAGE
+    assert "问句配置" in capsys.readouterr().err
+
+
+def _pick_args(cfg, queries, samples, prio):
+    return [
+        "pick", "--config", str(cfg), "--queries", str(queries),
+        "--samples", str(samples), "--prioritizer", str(prio),
+    ]
+
+
+def test_pick_happy_path_picks_and_traces(tmp_path, capsys, config_file):
+    data_dir, queries, samples, prio = _t17_env(tmp_path)
+    assert main(["map", "deepparser", "--queries", str(queries), "--data-dir", str(data_dir)]) == EXIT_OK
+    capsys.readouterr()
+    cfg = config_file(data_dir=str(data_dir))
+    code = main(_pick_args(cfg, queries, samples, prio))
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "今日选题：S01" in out and "deepparser" in out
+    traces = list((data_dir / "select").glob("*.json"))
+    assert len(traces) == 1
+    payload = json.loads(traces[0].read_text(encoding="utf-8"))
+    assert payload["status"] == "picked" and payload["choice"]["query_id"] == "S01"
+
+
+def test_pick_no_topic_exits_0_and_leaves_trace(tmp_path, capsys, config_file):
+    data_dir, queries, samples, prio = _t17_env(tmp_path)  # 不跑 map → 无任何 qa 映射
+    cfg = config_file(data_dir=str(data_dir))
+    code = main(_pick_args(cfg, queries, samples, prio))
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "no_topic" in out
+    traces = list((data_dir / "select").glob("*.json"))
+    assert len(traces) == 1
+    payload = json.loads(traces[0].read_text(encoding="utf-8"))
+    assert payload["status"] == "no_topic"
+    assert payload["exclusions"], "no_topic 必须留排除原因，日报要靠它写"
+
+
+def test_pick_missing_samples_is_usage_error(tmp_path, capsys, config_file):
+    data_dir, queries, _, prio = _t17_env(tmp_path)
+    cfg = config_file(data_dir=str(data_dir))
+    code = main(_pick_args(cfg, queries, tmp_path / "nope.json", prio))
+    assert code == EXIT_USAGE
+    assert "监测样本" in capsys.readouterr().err
+
+
+def test_pick_missing_prioritizer_is_env_error(tmp_path, capsys, config_file):
+    data_dir, queries, samples, _ = _t17_env(tmp_path)
+    cfg = config_file(data_dir=str(data_dir))
+    code = main(_pick_args(cfg, queries, samples, tmp_path / "nope.py"))
+    assert code == EXIT_ENV
+    assert "gap_prioritizer" in capsys.readouterr().err
+
+
+def test_pick_bad_config_is_config_error(tmp_path, capsys):
+    code = main(["pick", "--config", str(tmp_path / "nope.json")])
+    assert code == EXIT_CONFIG_ERROR
+
+
+def test_pick_unknown_platform_is_config_error(tmp_path, capsys, config_file):
+    data_dir, queries, samples, prio = _t17_env(tmp_path)
+    cfg = config_file(data_dir=str(data_dir))
+    code = main(_pick_args(cfg, queries, samples, prio) + ["--platform", "juejin"])
+    assert code == EXIT_CONFIG_ERROR
+
+
+def test_pick_twice_same_day_is_refused(tmp_path, capsys, config_file):
+    data_dir, queries, samples, prio = _t17_env(tmp_path)
+    main(["map", "deepparser", "--queries", str(queries), "--data-dir", str(data_dir)])
+    cfg = config_file(data_dir=str(data_dir))
+    assert main(_pick_args(cfg, queries, samples, prio)) == EXIT_OK
+    code = main(_pick_args(cfg, queries, samples, prio))
+    assert code == EXIT_USAGE
+    assert "已存在" in capsys.readouterr().err
+
+
+def test_pick_missing_queries_is_usage_error(tmp_path, capsys, config_file):
+    data_dir, _, samples, prio = _t17_env(tmp_path)
+    cfg = config_file(data_dir=str(data_dir))
+    code = main(_pick_args(cfg, tmp_path / "nope.json", samples, prio))
+    assert code == EXIT_USAGE
+    assert "问句配置" in capsys.readouterr().err
+
+
+# 6 条可锚定问句，用来触发「超出 5 条打省略号」的分支
+T17_BIG_QUERIES = {
+    **T17_QUERIES,
+    "queries": T17_QUERIES["queries"]
+    + [
+        {"id": "C02", "text": "文档解析工具怎么选", "intent": "评估", "priority": "P1"},
+        {"id": "D02", "text": "文档解析 SDK 怎么集成", "intent": "决策", "priority": "P1"},
+        {"id": "S02", "text": "扫描件表格提取有什么方案", "intent": "场景", "priority": "P1"},
+        {"id": "S03", "text": "合同文档里的表格怎么批量提取", "intent": "场景", "priority": "P1"},
+        {"id": "C03", "text": "PDF 文档怎么转成结构化数据", "intent": "评估", "priority": "P1"},
+    ],
+}
+
+
+def test_map_more_than_five_rows_prints_ellipsis(tmp_path, capsys):
+    data_dir, _, _, _ = _t17_env(tmp_path)
+    big = tmp_path / "big.json"
+    big.write_text(json.dumps(T17_BIG_QUERIES, ensure_ascii=False), encoding="utf-8")
+    code = main(["map", "deepparser", "--queries", str(big), "--data-dir", str(data_dir)])
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    qa = json.loads((data_dir / "products" / "deepparser" / "qa.json").read_text(encoding="utf-8"))
+    assert len(qa["queries"]) > 5, "这个用例的前提：映射结果必须超过 5 条"
+    assert "其余" in out
+
+
+def test_pick_no_topic_more_than_five_exclusions_prints_ellipsis(tmp_path, capsys, config_file):
+    data_dir, _, samples, prio = _t17_env(tmp_path)  # 不跑 map → 全部 no_mapping
+    big = tmp_path / "big.json"
+    big.write_text(json.dumps(T17_BIG_QUERIES, ensure_ascii=False), encoding="utf-8")
+    cfg = config_file(data_dir=str(data_dir))
+    code = main(_pick_args(cfg, big, samples, prio))
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "no_topic" in out and "其余" in out
+
+
+def test_pick_corrupted_facts_degrades_to_no_topic(tmp_path, capsys, config_file):
+    """facts.json 损坏：可达性计数降级为 0，真被映射时由 load_product 喊出来。"""
+    data_dir, queries, samples, prio = _t17_env(tmp_path)
+    main(["map", "deepparser", "--queries", str(queries), "--data-dir", str(data_dir)])
+    (data_dir / "products" / "deepparser" / "facts.json").write_text("{坏了", encoding="utf-8")
+    cfg = config_file(data_dir=str(data_dir))
+    code = main(_pick_args(cfg, queries, samples, prio))
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "no_topic" in out and "不可用" in out

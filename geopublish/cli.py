@@ -10,6 +10,8 @@
 - `geopublish ingest <资料>`：产品资料入库，产出 facts.json + REVIEW.md（T-13）
 - `geopublish write <product_id> --query <QID>`：成稿五步，过 R4 自检才落盘（T-14）
 - `geopublish cover <draft_dir>`：封面生成（T-15）；`--approve --by 名字` 落人工抽检结论（G2）
+- `geopublish map <product_id>`：生成 qa.json 问句映射（T-17，启发式预填，人工增删后生效）
+- `geopublish pick`：每日选题（T-17）：geo-monitor 缺口 × gap_prioritizer 打分 × 产品库映射
 
 退出码约定：
   0 成功（含 SKIPPED_DUPLICATE：已发过，幂等跳过）/ 1 用法错误 / 2 需重新授权 /
@@ -31,6 +33,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -60,6 +63,18 @@ from .core.snapshot import (
     capture,
 )
 from .publish import DraftLoadError, GateClosed, load_draft, publish_draft
+from .core.state import PublishLog
+from .select.picker import (
+    PickerError,
+    build_gaps,
+    latest_samples_path,
+    load_prioritizer,
+    load_qa_index,
+    load_samples,
+    pick_topic,
+    save_trace,
+    write_qa_matrix,
+)
 from .write.cover import (
     CoverNotApproved,
     CoverRenderError,
@@ -257,6 +272,48 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cover_cmd.add_argument("--by", default=None, help="抽检人姓名（--approve 时必填，留痕用）")
 
+    map_cmd = sub.add_parser(
+        "map",
+        help="为产品生成 qa.json 问句映射（T-17：bigram 启发式预填，人工增删后才该被采信）",
+    )
+    map_cmd.add_argument("product_id", help="产品库 id（data/products/<id>/，须已入库）")
+    map_cmd.add_argument(
+        "--queries",
+        default=str(DEFAULT_QUERIES_PATH),
+        help=f"问句配置路径（默认 {DEFAULT_QUERIES_PATH}，与 geo-monitor 同源）",
+    )
+    map_cmd.add_argument(
+        "--data-dir",
+        default="data",
+        help="数据根目录（默认 data；qa.json 落在 <data-dir>/products/<id>/）",
+    )
+
+    pick_cmd = sub.add_parser(
+        "pick",
+        help="每日选题（T-17）：geo-monitor 缺口 × geo-master 打分 × 产品库映射，留痕 data/select/",
+    )
+    pick_cmd.add_argument(
+        "--config",
+        default=str(DEFAULT_CONFIG_PATH),
+        help=f"配置文件路径（默认 {DEFAULT_CONFIG_PATH}，取 data_dir 与 refresh_days）",
+    )
+    pick_cmd.add_argument(
+        "--queries",
+        default=str(DEFAULT_QUERIES_PATH),
+        help=f"问句配置路径（默认 {DEFAULT_QUERIES_PATH}，与 geo-monitor 同源）",
+    )
+    pick_cmd.add_argument(
+        "--samples",
+        default=None,
+        help="geo-monitor 的 samples.json（缺省自动取最新一期）",
+    )
+    pick_cmd.add_argument("--platform", default="csdn", help="平台名（默认 csdn）")
+    pick_cmd.add_argument(
+        "--prioritizer",
+        default=None,
+        help="gap_prioritizer.py 路径（缺省用本机 geo-master 技能内的；排序不许自建）",
+    )
+
     return parser
 
 
@@ -280,6 +337,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _write(args)
     if args.command == "cover":
         return _cover(args)
+    if args.command == "map":
+        return _map(args)
+    if args.command == "pick":
+        return _pick(args)
 
     # 没给子命令不是「打印帮助然后成功」，是用法错了。
     # 退 0 会让 cron 以为今天跑过了 —— 静默成功比报错危险得多。
@@ -554,6 +615,100 @@ def _cover(args: argparse.Namespace) -> int:
     print("  ⚠️ 打开预览页人工核对两项（标题无错别字 / 主视觉无水印），通过后：")
     print(f"     geopublish cover {result.draft_dir} --approve --by <你的名字>")
     print("     未确认的封面不进入发布流程（G2）")
+    return EXIT_OK
+
+
+def _map(args: argparse.Namespace) -> int:
+    """生成 qa.json 问句映射（T-17）。产物是启发式预填稿，必须提醒人工增删。"""
+    try:
+        qcfg = load_query_config(Path(args.queries))
+        path = write_qa_matrix(args.product_id, Path(args.data_dir), qcfg)
+    except (PipelineError, PickerError) as exc:
+        print(f"用法错误：{exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    rows = data["queries"]
+    print(f"问句映射已生成：{path}")
+    print(f"  可锚定问句 = {len(rows)} 条")
+    for row in rows[:5]:
+        print(f"    - {row['query_id']}（{row['score']} 个命中：{'、'.join(row['matched'][:6])}）")
+    if len(rows) > 5:
+        print(f"    … 其余 {len(rows) - 5} 条见文件")
+    print("  ⚠️ 这是 bigram 启发式预填稿：请人工增删后再交给 pick 采信")
+    return EXIT_OK
+
+
+def _facts_count(data_dir: Path, product_id: str) -> int:
+    """产品的事实数（只影响「可达性」打分）。文件坏了返回 0——真被选中时
+    load_product 会把损坏喊出来，这里不抢它的台词。"""
+    path = Path(data_dir) / "products" / product_id / "facts.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 0
+    return len(data.get("facts") or [])
+
+
+def _pick(args: argparse.Namespace) -> int:
+    """每日选题（T-17）。退出码：配置 3 / 输入与数据问题 1 / geo-master 缺失 5；
+    no_topic 退 0——「今天没的可写」是合法结论，会在留痕与日报里写清原因。"""
+    try:
+        cfg = load_config(Path(args.config))
+        platform_cfg = cfg.platform(args.platform)
+    except (ConfigError, KeyError) as exc:
+        print(f"配置错误：{exc}", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
+    try:
+        qcfg = load_query_config(Path(args.queries))
+    except PipelineError as exc:
+        print(f"用法错误：{exc}", file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        samples_path = Path(args.samples) if args.samples else latest_samples_path()
+        samples = load_samples(samples_path)
+        qa_index = load_qa_index(cfg.data_dir / "products", qcfg)
+    except PickerError as exc:
+        print(f"用法错误：{exc}", file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        prioritize = load_prioritizer(args.prioritizer)
+    except PickerError as exc:
+        print(f"环境不可用：{exc}", file=sys.stderr)
+        return EXIT_ENV
+
+    gaps = build_gaps(samples, qcfg, qa_index, facts_count=lambda pid: _facts_count(cfg.data_dir, pid))
+    try:
+        result = pick_topic(
+            gaps,
+            query_config=qcfg,
+            qa_index=qa_index,
+            log=PublishLog(cfg.data_dir / "publish-log.csv"),
+            platform=platform_cfg.key,
+            refresh_days=cfg.refresh_days,
+            data_root=cfg.data_dir,
+            prioritize=prioritize,
+        )
+        trace = save_trace(cfg.data_dir, result)
+    except PickerError as exc:
+        print(f"选题失败：{exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    if result.choice is None:
+        print(f"今日无选题（no_topic）：{len(result.gaps)} 条缺口全部出局或清单为空")
+        for exc in result.exclusions[:5]:
+            print(f"  - {exc.query_id}: {exc.reason}")
+        if len(result.exclusions) > 5:
+            print(f"  … 其余 {len(result.exclusions) - 5} 条见留痕")
+        print(f"  留痕 = {trace}")
+        return EXIT_OK
+
+    choice = result.choice
+    print(f"今日选题：{choice.query_id} —— {choice.query_text}")
+    print(f"  产品     = {choice.product_id}")
+    print(f"  档位     = {choice.tier}（{choice.score} 分 · {choice.quadrant}）")
+    print(f"  留痕     = {trace}")
+    print(f"  下一步   = geopublish write {choice.product_id} --query {choice.query_id}")
     return EXIT_OK
 
 
