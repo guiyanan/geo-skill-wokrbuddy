@@ -8,9 +8,16 @@
 # 心跳监控那行：--check-heartbeat 超 26h 无运行退 6。这里用最朴素的
 # 「非零就写日志」，接外部监控（如 cron 的 MAILTO、或任何 healthcheck 服务）
 # 时把 echo 换成对应的上报命令。
+#
+# T-19 邮件推送：SMTP 凭据放 ~/.config/geopublish/smtp.env（chmod 600，不进 git），
+# schedule 行前用 `.` source 进来。文件内容（值换成自己的）：
+#   export GEOPUBLISH_SMTP_HOST=smtp.resend.com
+#   export GEOPUBLISH_SMTP_USER=resend
+#   export GEOPUBLISH_SMTP_PASSWORD=<Resend API Key 或邮箱授权码>
+#   export GEOPUBLISH_SMTP_FROM=no-reply@你的域名
 
 REPO=/Users/shiyimi/WorkBuddy/2026-10-20-16-34-21
 PY=/Users/shiyimi/.workbuddy/binaries/python/envs/default/bin/python
 
-0 10,15 * * * cd "$REPO" && "$PY" -m geopublish schedule >> data/schedule/cron.log 2>&1
+0 10,15 * * * cd "$REPO" && . "$HOME/.config/geopublish/smtp.env" && "$PY" -m geopublish schedule >> data/schedule/cron.log 2>&1
 0 * * * * cd "$REPO" && "$PY" -m geopublish schedule --check-heartbeat || echo "$(date) geopublish 调度心跳异常" >> data/schedule/heartbeat-alert.log

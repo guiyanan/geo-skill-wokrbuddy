@@ -14,6 +14,9 @@
      发车），但心跳要刷新；否则周末两天不跑，周一心跳监控（26h 阈值）必定误报。
   2. 10:00 / 15:00 两个时刻对齐 config/geopublish.json 里各平台的 publish_at
      （当前只有 csdn 10:00；15:00 给将来的掘金预留）。改了 publish_at 要同步改这里。
+  3. T-19 邮件推送：SMTP 凭据在 ~/.config/geopublish/smtp.env（chmod 600，不进 git）。
+     launchd 不能 source 文件，所以入口用 sh -c 包一层先 source 再 exec。
+     没有 smtp.env 也能跑：推送自动记 skipped，不影响发布（R18 推送要求 2）。
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -22,10 +25,9 @@
     <string>com.joto.geopublish.schedule</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/shiyimi/.workbuddy/binaries/python/envs/default/bin/python</string>
-        <string>-m</string>
-        <string>geopublish</string>
-        <string>schedule</string>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>. "$HOME/.config/geopublish/smtp.env" 2>/dev/null; exec /Users/shiyimi/.workbuddy/binaries/python/envs/default/bin/python -m geopublish schedule</string>
     </array>
     <key>WorkingDirectory</key>
     <string>/Users/shiyimi/WorkBuddy/2026-10-20-16-34-21</string>
