@@ -190,7 +190,7 @@ geo-publish/
 **P3 · 无人值守**
 ```
 - [x] T-17  选题串联 geo-master
-- [ ] T-18  每日调度（两阶段）
+- [x] T-18  每日调度（两阶段）
 - [ ] T-19  日报与邮件推送
 - [ ] T-20  节奏控制
 - [ ] T-22  干预通道
@@ -1046,6 +1046,27 @@ CLI 无 `--skip-guard` 类参数，UT-16-03 走参数表递归断言钉死。
 **DoD（P3 验收）**：连续 5 个工作日无人干预，每天有日报，且 `IT-18-01` 通过
 
 **已知失败模式**：调度进程挂了没人知道 → UT-18-04 强制 finally 出日报；再加"心跳"，超过 26 小时无运行记录则告警
+
+**实施记录（2026-10-28，IT-18-01 通过；1053 测试全绿，4432 语句/1218 分支全 100%，静态门禁过）**
+
+| 项 | 结果 |
+|---|---|
+| 文件 | `schedule/scheduler.py`（325 语句/76 分支 100%）、`schedule/__init__.py`、`core/guard.py` 增 `check_rate`/`published_in_window`（T-20 直接复用）、CLI 新增 `schedule` + `--check-heartbeat`、`deploy/com.joto.geopublish.schedule.plist`、`deploy/crontab.example`、`tests/unit/test_scheduler.py`（61 条）、`test_cli.py` +13 条、`tests/integration/test_schedule_five_days.py`（IT-18-01） |
+| 用例 | UT-18-01~05 全绿 + IT-18-01：假时钟快进 2026-10-26~30 五个工作日，5 份日报、应发/实发字段完整；第 3 天注入平台拒稿（needs_human 行 + CONTENT_REJECTED），当日日报体现、第 4 天 unresolved 携带且不自动重试、topic-5 当天入队当天未发（两阶段成立） |
+
+**五处设计取舍**
+
+1. **日报形态是 `data/reports/<date>.json`（机器可读）**，md 渲染与邮件推送留给 T-19。字段契约：`expected`/`published`（应发/实发）由 dispatches 汇总，不许手填；同日多次运行合并（已发车平台不重发，标记就在日报里）。
+2. **两阶段红线 = `queued_at < 今天`**：发布阶段只碰昨天及以前入队的稿，prepare（pick→write）入队的明天才发——R18.1 的人工干预窗口就靠这一天。队列文件 `data/queue.json`（原子写），T-22 的 hold/edit/pause 在此之上扩展状态。
+3. **节奏检查提前落在 `core/guard.check_rate`**（T-20 的交付位置）：调度触发与手动发布同一条检查，24h 滚动窗口按 idem_key 去重（崩溃恢复补的 published 行不双计），到阈值跳过且原因写进日报（G6）。
+4. **心跳 + `--check-heartbeat`（26h 阈值，超龄退 6）**：「进程没跑」日报自己说不出话，只能靠心跳。cron/launchd **每天跑含周末**——周末调度器自跳过（工作日=周一至周五，无节假日历，要停用 T-22 pause），但心跳照刷，防周一误报。
+5. **运营时区固定 +08:00**（`SCHEDULE_TZ`，可注入）：「工作日 10:00」指北京时间，与机器/CI 所在时区无关。prepare 目标平台取 publish_at 最早的启用平台（选题留痕按天唯一，天然一天一篇；多平台各写一篇是后续工单）。
+
+**已知边界**
+
+- 发布失败的操作异常（GateClosed/LockError/AuthRequired/适配器错误）记日报、留队、次日再来；不认识的异常原样抛出（bug 不许吞），finally 保证日报落盘。
+- DoD「连续 5 个工作日无人干预」由 IT-18-01 假时钟验收；真实环境 5 天观察自部署 launchd 后起算（待跑）。
+- T-15 封面 DoD 仍欠人工 approve；调度发布的稿件走无封面路径（封面审批闸只拦有封面未过审的）。
 
 ---
 
