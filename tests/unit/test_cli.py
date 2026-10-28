@@ -1520,3 +1520,348 @@ def test_schedule_real_wiring_prepare_prepared(tmp_path, capsys, config_file, mo
     assert item["queued_at"].startswith("2026-10-26")
     # 选题留痕也落了（同日重跑的防重哨兵）
     assert (data_dir / "select" / "2026-10-26.json").exists()
+
+
+# ================================================================ T-19 日报与邮件推送
+import smtplib  # noqa: E402
+
+from geopublish.core.notify import NotifyRecord, NotifyState, load_notify_state  # noqa: E402
+from geopublish.schedule.scheduler import (  # noqa: E402
+    DayReport,
+    Dispatch,
+    DispatchItemResult,
+    Unresolved,
+    save_report,
+)
+
+_T19_DAY = "2026-10-27"  # 周二
+_T19_NOW = f"{_T19_DAY}T10:05:00+08:00"
+_T19_SMTP_ENV = {
+    "GEOPUBLISH_SMTP_HOST": "smtp.example.com",
+    "GEOPUBLISH_SMTP_USER": "bot@example.com",
+    "GEOPUBLISH_SMTP_PASSWORD": "授权码",
+    "GEOPUBLISH_SMTP_FROM": "bot@example.com",
+}
+
+
+class _T19FakeSMTP:
+    instances: list = []
+    fail_send: bool = False
+
+    def __init__(self, host, port, timeout=None):
+        self.host, self.port = host, port
+        self.messages: list = []
+        _T19FakeSMTP.instances.append(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def starttls(self):
+        pass
+
+    def login(self, user, password):
+        pass
+
+    def send_message(self, msg):
+        if _T19FakeSMTP.fail_send:
+            raise smtplib.SMTPException("550 发送被拒")
+        self.messages.append(msg)
+
+
+@pytest.fixture
+def _t19_smtp(monkeypatch):
+    for k, v in _T19_SMTP_ENV.items():
+        monkeypatch.setenv(k, v)
+    _T19FakeSMTP.instances = []
+    _T19FakeSMTP.fail_send = False
+    monkeypatch.setattr(smtplib, "SMTP_SSL", _T19FakeSMTP)
+    return _T19FakeSMTP
+
+
+@pytest.fixture
+def _t19_no_smtp(monkeypatch):
+    for k in _T19_SMTP_ENV:
+        monkeypatch.delenv(k, raising=False)
+
+
+def _t19_all_mails():
+    """每封邮件一条 SMTP 连接（各自一个实例），汇总全部实例的收件。"""
+    return [m for inst in _T19FakeSMTP.instances for m in inst.messages]
+
+
+def _t19_report(data_dir, *, day=_T19_DAY, workday=True, dispatches=(), unresolved=(), error=None):
+    report = DayReport(
+        date=day,
+        workday=workday,
+        generated_at=f"{day}T10:00:00+08:00",
+        updated_at=f"{day}T10:05:00+08:00",
+        dispatches=list(dispatches),
+        unresolved=list(unresolved),
+        error=error,
+    )
+    save_report(data_dir, report, FakeClock(f"{day}T23:00:00+08:00"))
+    return report
+
+
+def _t19_dispatch(slug="a-1", result="published", url="https://blog.csdn.net/x/1", **kw):
+    item = DispatchItemResult(slug=slug, result=result, url=url, reason=kw.pop("reason", ""))
+    return Dispatch(
+        platform="csdn", publish_at="10:00", due=True, dispatched=True,
+        planned=kw.pop("planned", 1), published=kw.pop("published", 1),
+        dispatched_at="10:05", items=[item],
+    )
+
+
+def _t19_meta(data_dir, slug, title="测试标题"):
+    d = data_dir / "drafts" / slug
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "meta.json").write_text(json.dumps({"slug": slug, "title": title}), encoding="utf-8")
+
+
+def test_report_bad_config_exit_3(tmp_path, capsys):
+    assert main(["report", "--config", str(tmp_path / "nope.json")]) == EXIT_CONFIG_ERROR
+    assert "配置错误" in capsys.readouterr().err
+
+
+def test_report_bad_date_exit_1(tmp_path, capsys, config_file):
+    cfg, _ = _t18_config(config_file, tmp_path)
+    assert main(["report", "--config", str(cfg), "--date", "10/27"]) == EXIT_USAGE
+    assert "YYYY-MM-DD" in capsys.readouterr().err
+
+
+def test_report_missing_report_exit_1(tmp_path, capsys, config_file):
+    cfg, _ = _t18_config(config_file, tmp_path)
+    # 不给 --date：默认按运营时区取今天，今天当然没有日报
+    assert main(["report", "--config", str(cfg)]) == EXIT_USAGE
+    assert "先跑 geopublish schedule" in capsys.readouterr().err
+
+
+def test_report_corrupt_report_exit_3(tmp_path, capsys, config_file):
+    cfg, data_dir = _t18_config(config_file, tmp_path)
+    (data_dir / "reports").mkdir(exist_ok=True)
+    (data_dir / "reports" / f"{_T19_DAY}.json").write_text("{oops", encoding="utf-8")
+    assert main(["report", "--config", str(cfg), "--date", _T19_DAY]) == EXIT_CONFIG_ERROR
+    assert "数据错误" in capsys.readouterr().err
+
+
+def test_report_render_failure_exit_3(tmp_path, capsys, config_file):
+    """四问渲染不出来（published 稿件的 meta.json 丢了）→ 数据错误，不发残报。"""
+    cfg, data_dir = _t18_config(config_file, tmp_path)
+    _t19_report(data_dir, dispatches=[_t19_dispatch()])
+    assert main(["report", "--config", str(cfg), "--date", _T19_DAY]) == EXIT_CONFIG_ERROR
+    assert "读不到 meta.json" in capsys.readouterr().err
+
+
+def test_report_corrupt_queue_exit_3(tmp_path, capsys, config_file):
+    cfg, data_dir = _t18_config(config_file, tmp_path)
+    _t19_report(data_dir)
+    (data_dir / "queue.json").write_text("{oops", encoding="utf-8")
+    assert main(["report", "--config", str(cfg), "--date", _T19_DAY]) == EXIT_CONFIG_ERROR
+    assert "数据错误" in capsys.readouterr().err
+
+
+def test_report_render_only_exit_0(tmp_path, capsys, config_file, _t19_no_smtp):
+    cfg, data_dir = _t18_config(config_file, tmp_path)
+    _t19_meta(data_dir, "a-1", "文档解析为什么是 RAG 的第一道工序")
+    _t19_report(data_dir, dispatches=[_t19_dispatch()])
+
+    code = main(["report", "--config", str(cfg), "--date", _T19_DAY])
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "[JOTO GEO] 10-27 发布 1/1 · csdn" in out
+    md = (data_dir / "reports" / f"{_T19_DAY}.md").read_text(encoding="utf-8")
+    assert "[文档解析为什么是 RAG 的第一道工序](https://blog.csdn.net/x/1)" in md
+
+
+def test_report_send_without_smtp_env_exit_3(tmp_path, capsys, config_file, _t19_no_smtp):
+    cfg, data_dir = _t18_config(config_file, tmp_path)
+    _t19_report(data_dir)
+    code = main(["report", "--config", str(cfg), "--date", _T19_DAY, "--send"])
+    err = capsys.readouterr().err
+    assert code == EXIT_CONFIG_ERROR
+    assert "GEOPUBLISH_SMTP_HOST" in err
+    assert (data_dir / "reports" / f"{_T19_DAY}.md").exists(), "md 照样落盘"
+
+
+def test_report_send_success(tmp_path, capsys, config_file, _t19_smtp):
+    cfg, data_dir = _t18_config(config_file, tmp_path)
+    _t19_meta(data_dir, "a-1")
+    _t19_report(data_dir, dispatches=[_t19_dispatch(planned=2, published=1)])
+    code = main(["report", "--config", str(cfg), "--date", _T19_DAY, "--send"])
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "邮件推送   = 已送达" in out
+    msgs = _t19_all_mails()
+    assert len(msgs) == 1
+    assert msgs[0]["Subject"] == "[JOTO GEO] 10-27 发布 1/2 · csdn"
+    assert msgs[0]["To"] == "shiyimi@joto.example"
+    state = load_notify_state(data_dir, _T19_DAY)
+    assert state is not None and state.daily is not None and state.daily.status == "sent"
+
+
+def test_ut_19_03_send_failure_exit_6_publish_untouched(tmp_path, capsys, config_file, _t19_smtp):
+    """UT-19-03 的 CLI 面：推送失败退 6，稿件发布状态不动，台账记 notify_failed。"""
+    cfg, data_dir = _t18_config(config_file, tmp_path)
+    _t19_meta(data_dir, "a-1")
+    _t19_report(data_dir, dispatches=[_t19_dispatch()])
+    _T19FakeSMTP.fail_send = True
+
+    code = main(["report", "--config", str(cfg), "--date", _T19_DAY, "--send"])
+    captured = capsys.readouterr()
+    assert code == EXIT_FAILED
+    assert "邮件推送   = 推送失败" in captured.err
+    state = load_notify_state(data_dir, _T19_DAY)
+    assert state is not None and state.daily is not None
+    assert state.daily.status == "notify_failed"
+    # 发布状态判定不受推送影响：日报 JSON 的 published 还是 1，publish-log 一个字节都没动
+    report = json.loads((data_dir / "reports" / f"{_T19_DAY}.json").read_text(encoding="utf-8"))
+    assert report["published"] == 1
+    assert not (data_dir / "publish-log.csv").exists()
+
+
+def test_report_send_corrupt_notify_state_exit_3(tmp_path, capsys, config_file, _t19_smtp):
+    cfg, data_dir = _t18_config(config_file, tmp_path)
+    _t19_report(data_dir)
+    (data_dir / "reports" / f"{_T19_DAY}.notify.json").write_text("{oops", encoding="utf-8")
+    code = main(["report", "--config", str(cfg), "--date", _T19_DAY, "--send"])
+    assert code == EXIT_CONFIG_ERROR
+    assert "数据错误" in capsys.readouterr().err
+
+
+def test_ut_19_06_needs_human_triggers_alert_mail(tmp_path, capsys, config_file, _t19_smtp):
+    """UT-19-06：日报里有 needs_human → 即时告警邮件，与日报分开（第二封）。"""
+    cfg, data_dir = _t18_config(config_file, tmp_path)
+    _t19_meta(data_dir, "a-1")
+    _t19_report(
+        data_dir,
+        dispatches=[_t19_dispatch()],
+        unresolved=[Unresolved(slug="stuck-1", platform="csdn", note="verify 未确认", since=_T19_NOW)],
+    )
+    code = main(["report", "--config", str(cfg), "--date", _T19_DAY, "--send"])
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "告警[needs_human] = sent" in out
+    subjects = [m["Subject"] for m in _t19_all_mails()]
+    assert subjects == [
+        "[JOTO GEO] 10-27 发布 1/1 · csdn",
+        "[JOTO GEO 告警] 10-27 needs_human 待处理（1 篇）",
+    ]
+    body = _t19_all_mails()[1].get_content()
+    assert "stuck-1" in body and "verify 未确认" in body
+
+
+def test_ut_19_07_two_zero_days_trigger_alert_mail(tmp_path, capsys, config_file, _t19_smtp):
+    """UT-19-07：连续两日零发布 → 即时告警邮件。"""
+    cfg, data_dir = _t18_config(config_file, tmp_path)
+    zero = Dispatch(
+        platform="csdn", publish_at="10:00", due=True, dispatched=True,
+        planned=1, published=0, dispatched_at="10:05",
+        items=[DispatchItemResult(slug="a-1", result="failed", reason="平台原话：含营销内容")],
+    )
+    _t19_report(data_dir, day="2026-10-26", dispatches=[zero])
+    _t19_report(data_dir, day=_T19_DAY, dispatches=[zero])
+    code = main(["report", "--config", str(cfg), "--date", _T19_DAY, "--send"])
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "告警[zero_streak] = sent" in out
+    subjects = [m["Subject"] for m in _t19_all_mails()]
+    assert "[JOTO GEO 告警] 10-27 已连续 2 日零发布" in subjects
+
+
+def test_schedule_success_renders_md_and_sends(tmp_path, capsys, config_file, monkeypatch, _t19_smtp):
+    """调度收尾自动渲染 + 推送：cron 只需要 schedule 一条命令。"""
+    cfg, data_dir = _t18_config(config_file, tmp_path)
+    _t18_queue(data_dir, "a-1")
+    _t19_meta(data_dir, "a-1")
+    monkeypatch.setattr("geopublish.cli.SystemClock", lambda: FakeClock(_T18_MON))
+
+    def fake_publish(item, platform_cfg):
+        return PublishOutcome(ok=True, url="https://example.test/a-1", article_id="42")
+
+    monkeypatch.setattr(
+        "geopublish.cli._schedule_wiring", lambda cfg, args, clock: (fake_publish, None)
+    )
+    # 今日留痕短路 prepare（别真去选题）
+    (data_dir / "select").mkdir(exist_ok=True)
+    (data_dir / "select" / "2026-10-26.json").write_text("{}", encoding="utf-8")
+
+    code = main(["schedule", "--config", str(cfg)])
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "日报 md    = " in out and "邮件推送   = 已送达" in out
+    assert (data_dir / "reports" / "2026-10-26.md").exists()
+    subjects = [m["Subject"] for m in _t19_all_mails()]
+    assert subjects == ["[JOTO GEO] 10-26 发布 1/1 · csdn"]
+
+
+def test_schedule_notify_failure_keeps_exit_0(tmp_path, capsys, config_file, monkeypatch, _t19_smtp):
+    """推送链路炸了不影响调度结果：退 0，台账记 notify_failed。"""
+    cfg, data_dir = _t18_config(config_file, tmp_path)
+    _t18_queue(data_dir, "a-1")
+    _t19_meta(data_dir, "a-1")
+    monkeypatch.setattr("geopublish.cli.SystemClock", lambda: FakeClock(_T18_MON))
+
+    def fake_publish(item, platform_cfg):
+        return PublishOutcome(ok=True, url="https://example.test/a-1", article_id="42")
+
+    monkeypatch.setattr(
+        "geopublish.cli._schedule_wiring", lambda cfg, args, clock: (fake_publish, None)
+    )
+    (data_dir / "select").mkdir(exist_ok=True)
+    (data_dir / "select" / "2026-10-26.json").write_text("{}", encoding="utf-8")
+    _T19FakeSMTP.fail_send = True
+
+    code = main(["schedule", "--config", str(cfg)])
+    captured = capsys.readouterr()
+    assert code == EXIT_OK
+    assert "邮件推送   = 推送失败" in captured.err
+    state = load_notify_state(data_dir, "2026-10-26")
+    assert state is not None and state.daily is not None and state.daily.status == "notify_failed"
+
+
+def test_render_and_notify_no_report_is_silent(tmp_path, capsys, config_file):
+    """防御分支：当天连 JSON 日报都没有（run_daily 没跑到 finally），静默返回。"""
+    import geopublish.cli as cli_mod
+
+    cfg, _ = _t18_config(config_file, tmp_path)
+    cli_mod._render_and_notify(cli_mod.load_config(cfg), "2020-01-01", FakeClock(_T19_NOW))
+    captured = capsys.readouterr()
+    assert captured.out == "" and captured.err == ""
+
+
+def test_render_and_notify_swallows_render_errors(tmp_path, capsys, config_file, monkeypatch):
+    """渲染/推送链路的任何异常都只打印警告，绝不改变调度退出码。"""
+    import geopublish.cli as cli_mod
+
+    cfg, data_dir = _t18_config(config_file, tmp_path)
+    _t19_report(data_dir)
+
+    def boom(cfg_, report_):
+        raise RuntimeError("渲染炸了")
+
+    monkeypatch.setattr(cli_mod, "_render_md", boom)
+    cli_mod._render_and_notify(cli_mod.load_config(cfg), _T19_DAY, FakeClock(_T19_NOW))
+    assert "渲染/推送失败" in capsys.readouterr().err
+
+
+def test_print_notify_state_edge_labels(capsys):
+    """台账打印的边角：无日报记录不打印；未知状态原样透传；告警带原因。"""
+    import geopublish.cli as cli_mod
+
+    cli_mod._print_notify_state(NotifyState(date=_T19_DAY))
+    assert capsys.readouterr().out == ""
+
+    from geopublish.core.notify import AlertRecord
+
+    state = NotifyState(
+        date=_T19_DAY,
+        daily=NotifyRecord("mystery", _T19_NOW),
+        alerts=[AlertRecord("notify_failed", _T19_NOW, "OSError: 拒了", kind="needs_human")],
+    )
+    cli_mod._print_notify_state(state)
+    out = capsys.readouterr().out
+    assert "邮件推送   = mystery" in out
+    assert "告警[needs_human] = notify_failed（OSError: 拒了）" in out

@@ -191,7 +191,7 @@ geo-publish/
 ```
 - [x] T-17  选题串联 geo-master
 - [x] T-18  每日调度（两阶段）
-- [ ] T-19  日报与邮件推送
+- [x] T-19  日报与邮件推送
 - [ ] T-20  节奏控制
 - [ ] T-22  干预通道
 ```
@@ -1100,6 +1100,40 @@ CLI 无 `--skip-guard` 类参数，UT-16-03 走参数表递归断言钉死。
 | UT-19-11 | 任一干预动作 | 日志含操作人 / 时间 / 目标 slug / 动作类型（补 N4） |
 
 **DoD**：收件箱收到一封能一眼看出结果的邮件
+
+**实施记录（2026-10-28，UT-19-01~07 全绿；1157 测试全绿，4935 语句/1386 分支全 100%，静态门禁过，集成 3 绿）**
+
+| 项 | 结果 |
+|---|---|
+| 文件 | `report/__init__.py`、`report/daily.py`（194 语句/86 分支 100%）、`core/notify.py`（173 语句/40 分支 100%）、CLI 新增 `report` 命令 + `schedule` 收尾自动渲染推送、`tests/unit/test_report_daily.py`（40 条）、`tests/unit/test_notify.py`（35 条）、`test_cli.py` +18 条 |
+| 用例 | UT-19-01~07 全绿。UT-19-08~11（hold/edit/pause/干预日志）压在 T-22 的队列状态上，不在本工单 |
+
+**六处设计取舍**
+
+1. **渲染是纯函数，四问缺一即 `ReportError`**（UT-19-01）：published 无 URL、标题解析不出、
+   failed 无平台原话、缺队列/日志输入 —— 宁可渲染失败也不发「看起来没问题」的残报。
+   标题取自 `data/drafts/<slug>/meta.json`（published 必需 / 预告尽力而为：预告喊停靠的是 slug）。
+2. **SMTP 凭据只走环境变量**（`GEOPUBLISH_SMTP_HOST/_PORT/_USER/_PASSWORD/_FROM`，
+   收件人 = `report.email`）：配置文件会进笔记会贴截图，授权码不该出现在那里（N2 延伸）。
+   465=SMTP_SSL，其余端口=STARTTLS。
+3. **推送与发布彻底分离**（UT-19-03）：notify 层不碰 publish-log；推送失败只记
+   `data/reports/<date>.notify.json` 的 `notify_failed`，调度退出码不变（best-effort
+   `_render_and_notify`，任何异常只打印警告）。`report --send` 手动重推失败退 6。
+4. **日报按内容 digest 去重而非「每日一封死规则」**：T-18b 多槽位后 15:00 的 X/Y 会变，
+   内容变了就该再发一封；没变（重跑调度）才不打扰。告警则同日同种只发一次
+   （告警轰炸 = 告警失效），去重标记在 notify.json，重启不丢。
+5. **零发布连击只数「有机会发车」的日子**：日报缺失 → 停止前数（「没跑」归心跳告警管，
+   混进来会把两种故障揉成误报）；workdays_only 的周末（无发车记录）跳过不计。
+6. **notify 模块不决定「发什么」**：主题行/正文/告警判定在上层（report 渲染 + CLI
+   `_build_alerts`），notify 只管送达与记账 —— 全链路假 transport 可测，不需要真 SMTP。
+
+**已知边界**
+
+- DoD「收件箱收到邮件」需拾一米提供：收件邮箱（写进 `config/geopublish.json` 的
+  `report.email`，当前是 you@example.com 占位）+ 发件邮箱 SMTP 授权码
+  （export 到调度机器环境）。授权码到位后跑一次 `geopublish report --send` 即验收。
+- 邮件正文是纯文本 md（`text/plain`）：QQ/163 客户端直接可读；要 HTML 渲染是后续工单。
+- launchd/cron 部署后推送随 `schedule` 自动发生，无需额外条目。
 
 ---
 

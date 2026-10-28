@@ -13,13 +13,16 @@
 - `geopublish map <product_id>`：生成 qa.json 问句映射（T-17，启发式预填，人工增删后生效）
 - `geopublish pick`：每日选题（T-17）：geo-monitor 缺口 × gap_prioritizer 打分 × 产品库映射
 - `geopublish schedule`：每日调度（T-18，两阶段）：到点发昨天入队的稿 + 选题成稿入队明天发；
-  `--check-heartbeat` 只查心跳（超 26h 无运行退 6）
+  `--check-heartbeat` 只查心跳（超 26h 无运行退 6）；运行结束自动渲染日报 md 并推送邮件（T-19）
+- `geopublish report [--date D] [--send]`：把 data/reports/<date>.json 渲染成 md（T-19 四问）；
+  `--send` 推送邮件（SMTP 走 GEOPUBLISH_SMTP_* 环境变量）
 
 退出码约定：
   0 成功（含 SKIPPED_DUPLICATE：已发过，幂等跳过）/ 1 用法错误 / 2 需重新授权 /
   3 配置错误 / 并发锁冲突（另一进程在跑，等它完）/
   4 现场已复现（replay 的预期结果）/ 5 环境不可用（缺浏览器驱动、抓不到内容）/
-  6 发布未确认成功（verify 没过、提交前复核被拦、上次 submitting 未决 → needs_human）
+  6 发布未确认成功（verify 没过、提交前复核被拦、上次 submitting 未决 → needs_human）、
+    report --send 推送失败（稿件发布状态不受影响，台账记 notify_failed）
 
 「1 用法错误」包括**没给子命令**：cron 里跑 `geopublish` 忘写子命令如果退 0，
 监控会当成「今天跑过了」，第二天才发现一篇都没发。argparse 默认对解析失败退 2，
@@ -37,6 +40,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import date
 from pathlib import Path
 from typing import Sequence
 
@@ -66,12 +70,33 @@ from .core.snapshot import (
 )
 from .publish import DraftLoadError, GateClosed, load_draft, publish_draft
 from .core.clock import SystemClock
+from .core.notify import (
+    ALERT_NEEDS_HUMAN,
+    ALERT_ZERO_STREAK,
+    NotifyConfig,
+    NotifyError,
+    NotifyState,
+    notify_day,
+)
 from .core.state import PublishLog
+from .report.daily import (
+    ZERO_STREAK_ALERT_DAYS,
+    ReportError,
+    render_daily_md,
+    subject_line,
+    write_daily_md,
+    zero_publish_streak,
+    zero_reasons,
+)
 from .schedule.scheduler import (
+    SCHEDULE_TZ,
     HeartbeatStale,
     PrepareResult,
     SchedulerError,
     check_heartbeat,
+    load_queue,
+    load_report,
+    queue_path,
     report_path,
     run_daily,
 )
@@ -370,6 +395,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="只查心跳不调度：超 26h 无运行记录退 6（监控/告警接这里）",
     )
 
+    report_cmd = sub.add_parser(
+        "report",
+        help="渲染日报 md（T-19 四问）；--send 推送邮件（SMTP 走 GEOPUBLISH_SMTP_* 环境变量）",
+    )
+    report_cmd.add_argument(
+        "--date",
+        default=None,
+        help="日期 YYYY-MM-DD（默认今天，按运营时区 +08:00）",
+    )
+    report_cmd.add_argument(
+        "--config",
+        default=str(DEFAULT_CONFIG_PATH),
+        help=f"配置文件路径（默认 {DEFAULT_CONFIG_PATH}，取 data_dir 与 report.email）",
+    )
+    report_cmd.add_argument(
+        "--send",
+        action="store_true",
+        help="渲染后推送到 report.email；推送失败退 6（不影响稿件发布状态）",
+    )
+
     return parser
 
 
@@ -399,6 +444,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _pick(args)
     if args.command == "schedule":
         return _schedule(args)
+    if args.command == "report":
+        return _report(args)
 
     # 没给子命令不是「打印帮助然后成功」，是用法错了。
     # 退 0 会让 cron 以为今天跑过了 —— 静默成功比报错危险得多。
@@ -801,9 +848,11 @@ def _schedule(args: argparse.Namespace) -> int:
         report = run_daily(cfg, clock=clock, publish_one=publish_one, prepare=prepare)
     except SchedulerError as exc:
         print(f"调度配置/数据错误：{exc}", file=sys.stderr)
+        _render_and_notify(cfg, _schedule_today(clock), clock)
         return EXIT_CONFIG_ERROR
     except Exception as exc:  # noqa: BLE001 - 崩溃也要转成退出码，不给 cron 丢 traceback
         print(f"调度运行异常（当日日报已落盘）：{type(exc).__name__}: {exc}", file=sys.stderr)
+        _render_and_notify(cfg, _schedule_today(clock), clock)
         return EXIT_FAILED
 
     where = report_path(cfg.data_dir, report.date)
@@ -834,7 +883,161 @@ def _schedule(args: argparse.Namespace) -> int:
             if prep.status != "prepared":
                 print(f"  明日选题   = {prep.status}：{prep.reason}")
     print(f"  日报       = {where}")
+    _render_and_notify(cfg, report.date, clock)
     return EXIT_OK
+
+
+def _schedule_today(clock) -> str:
+    """调度异常路径上的「今天」：run_daily 抛了，日报日期只能按运营时区现算。"""
+    return clock.now().astimezone(SCHEDULE_TZ).date().isoformat()
+
+
+# ---------------------------------------------------------------- T-19 日报与推送
+def _report(args: argparse.Namespace) -> int:
+    """渲染日报 md（T-19）。退出码：
+
+    - 0：渲染成功（--send 时含推送成功/跳过）
+    - 1：用法错误（日期格式不对、当日没有日报）
+    - 3：配置/数据错误（配置缺失、日报或队列损坏、四问渲染不出来、SMTP 环境变量缺失）
+    - 6：--send 推送失败（notify_failed 已记台账，稿件发布状态不受影响）
+    """
+    try:
+        cfg = load_config(Path(args.config))
+    except ConfigError as exc:
+        print(f"配置错误：{exc}", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
+
+    day = args.date or _schedule_today(SystemClock())
+    try:
+        date.fromisoformat(day)
+    except ValueError:
+        print(f"用法错误：--date 必须是 YYYY-MM-DD，收到 {day!r}", file=sys.stderr)
+        return EXIT_USAGE
+
+    try:
+        report = load_report(cfg.data_dir, day)
+    except SchedulerError as exc:
+        print(f"数据错误：{exc}", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
+    if report is None:
+        print(f"用法错误：没有 {day} 的日报（先跑 geopublish schedule）", file=sys.stderr)
+        return EXIT_USAGE
+
+    try:
+        md, mail_subject = _render_md(cfg, report)
+    except (SchedulerError, ReportError) as exc:
+        print(f"数据错误：{exc}", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
+    where = write_daily_md(cfg.data_dir, day, md)
+    print(mail_subject)
+    print(f"日报 md = {where}")
+
+    if not args.send:
+        return EXIT_OK
+    try:
+        mail = NotifyConfig.from_env(recipients=cfg.report_email)
+    except NotifyError as exc:
+        print(f"配置错误：{exc}", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
+    try:
+        state = notify_day(
+            cfg.data_dir,
+            day,
+            daily=(mail_subject, md),
+            alerts=_build_alerts(cfg, report),
+            mail=mail,
+        )
+    except NotifyError as exc:
+        print(f"数据错误：{exc}", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
+    _print_notify_state(state)
+    if state.daily is not None and state.daily.status == "notify_failed":
+        return EXIT_FAILED
+    return EXIT_OK
+
+
+def _render_md(cfg: Config, report) -> tuple[str, str]:
+    """渲染当日日报 md + 主题行（队列是「明日预告」的唯一事实来源）。"""
+    queue = load_queue(queue_path(cfg.data_dir))
+    log = PublishLog(cfg.data_dir / "publish-log.csv")
+    md = render_daily_md(report, data_root=cfg.data_dir, queue=queue, log=log)
+    return md, subject_line(report)
+
+
+def _build_alerts(cfg: Config, report) -> list[tuple[str, str, str]]:
+    """异常告警（PRD R18 推送要求 3）：needs_human / 连续两日零发布，
+    走即时通道，与日报分开（同日同种的去重在 notify_day 里）。"""
+    day = date.fromisoformat(report.date)
+    mmdd = day.strftime("%m-%d")
+    alerts: list[tuple[str, str, str]] = []
+    if report.unresolved:
+        items = "\n".join(
+            f"- {u.slug}（{u.platform}，{u.since} 起）：{u.note}" for u in report.unresolved
+        )
+        alerts.append(
+            (
+                ALERT_NEEDS_HUMAN,
+                f"[JOTO GEO 告警] {mmdd} needs_human 待处理（{len(report.unresolved)} 篇）",
+                "以下稿件发布结果未知，需要人工到平台后台确认（处理前调度不会自动重试）：\n"
+                f"{items}\n",
+            )
+        )
+    streak = zero_publish_streak(cfg.data_dir, day)
+    if streak >= ZERO_STREAK_ALERT_DAYS:
+        reasons = "\n".join(f"- {r}" for r in zero_reasons(report))
+        alerts.append(
+            (
+                ALERT_ZERO_STREAK,
+                f"[JOTO GEO 告警] {mmdd} 已连续 {streak} 日零发布",
+                f"截至 {report.date} 已连续 {streak} 天零发布，请检查选题与平台状态。\n"
+                f"今日原因：\n{reasons}\n",
+            )
+        )
+    return alerts
+
+
+def _print_notify_state(state: NotifyState) -> None:
+    if state.daily is not None:
+        label = {"sent": "已送达", "notify_failed": "推送失败", "skipped": "跳过"}.get(
+            state.daily.status, state.daily.status
+        )
+        suffix = f"（{state.daily.reason}）" if state.daily.reason else ""
+        stream = sys.stderr if state.daily.status == "notify_failed" else sys.stdout
+        print(f"  邮件推送   = {label}{suffix}", file=stream)
+    for alert in state.alerts:
+        suffix = f"（{alert.reason}）" if alert.reason else ""
+        print(f"  告警[{alert.kind}] = {alert.status}{suffix}")
+
+
+def _render_and_notify(cfg: Config, day: str, clock) -> None:
+    """调度收尾：渲染 md + 推送邮件（T-19）。**永远 best-effort**——
+    推送链路出任何问题都只打印警告，不改变 schedule 的退出码（R18 推送要求 2：
+    推送失败不得影响发布状态判定；调度退出码同理）。
+    """
+    try:
+        report = load_report(cfg.data_dir, day)
+        if report is None:
+            return
+        md, mail_subject = _render_md(cfg, report)
+        md_path = write_daily_md(cfg.data_dir, day, md)
+        print(f"  日报 md    = {md_path}")
+        try:
+            mail = NotifyConfig.from_env(recipients=cfg.report_email)
+        except NotifyError as exc:
+            mail = None
+            print(f"  邮件推送   = 跳过（{exc}）", file=sys.stderr)
+        state = notify_day(
+            cfg.data_dir,
+            day,
+            daily=(mail_subject, md),
+            alerts=_build_alerts(cfg, report),
+            mail=mail,
+            clock=clock,
+        )
+        _print_notify_state(state)
+    except Exception as exc:  # noqa: BLE001 - 推送链路的失败不许改变调度退出码
+        print(f"  ⚠️ 日报渲染/推送失败（不影响发布与调度结果）：{type(exc).__name__}: {exc}",
+              file=sys.stderr)
 
 
 def _schedule_wiring(cfg: Config, args: argparse.Namespace, clock):
