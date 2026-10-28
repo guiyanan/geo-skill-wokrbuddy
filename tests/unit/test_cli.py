@@ -1069,3 +1069,454 @@ def test_pick_corrupted_facts_degrades_to_no_topic(tmp_path, capsys, config_file
     out = capsys.readouterr().out
     assert code == EXIT_OK
     assert "no_topic" in out and "不可用" in out
+
+
+# ------------------------------------------------- T-18：schedule 每日调度
+
+from geopublish.core.clock import FakeClock  # noqa: E402
+from geopublish.publish import PublishOutcome  # noqa: E402
+from geopublish.schedule.scheduler import PrepareResult, touch_heartbeat  # noqa: E402
+
+_T18_MON = "2026-10-26T10:05:00+08:00"  # 周一
+_T18_SAT = "2026-10-24T10:05:00+08:00"  # 周六
+
+
+def _t18_config(config_file, tmp_path, **over):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(exist_ok=True)
+    return config_file(data_dir=str(data_dir), **over), data_dir
+
+
+def _t18_queue(data_dir, *slugs):
+    items = [
+        {
+            "slug": s,
+            "draft_dir": f"data/drafts/{s}",
+            "platform": "csdn",
+            "query_id": "C01",
+            "queued_at": "2026-10-25T10:00:00+08:00",
+        }
+        for s in slugs
+    ]
+    (data_dir / "queue.json").write_text(
+        json.dumps({"schema": 1, "items": items}), encoding="utf-8"
+    )
+
+
+def test_schedule_bad_config_exit_3(tmp_path, capsys, config_file):
+    path = config_file(gate="ship")
+    assert main(["schedule", "--config", str(path)]) == EXIT_CONFIG_ERROR
+    assert "配置错误" in capsys.readouterr().err
+
+
+def test_schedule_heartbeat_missing_exit_6(tmp_path, capsys, config_file):
+    cfg, _ = _t18_config(config_file, tmp_path)
+    assert main(["schedule", "--config", str(cfg), "--check-heartbeat"]) == EXIT_FAILED
+    assert "心跳" in capsys.readouterr().err
+
+
+def test_schedule_heartbeat_fresh_exit_0(tmp_path, capsys, config_file):
+    cfg, data_dir = _t18_config(config_file, tmp_path)
+    from geopublish.core.clock import SystemClock
+
+    touch_heartbeat(data_dir, SystemClock())  # 当前时刻的心跳，查验必须放行
+    assert main(["schedule", "--config", str(cfg), "--check-heartbeat"]) == EXIT_OK
+    assert "心跳正常" in capsys.readouterr().out
+
+
+def test_schedule_saturday_publishes_nothing(tmp_path, capsys, config_file, monkeypatch):
+    """周末：真实接线也不许碰浏览器（publish/prepare 根本不会被调用）。"""
+    cfg, data_dir = _t18_config(config_file, tmp_path)
+    _t18_queue(data_dir, "a-1")  # 队列里有货也不许发
+    monkeypatch.setattr("geopublish.cli.SystemClock", lambda: FakeClock(_T18_SAT))
+
+    code = main(["schedule", "--config", str(cfg)])
+
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "非工作日" in out
+    report = json.loads((data_dir / "reports" / "2026-10-24.json").read_text(encoding="utf-8"))
+    assert report["workday"] is False and report["expected"] == 0
+    assert json.loads((data_dir / "queue.json").read_text(encoding="utf-8"))["items"], "周末不动队列"
+
+
+def test_schedule_workday_publishes_and_prepares(tmp_path, capsys, config_file, monkeypatch):
+    """工作日：昨天入队的稿发出去，明天的选题入队（接线用替身，不开浏览器）。"""
+    cfg, data_dir = _t18_config(config_file, tmp_path)
+    _t18_queue(data_dir, "a-1")
+    monkeypatch.setattr("geopublish.cli.SystemClock", lambda: FakeClock(_T18_MON))
+
+    calls = []
+
+    def fake_publish(item, platform_cfg):
+        calls.append(item.slug)
+        return PublishOutcome(ok=True, url="https://example.test/a-1", article_id="42")
+
+    def fake_prepare():
+        return PrepareResult(
+            status="prepared", slug="b-1", query_id="C02",
+            draft_dir="data/drafts/b-1", platform="csdn",
+        )
+
+    monkeypatch.setattr(
+        "geopublish.cli._schedule_wiring", lambda cfg, args, clock: (fake_publish, fake_prepare)
+    )
+
+    code = main(["schedule", "--config", str(cfg)])
+
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert calls == ["a-1"]
+    assert "应发/实发 = 1/1" in out
+    assert "明日待发   = b-1" in out
+    queued = json.loads((data_dir / "queue.json").read_text(encoding="utf-8"))["items"]
+    assert [i["slug"] for i in queued] == ["b-1"], "a-1 出队、b-1 入队"
+
+
+def test_schedule_stagger_collision_exit_3(tmp_path, capsys, config_file, monkeypatch):
+    cfg, data_dir = _t18_config(
+        config_file,
+        tmp_path,
+        platforms=[
+            {"name": "csdn", "publish_at": "10:00"},
+            {"name": "juejin", "publish_at": "10:00"},
+        ],
+    )
+    monkeypatch.setattr("geopublish.cli.SystemClock", lambda: FakeClock(_T18_MON))
+    code = main(["schedule", "--config", str(cfg)])
+    assert code == EXIT_CONFIG_ERROR
+    assert "错峰" in capsys.readouterr().err
+    # 配置错误也不静默：日报里钉着 error
+    report = json.loads((data_dir / "reports" / "2026-10-26.json").read_text(encoding="utf-8"))
+    assert "错峰" in report["error"]
+
+
+def test_schedule_crash_exit_6_but_report_written(tmp_path, capsys, config_file, monkeypatch):
+    """UT-18-04 的 CLI 面：运行崩溃退 6，但当务之急的日报已经落盘。"""
+    cfg, data_dir = _t18_config(config_file, tmp_path)
+    _t18_queue(data_dir, "a-1")
+    monkeypatch.setattr("geopublish.cli.SystemClock", lambda: FakeClock(_T18_MON))
+
+    def boom(item, platform_cfg):
+        raise RuntimeError("磁盘炸了")
+
+    monkeypatch.setattr(
+        "geopublish.cli._schedule_wiring", lambda cfg, args, clock: (boom, None)
+    )
+
+    code = main(["schedule", "--config", str(cfg)])
+
+    assert code == EXIT_FAILED
+    assert "日报已落盘" in capsys.readouterr().err
+    report = json.loads((data_dir / "reports" / "2026-10-26.json").read_text(encoding="utf-8"))
+    assert "磁盘炸了" in report["error"]
+
+
+def test_schedule_summary_prints_failures_unresolved_notopic(tmp_path, capsys, config_file, monkeypatch):
+    """摘要输出的暗面分支：失败项明细、needs_human 未解决清单、no_topic 明日选题。"""
+    from datetime import datetime
+
+    from geopublish.core.models import LogEntry
+    from geopublish.core.state import PublishLog, Status, idem_key
+
+    cfg, data_dir = _t18_config(config_file, tmp_path)
+    _t18_queue(data_dir, "a-1")
+    PublishLog(data_dir / "publish-log.csv").append(
+        LogEntry(
+            ts=datetime.fromisoformat("2026-10-25T10:01:00+08:00"),
+            platform="csdn", account="default", slug="stuck-1",
+            idem_key=idem_key("csdn", "default", "stuck-1", "sha-stuck-1"),
+            status=Status.NEEDS_HUMAN, note="verify 未确认成功",
+        )
+    )
+    monkeypatch.setattr("geopublish.cli.SystemClock", lambda: FakeClock(_T18_MON))
+
+    def fake_publish(item, platform_cfg):
+        return PublishOutcome(ok=False, reason="failure_kind=CONTENT_REJECTED；平台原话：含营销内容")
+
+    monkeypatch.setattr(
+        "geopublish.cli._schedule_wiring",
+        lambda cfg, args, clock: (fake_publish, lambda: PrepareResult(status="no_topic", reason="全部出局")),
+    )
+
+    code = main(["schedule", "--config", str(cfg)])
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "[failed] a-1" in out and "平台原话" in out
+    assert "未解决 needs_human：1 篇" in out and "stuck-1" in out
+    assert "明日选题   = no_topic：全部出局" in out
+
+
+def test_schedule_not_yet_due_prints_skip_reason(tmp_path, capsys, config_file, monkeypatch):
+    """还没到发车点：摘要里要能看到「跳过：未到发车时间」，不是一片空白。"""
+    cfg, data_dir = _t18_config(config_file, tmp_path)
+    _t18_queue(data_dir, "a-1")
+    monkeypatch.setattr("geopublish.cli.SystemClock", lambda: FakeClock("2026-10-26T09:00:00+08:00"))
+    monkeypatch.setattr(
+        "geopublish.cli._schedule_wiring", lambda cfg, args, clock: (None, None)
+    )
+    code = main(["schedule", "--config", str(cfg)])
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "跳过：未到发车时间 10:00" in out
+    assert "明日选题   = skipped" in out
+
+
+def test_schedule_real_wiring_publish_path(tmp_path, capsys, config_file, monkeypatch):
+    """真实 _schedule_wiring 的 publish_one：适配器解析 → load_draft → publish_draft
+    （publish_draft 打桩，不开浏览器）。覆盖接线本体，不只是替身。"""
+    cfg, data_dir = _t18_config(config_file, tmp_path)
+    draft = data_dir / "drafts" / "a-1"
+    draft.mkdir(parents=True)
+    (draft / "meta.json").write_text(
+        json.dumps({"slug": "a-1", "title": "测试标题"}), encoding="utf-8"
+    )
+    (draft / "csdn.md").write_text("正文内容\n", encoding="utf-8")
+    (data_dir / "queue.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "items": [
+                    {
+                        "slug": "a-1",
+                        "draft_dir": str(draft),
+                        "platform": "csdn",
+                        "query_id": "C01",
+                        "queued_at": "2026-10-25T10:00:00+08:00",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("geopublish.cli.SystemClock", lambda: FakeClock(_T18_MON))
+
+    seen = {}
+
+    def fake_publish_draft(adapter, loaded, platform_cfg, **kwargs):
+        seen["slug"] = loaded.draft.meta.slug
+        seen["mode"] = kwargs.get("mode")
+        return PublishOutcome(ok=True, url="https://example.test/a-1", article_id="7")
+
+    monkeypatch.setattr("geopublish.cli.publish_draft", fake_publish_draft)
+    # prepare 走替身：publish 接线与 prepare 接线分开测，别搅在一起
+    monkeypatch.setattr(
+        "geopublish.cli.load_samples",
+        lambda p: (_ for _ in ()).throw(RuntimeError("不该被调用")),
+    )
+    # 用「今日留痕已存在」短路 prepare，避免真选题
+    (data_dir / "select").mkdir(exist_ok=True)
+    (data_dir / "select" / "2026-10-26.json").write_text("{}", encoding="utf-8")
+
+    code = main(["schedule", "--config", str(cfg)])
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert seen == {"slug": "a-1", "mode": "publish"}, "调度发车必须是 publish 模式"
+    assert "发 1/1" in out
+    assert json.loads((data_dir / "queue.json").read_text(encoding="utf-8"))["items"] == []
+
+
+def test_schedule_real_wiring_prepare_no_topic(tmp_path, capsys, config_file, monkeypatch):
+    """真实 prepare 接线（pick 全链路）但无缺口 → no_topic 写进日报。"""
+    data_dir, queries, _, prio = _t17_env(tmp_path)
+    all_cited = tmp_path / "samples-cited.json"
+    all_cited.write_text(
+        json.dumps(
+            [
+                {"query_id": "C01", "cited": True, "mentioned": True, "competitors_seen": []},
+                {"query_id": "D01", "cited": True, "mentioned": True, "competitors_seen": []},
+                {"query_id": "S01", "cited": True, "mentioned": True, "competitors_seen": []},
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    cfg = config_file(data_dir=str(data_dir))
+    monkeypatch.setattr("geopublish.cli.SystemClock", lambda: FakeClock(_T18_MON))
+
+    code = main([
+        "schedule", "--config", str(cfg), "--queries", str(queries),
+        "--samples", str(all_cited), "--prioritizer", str(prio),
+    ])
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "明日选题   = no_topic" in out
+    report = json.loads((data_dir / "reports" / "2026-10-26.json").read_text(encoding="utf-8"))
+    assert report["prepare"]["status"] == "no_topic"
+
+
+def test_schedule_real_wiring_prepare_prepared(tmp_path, capsys, config_file, monkeypatch):
+    """真实 prepare 全链路：S01 是缺口 → pick 选中 → write 成稿 → 入队明天发。"""
+    data_dir, queries, samples, prio = _t17_env(tmp_path)
+    assert main(["map", "deepparser", "--queries", str(queries), "--data-dir", str(data_dir)]) == EXIT_OK
+    capsys.readouterr()
+    cfg = config_file(data_dir=str(data_dir))
+    monkeypatch.setattr("geopublish.cli.SystemClock", lambda: FakeClock(_T18_MON))
+
+    code = main([
+        "schedule", "--config", str(cfg), "--queries", str(queries),
+        "--samples", str(samples), "--prioritizer", str(prio),
+    ])
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "明日待发   = deepparser-s01" in out
+    (item,) = json.loads((data_dir / "queue.json").read_text(encoding="utf-8"))["items"]
+    assert item["slug"] == "deepparser-s01" and item["query_id"] == "S01"
+    assert item["queued_at"].startswith("2026-10-26")
+    # 选题留痕也落了（同日重跑的防重哨兵）
+    assert (data_dir / "select" / "2026-10-26.json").exists()
+
+
+def test_schedule_summary_prints_failures_unresolved_notopic(tmp_path, capsys, config_file, monkeypatch):
+    """摘要输出的暗面分支：失败项明细、needs_human 未解决清单、no_topic 明日选题。"""
+    from datetime import datetime
+
+    from geopublish.core.models import LogEntry
+    from geopublish.core.state import PublishLog, Status, idem_key
+
+    cfg, data_dir = _t18_config(config_file, tmp_path)
+    _t18_queue(data_dir, "a-1")
+    PublishLog(data_dir / "publish-log.csv").append(
+        LogEntry(
+            ts=datetime.fromisoformat("2026-10-25T10:01:00+08:00"),
+            platform="csdn", account="default", slug="stuck-1",
+            idem_key=idem_key("csdn", "default", "stuck-1", "sha-stuck-1"),
+            status=Status.NEEDS_HUMAN, note="verify 未确认成功",
+        )
+    )
+    monkeypatch.setattr("geopublish.cli.SystemClock", lambda: FakeClock(_T18_MON))
+
+    def fake_publish(item, platform_cfg):
+        return PublishOutcome(ok=False, reason="failure_kind=CONTENT_REJECTED；平台原话：含营销内容")
+
+    monkeypatch.setattr(
+        "geopublish.cli._schedule_wiring",
+        lambda cfg, args, clock: (fake_publish, lambda: PrepareResult(status="no_topic", reason="全部出局")),
+    )
+
+    code = main(["schedule", "--config", str(cfg)])
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "[failed] a-1" in out and "平台原话" in out
+    assert "未解决 needs_human：1 篇" in out and "stuck-1" in out
+    assert "明日选题   = no_topic：全部出局" in out
+
+
+def test_schedule_not_yet_due_prints_skip_reason(tmp_path, capsys, config_file, monkeypatch):
+    """还没到发车点：摘要里要能看到「跳过：未到发车时间」，不是一片空白。"""
+    cfg, data_dir = _t18_config(config_file, tmp_path)
+    _t18_queue(data_dir, "a-1")
+    monkeypatch.setattr("geopublish.cli.SystemClock", lambda: FakeClock("2026-10-26T09:00:00+08:00"))
+    monkeypatch.setattr(
+        "geopublish.cli._schedule_wiring", lambda cfg, args, clock: (None, None)
+    )
+    code = main(["schedule", "--config", str(cfg)])
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "跳过：未到发车时间 10:00" in out
+    assert "明日选题   = skipped" in out
+
+
+def test_schedule_real_wiring_publish_path(tmp_path, capsys, config_file, monkeypatch):
+    """真实 _schedule_wiring 的 publish_one：适配器解析 → load_draft → publish_draft
+    （publish_draft 打桩，不开浏览器）。覆盖接线本体，不只是替身。"""
+    cfg, data_dir = _t18_config(config_file, tmp_path)
+    draft = data_dir / "drafts" / "a-1"
+    draft.mkdir(parents=True)
+    (draft / "meta.json").write_text(
+        json.dumps({"slug": "a-1", "title": "测试标题"}), encoding="utf-8"
+    )
+    (draft / "csdn.md").write_text("正文内容\n", encoding="utf-8")
+    (data_dir / "queue.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "items": [
+                    {
+                        "slug": "a-1",
+                        "draft_dir": str(draft),
+                        "platform": "csdn",
+                        "query_id": "C01",
+                        "queued_at": "2026-10-25T10:00:00+08:00",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("geopublish.cli.SystemClock", lambda: FakeClock(_T18_MON))
+
+    seen = {}
+
+    def fake_publish_draft(adapter, loaded, platform_cfg, **kwargs):
+        seen["slug"] = loaded.draft.meta.slug
+        seen["mode"] = kwargs.get("mode")
+        return PublishOutcome(ok=True, url="https://example.test/a-1", article_id="7")
+
+    monkeypatch.setattr("geopublish.cli.publish_draft", fake_publish_draft)
+    # prepare 走替身：publish 接线与 prepare 接线分开测，别搅在一起
+    monkeypatch.setattr(
+        "geopublish.cli.load_samples",
+        lambda p: (_ for _ in ()).throw(RuntimeError("不该被调用")),
+    )
+    # 用「今日留痕已存在」短路 prepare，避免真选题
+    (data_dir / "select").mkdir(exist_ok=True)
+    (data_dir / "select" / "2026-10-26.json").write_text("{}", encoding="utf-8")
+
+    code = main(["schedule", "--config", str(cfg)])
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert seen == {"slug": "a-1", "mode": "publish"}, "调度发车必须是 publish 模式"
+    assert "发 1/1" in out
+    assert json.loads((data_dir / "queue.json").read_text(encoding="utf-8"))["items"] == []
+
+
+def test_schedule_real_wiring_prepare_no_topic(tmp_path, capsys, config_file, monkeypatch):
+    """真实 prepare 接线（pick 全链路）但无缺口 → no_topic 写进日报。"""
+    data_dir, queries, _, prio = _t17_env(tmp_path)
+    all_cited = tmp_path / "samples-cited.json"
+    all_cited.write_text(
+        json.dumps(
+            [
+                {"query_id": "C01", "cited": True, "mentioned": True, "competitors_seen": []},
+                {"query_id": "D01", "cited": True, "mentioned": True, "competitors_seen": []},
+                {"query_id": "S01", "cited": True, "mentioned": True, "competitors_seen": []},
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    cfg = config_file(data_dir=str(data_dir))
+    monkeypatch.setattr("geopublish.cli.SystemClock", lambda: FakeClock(_T18_MON))
+
+    code = main([
+        "schedule", "--config", str(cfg), "--queries", str(queries),
+        "--samples", str(all_cited), "--prioritizer", str(prio),
+    ])
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "明日选题   = no_topic" in out
+    report = json.loads((data_dir / "reports" / "2026-10-26.json").read_text(encoding="utf-8"))
+    assert report["prepare"]["status"] == "no_topic"
+
+
+def test_schedule_real_wiring_prepare_prepared(tmp_path, capsys, config_file, monkeypatch):
+    """真实 prepare 全链路：S01 是缺口 → pick 选中 → write 成稿 → 入队明天发。"""
+    data_dir, queries, samples, prio = _t17_env(tmp_path)
+    assert main(["map", "deepparser", "--queries", str(queries), "--data-dir", str(data_dir)]) == EXIT_OK
+    capsys.readouterr()
+    cfg = config_file(data_dir=str(data_dir))
+    monkeypatch.setattr("geopublish.cli.SystemClock", lambda: FakeClock(_T18_MON))
+
+    code = main([
+        "schedule", "--config", str(cfg), "--queries", str(queries),
+        "--samples", str(samples), "--prioritizer", str(prio),
+    ])
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "明日待发   = deepparser-s01" in out
+    (item,) = json.loads((data_dir / "queue.json").read_text(encoding="utf-8"))["items"]
+    assert item["slug"] == "deepparser-s01" and item["query_id"] == "S01"
+    assert item["queued_at"].startswith("2026-10-26")
+    # 选题留痕也落了（同日重跑的防重哨兵）
+    assert (data_dir / "select" / "2026-10-26.json").exists()

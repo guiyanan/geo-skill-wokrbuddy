@@ -12,6 +12,8 @@
 - `geopublish cover <draft_dir>`：封面生成（T-15）；`--approve --by 名字` 落人工抽检结论（G2）
 - `geopublish map <product_id>`：生成 qa.json 问句映射（T-17，启发式预填，人工增删后生效）
 - `geopublish pick`：每日选题（T-17）：geo-monitor 缺口 × gap_prioritizer 打分 × 产品库映射
+- `geopublish schedule`：每日调度（T-18，两阶段）：到点发昨天入队的稿 + 选题成稿入队明天发；
+  `--check-heartbeat` 只查心跳（超 26h 无运行退 6）
 
 退出码约定：
   0 成功（含 SKIPPED_DUPLICATE：已发过，幂等跳过）/ 1 用法错误 / 2 需重新授权 /
@@ -63,7 +65,16 @@ from .core.snapshot import (
     capture,
 )
 from .publish import DraftLoadError, GateClosed, load_draft, publish_draft
+from .core.clock import SystemClock
 from .core.state import PublishLog
+from .schedule.scheduler import (
+    HeartbeatStale,
+    PrepareResult,
+    SchedulerError,
+    check_heartbeat,
+    report_path,
+    run_daily,
+)
 from .select.picker import (
     PickerError,
     build_gaps,
@@ -314,6 +325,51 @@ def build_parser() -> argparse.ArgumentParser:
         help="gap_prioritizer.py 路径（缺省用本机 geo-master 技能内的；排序不许自建）",
     )
 
+    sched = sub.add_parser(
+        "schedule",
+        help="每日调度（T-18，两阶段）：到点发昨天入队的稿 + 选题成稿入队明天发；日报落 data/reports/",
+    )
+    sched.add_argument(
+        "--config",
+        default=str(DEFAULT_CONFIG_PATH),
+        help=f"配置文件路径（默认 {DEFAULT_CONFIG_PATH}）",
+    )
+    sched.add_argument(
+        "--queries",
+        default=str(DEFAULT_QUERIES_PATH),
+        help=f"问句配置路径（默认 {DEFAULT_QUERIES_PATH}，与 geo-monitor 同源）",
+    )
+    sched.add_argument(
+        "--samples",
+        default=None,
+        help="geo-monitor 的 samples.json（缺省自动取最新一期；prepare 阶段用）",
+    )
+    sched.add_argument(
+        "--prioritizer",
+        default=None,
+        help="gap_prioritizer.py 路径（缺省用本机 geo-master 技能内的）",
+    )
+    sched.add_argument(
+        "--channel",
+        default="chrome",
+        help="浏览器来源：chrome=复用系统 Chrome（默认）；bundled=用 playwright 自带 chromium",
+    )
+    sched.add_argument(
+        "--profile-root",
+        default=None,
+        help=f"profile 根目录（默认 {DEFAULT_PROFILE_ROOT}）",
+    )
+    sched.add_argument(
+        "--lock-root",
+        default=None,
+        help=f"平台锁目录（默认 {DEFAULT_LOCK_ROOT}）",
+    )
+    sched.add_argument(
+        "--check-heartbeat",
+        action="store_true",
+        help="只查心跳不调度：超 26h 无运行记录退 6（监控/告警接这里）",
+    )
+
     return parser
 
 
@@ -341,6 +397,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _map(args)
     if args.command == "pick":
         return _pick(args)
+    if args.command == "schedule":
+        return _schedule(args)
 
     # 没给子命令不是「打印帮助然后成功」，是用法错了。
     # 退 0 会让 cron 以为今天跑过了 —— 静默成功比报错危险得多。
@@ -710,6 +768,144 @@ def _pick(args: argparse.Namespace) -> int:
     print(f"  留痕     = {trace}")
     print(f"  下一步   = geopublish write {choice.product_id} --query {choice.query_id}")
     return EXIT_OK
+
+
+def _schedule(args: argparse.Namespace) -> int:
+    """每日调度（T-18）。退出码约定：
+
+    - 0：运行完成（含周末跳过、平台拒稿、选题 no_topic）——这些都写在日报里，
+      「发过没」只看日报，不看退出码（R16：日报是唯一检查入口）
+    - 3：配置/数据错误（错峰撞车、queue 损坏）——要改的是配置
+    - 6：运行崩溃（bug）或心跳超龄——要去看的是机器/进程
+
+    崩溃也有日报：run_daily 的 finally 保证 data/reports/<date>.json 落盘。
+    """
+    try:
+        cfg = load_config(Path(args.config))
+    except ConfigError as exc:
+        print(f"配置错误：{exc}", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
+
+    if args.check_heartbeat:
+        try:
+            check_heartbeat(cfg.data_dir)
+        except HeartbeatStale as exc:
+            print(f"心跳异常：{exc}", file=sys.stderr)
+            return EXIT_FAILED
+        print("心跳正常：调度在 26h 内有运行记录")
+        return EXIT_OK
+
+    clock = SystemClock()
+    publish_one, prepare = _schedule_wiring(cfg, args, clock)
+    try:
+        report = run_daily(cfg, clock=clock, publish_one=publish_one, prepare=prepare)
+    except SchedulerError as exc:
+        print(f"调度配置/数据错误：{exc}", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
+    except Exception as exc:  # noqa: BLE001 - 崩溃也要转成退出码，不给 cron 丢 traceback
+        print(f"调度运行异常（当日日报已落盘）：{type(exc).__name__}: {exc}", file=sys.stderr)
+        return EXIT_FAILED
+
+    where = report_path(cfg.data_dir, report.date)
+    print(f"调度完成：{report.date}（{'工作日' if report.workday else '非工作日'}）")
+    print(f"  应发/实发 = {report.expected}/{report.published}")
+    for d in report.dispatches:
+        line = f"  - {d.platform}（{d.publish_at}）"
+        if d.skipped_reason:
+            line += f" 跳过：{d.skipped_reason}"
+        else:
+            line += f" 发 {d.published}/{d.planned}"
+        print(line)
+        for item in d.items:
+            if item.result not in ("published",):
+                print(f"      [{item.result}] {item.slug} {item.reason}")
+    if report.unresolved:
+        print(f"  ⚠️ 未解决 needs_human：{len(report.unresolved)} 篇（处理前不会自动重试）")
+        for u in report.unresolved:
+            print(f"      {u.slug}（{u.platform}，{u.since} 起）")
+    if report.prepare is not None:
+        prep = report.prepare
+        if prep.status == "prepared":
+            print(f"  明日待发   = {prep.slug}（{prep.query_id}，已入队）")
+        else:
+            print(f"  明日选题   = {prep.status}：{prep.reason}")
+    print(f"  日报       = {where}")
+    return EXIT_OK
+
+
+def _schedule_wiring(cfg: Config, args: argparse.Namespace, clock):
+    """把调度器的两个注入点接到真实实现上。
+
+    publish_one：复用 _publish 的全套链路（适配器/浏览器/锁/重试/回执），
+    mode 固定 publish —— 调度器的存在意义就是真实发布；gate 不是 publish 时
+    publish_draft 会拦（GateClosed → 记日报，不撞平台）。
+    prepare：T-17 pick + T-14 write；目标平台取 publish_at 最早的启用平台
+    （多平台各写一篇是后续工单，选题留痕按天唯一，天然一天一篇）。
+    """
+
+    def publish_one(item, platform_cfg):
+        adapter = _adapter_for(item.platform)
+        loaded = load_draft(item.draft_dir, platform=platform_cfg.key)
+        channel = None if str(args.channel).strip().lower() in {"bundled", "none", ""} else args.channel
+        browser = PersistentBrowser(
+            SessionConfig(
+                profile_root=Path(args.profile_root) if args.profile_root else DEFAULT_PROFILE_ROOT,
+                channel=channel,
+            )
+        )
+        return publish_draft(
+            adapter,
+            loaded,
+            platform_cfg,
+            gate=cfg.gate,
+            open_page=lambda: browser.open(adapter.name),
+            mode="publish",
+            data_dir=cfg.data_dir,
+            screenshot=lambda page, path: page.screenshot(path=str(path)),
+            lock_root=Path(args.lock_root) if args.lock_root else DEFAULT_LOCK_ROOT,
+            retry_max=cfg.retry_max,
+        )
+
+    def prepare() -> PrepareResult:
+        qcfg = load_query_config(Path(args.queries))
+        samples = load_samples(Path(args.samples) if args.samples else latest_samples_path())
+        qa_index = load_qa_index(cfg.data_dir / "products", qcfg)
+        prioritize = load_prioritizer(args.prioritizer)
+        platform_cfg = sorted(cfg.enabled_platforms, key=lambda p: p.publish_at)[0]
+        gaps = build_gaps(
+            samples, qcfg, qa_index, facts_count=lambda pid: _facts_count(cfg.data_dir, pid)
+        )
+        result = pick_topic(
+            gaps,
+            query_config=qcfg,
+            qa_index=qa_index,
+            log=PublishLog(cfg.data_dir / "publish-log.csv"),
+            platform=platform_cfg.key,
+            refresh_days=cfg.refresh_days,
+            data_root=cfg.data_dir,
+            prioritize=prioritize,
+            clock=clock,
+        )
+        save_trace(cfg.data_dir, result, clock=clock)
+        if result.choice is None:
+            reasons = "；".join(f"{e.query_id}: {e.reason}" for e in result.exclusions[:3])
+            return PrepareResult(status="no_topic", reason=reasons or "缺口清单为空")
+        written = write_article(
+            result.choice.product_id,
+            result.choice.query_id,
+            data_root=cfg.data_dir,
+            query_config=qcfg,
+            platform=platform_cfg,
+        )
+        return PrepareResult(
+            status="prepared",
+            slug=written.slug,
+            query_id=result.choice.query_id,
+            draft_dir=str(written.draft_dir),
+            platform=platform_cfg.key,
+        )
+
+    return publish_one, prepare
 
 
 def _snapshot(args: argparse.Namespace) -> int:

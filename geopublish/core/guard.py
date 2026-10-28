@@ -47,28 +47,32 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Pattern, Sequence
 
 from .clock import Clock, SystemClock
 from .config import PlatformConfig
 from .models import Draft, Meta
-from .state import Status
+from .state import PublishLog, Status
 
 __all__ = [
     "AI_INVOLVEMENT_VALUES",
     "CHECK_ORDER",
     "DEFAULT_WORDS_PATH",
     "R4_CHECKS",
+    "RATE_WINDOW",
     "BannedWords",
     "CheckOutcome",
     "GuardConfigError",
     "GuardRejected",
     "GuardResult",
     "Hit",
+    "RateLimited",
     "Term",
+    "check_rate",
     "load_banned_words",
+    "published_in_window",
     "require_pass",
     "self_check",
 ]
@@ -520,3 +524,60 @@ def require_pass(result: GuardResult) -> None:
     raise GuardRejected(
         f"R4 自检未通过（{', '.join(result.failed_checks)}）：{detail}"
     )
+
+
+# ---------------------------------------------------------------- 节奏控制（R14）
+# T-18 落地、T-20 接 CLI：调度与手动发布共用同一条检查，防「调度绕过节奏」（G6）。
+RATE_WINDOW = timedelta(hours=24)
+
+
+class RateLimited(RuntimeError):
+    """滚动窗口内已发达 daily_limit：拒发，阈值只能调配置，逻辑不可绕过。"""
+
+    def __init__(self, platform: str, count: int, limit: int) -> None:
+        self.platform = platform
+        self.count = count
+        self.limit = limit
+        super().__init__(
+            f"节奏控制：{platform} 24h 内已发 {count} 篇，达阈值 daily_limit={limit}（R14）"
+        )
+
+
+def published_in_window(
+    log: PublishLog, platform: str, *, clock: Clock | None = None, window: timedelta = RATE_WINDOW
+) -> int:
+    """滚动 window 内该平台已发布的篇数（按 idem_key 去重）。
+
+    只认 published 行（failed/needs_human 没发出去，不占配额）；
+    崩溃恢复会给同一篇补第二行 published，按 idem_key 去重，不按行数。
+    未来时间戳的日志行（时钟漂移）不计入 —— 那不是「已发」。
+    """
+    clk = clock if clock is not None else SystemClock()
+    now = clk.now()
+    key = str(platform).strip().lower()
+    seen: set[str] = set()
+    for entry in log.entries():
+        if entry.status is not Status.PUBLISHED:
+            continue
+        if entry.platform.strip().lower() != key:
+            continue
+        age = (now - entry.ts).total_seconds()
+        if 0 <= age < window.total_seconds():
+            seen.add(entry.idem_key)
+    return len(seen)
+
+
+def check_rate(
+    log: PublishLog,
+    platform: PlatformConfig,
+    *,
+    clock: Clock | None = None,
+    window: timedelta = RATE_WINDOW,
+) -> None:
+    """R14 硬检查：窗口内已发 ≥ daily_limit 就抛 RateLimited。
+
+    阈值在配置里（L1 可改），「要不要检查」不在配置里 —— 没有 skip 参数。
+    """
+    count = published_in_window(log, platform.key, clock=clock, window=window)
+    if count >= platform.daily_limit:
+        raise RateLimited(platform.key, count, platform.daily_limit)

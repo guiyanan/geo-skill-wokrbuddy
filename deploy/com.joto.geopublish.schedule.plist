@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  T-18 每日调度的 launchd 配置（macOS 推荐，比 cron 可靠：机器睡了会补跑）。
+
+  安装：
+    cp deploy/com.joto.geopublish.schedule.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.joto.geopublish.schedule.plist
+    launchctl start com.joto.geopublish.schedule   # 立刻验证一次
+  卸载：
+    launchctl unload ~/Library/LaunchAgents/com.joto.geopublish.schedule.plist
+
+  两个设计决定，改之前先读：
+  1. 每天跑（含周末），不按工作日过滤 —— 周末由调度器自身跳过（R16 只工作日
+     发车），但心跳要刷新；否则周末两天不跑，周一心跳监控（26h 阈值）必定误报。
+  2. 10:00 / 15:00 两个时刻对齐 config/geopublish.json 里各平台的 publish_at
+     （当前只有 csdn 10:00；15:00 给将来的掘金预留）。改了 publish_at 要同步改这里。
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.joto.geopublish.schedule</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/shiyimi/.workbuddy/binaries/python/envs/default/bin/python</string>
+        <string>-m</string>
+        <string>geopublish</string>
+        <string>schedule</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/shiyimi/WorkBuddy/2026-10-20-16-34-21</string>
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key><integer>10</integer>
+            <key>Minute</key><integer>0</integer>
+        </dict>
+        <dict>
+            <key>Hour</key><integer>15</integer>
+            <key>Minute</key><integer>0</integer>
+        </dict>
+    </array>
+    <key>StandardOutPath</key>
+    <string>/Users/shiyimi/WorkBuddy/2026-10-20-16-34-21/data/schedule/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/shiyimi/WorkBuddy/2026-10-20-16-34-21/data/schedule/launchd.err.log</string>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

@@ -1,0 +1,16 @@
+# T-18 每日调度的 crontab 示例（Linux 服务器或不用 launchd 时的备选）。
+# 安装：crontab -e 后粘贴下面两行（把 REPO 换成实际路径）。
+#
+# 与 launchd 版同两条纪律：
+# 1. 每天跑（含周末）——周末由调度器自身跳过，但心跳要刷新，否则周一误报「调度挂了」。
+# 2. 10:00 / 15:00 对齐 config/geopublish.json 的 publish_at；改了配置要同步改这里。
+#
+# 心跳监控那行：--check-heartbeat 超 26h 无运行退 6。这里用最朴素的
+# 「非零就写日志」，接外部监控（如 cron 的 MAILTO、或任何 healthcheck 服务）
+# 时把 echo 换成对应的上报命令。
+
+REPO=/Users/shiyimi/WorkBuddy/2026-10-20-16-34-21
+PY=/Users/shiyimi/.workbuddy/binaries/python/envs/default/bin/python
+
+0 10,15 * * * cd "$REPO" && "$PY" -m geopublish schedule >> data/schedule/cron.log 2>&1
+0 * * * * cd "$REPO" && "$PY" -m geopublish schedule --check-heartbeat || echo "$(date) geopublish 调度心跳异常" >> data/schedule/heartbeat-alert.log
