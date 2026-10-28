@@ -95,15 +95,15 @@ class SimulatedPrepare:
     def __init__(self):
         self.counter = 0
 
-    def __call__(self) -> PrepareResult:
+    def __call__(self) -> list[PrepareResult]:
         self.counter += 1
-        return PrepareResult(
+        return [PrepareResult(
             status="prepared",
             slug=f"topic-{self.counter}",
             query_id=f"C{self.counter:02d}",
             draft_dir=f"data/drafts/topic-{self.counter}",
             platform="csdn",
-        )
+        )]
 
 
 @pytest.mark.integration

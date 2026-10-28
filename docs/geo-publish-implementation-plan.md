@@ -1066,7 +1066,17 @@ CLI 无 `--skip-guard` 类参数，UT-16-03 走参数表递归断言钉死。
 
 - 发布失败的操作异常（GateClosed/LockError/AuthRequired/适配器错误）记日报、留队、次日再来；不认识的异常原样抛出（bug 不许吞），finally 保证日报落盘。
 - DoD「连续 5 个工作日无人干预」由 IT-18-01 假时钟验收；真实环境 5 天观察自部署 launchd 后起算（待跑）。
-- T-15 封面 DoD 仍欠人工 approve；调度发布的稿件走无封面路径（封面审批闸只拦有封面未过审的）。
+**T-18b 变更（2026-10-28 下午，拾一米决策：连续 3 天、每天 2 篇、周末照发）**
+
+| 变更 | 落地 |
+|---|---|
+| 一天多发 | `pick_topic(count=N)` 按 prioritize 顺序取前 N 个活候选（N = 平台 daily_limit）；留痕增 `choices` 列表，`choice` 保留兼容 |
+| 周末发车 | 配置新增 `workdays_only`（默认 true 保持 PRD 口径；他的配置已设 false）。UT-18-01 语义不变（默认口径下周末不触发） |
+| 单槽限 1 篇 | `MAX_PER_RUN_PER_PLATFORM=1`：一天 N 篇靠 N 个槽位摊开，不同刻连发（防机器人特征） |
+| 同槽防重 | Dispatch 增 `dispatched_at`；同一平台 3h 内重复触发跳过（`SLOT_DEDUP_MINUTES=180`），超 3h 视为下一槽位。约束：相邻槽位间隔 > 3h（10:00/15:00 ✓） |
+| 日报 prepare | 改为列表（一批多篇）；`from_json` 容忍旧单对象格式 |
+
+**配套**：`config/geopublish.json`（gitignore 内）已改 `daily_limit=2`、`workdays_only=false`；今日（10-28）队列已重置并重跑，明日待发 2 篇（deepparser-c01 / c02）。
 
 ---
 

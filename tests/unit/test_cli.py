@@ -1153,10 +1153,10 @@ def test_schedule_workday_publishes_and_prepares(tmp_path, capsys, config_file, 
         return PublishOutcome(ok=True, url="https://example.test/a-1", article_id="42")
 
     def fake_prepare():
-        return PrepareResult(
+        return [PrepareResult(
             status="prepared", slug="b-1", query_id="C02",
             draft_dir="data/drafts/b-1", platform="csdn",
-        )
+        )]
 
     monkeypatch.setattr(
         "geopublish.cli._schedule_wiring", lambda cfg, args, clock: (fake_publish, fake_prepare)
@@ -1168,7 +1168,7 @@ def test_schedule_workday_publishes_and_prepares(tmp_path, capsys, config_file, 
     assert code == EXIT_OK
     assert calls == ["a-1"]
     assert "应发/实发 = 1/1" in out
-    assert "明日待发   = b-1" in out
+    assert "明日待发   = 1 篇：b-1（C02）" in out
     queued = json.loads((data_dir / "queue.json").read_text(encoding="utf-8"))["items"]
     assert [i["slug"] for i in queued] == ["b-1"], "a-1 出队、b-1 入队"
 
@@ -1236,7 +1236,7 @@ def test_schedule_summary_prints_failures_unresolved_notopic(tmp_path, capsys, c
 
     monkeypatch.setattr(
         "geopublish.cli._schedule_wiring",
-        lambda cfg, args, clock: (fake_publish, lambda: PrepareResult(status="no_topic", reason="全部出局")),
+        lambda cfg, args, clock: (fake_publish, lambda: [PrepareResult(status="no_topic", reason="全部出局")]),
     )
 
     code = main(["schedule", "--config", str(cfg)])
@@ -1342,7 +1342,7 @@ def test_schedule_real_wiring_prepare_no_topic(tmp_path, capsys, config_file, mo
     assert code == EXIT_OK
     assert "明日选题   = no_topic" in out
     report = json.loads((data_dir / "reports" / "2026-10-26.json").read_text(encoding="utf-8"))
-    assert report["prepare"]["status"] == "no_topic"
+    assert report["prepare"][0]["status"] == "no_topic"
 
 
 def test_schedule_real_wiring_prepare_prepared(tmp_path, capsys, config_file, monkeypatch):
@@ -1359,7 +1359,7 @@ def test_schedule_real_wiring_prepare_prepared(tmp_path, capsys, config_file, mo
     ])
     out = capsys.readouterr().out
     assert code == EXIT_OK
-    assert "明日待发   = deepparser-s01" in out
+    assert "明日待发   = 1 篇：deepparser-s01（S01）" in out
     (item,) = json.loads((data_dir / "queue.json").read_text(encoding="utf-8"))["items"]
     assert item["slug"] == "deepparser-s01" and item["query_id"] == "S01"
     assert item["queued_at"].startswith("2026-10-26")
@@ -1391,7 +1391,7 @@ def test_schedule_summary_prints_failures_unresolved_notopic(tmp_path, capsys, c
 
     monkeypatch.setattr(
         "geopublish.cli._schedule_wiring",
-        lambda cfg, args, clock: (fake_publish, lambda: PrepareResult(status="no_topic", reason="全部出局")),
+        lambda cfg, args, clock: (fake_publish, lambda: [PrepareResult(status="no_topic", reason="全部出局")]),
     )
 
     code = main(["schedule", "--config", str(cfg)])
@@ -1497,7 +1497,7 @@ def test_schedule_real_wiring_prepare_no_topic(tmp_path, capsys, config_file, mo
     assert code == EXIT_OK
     assert "明日选题   = no_topic" in out
     report = json.loads((data_dir / "reports" / "2026-10-26.json").read_text(encoding="utf-8"))
-    assert report["prepare"]["status"] == "no_topic"
+    assert report["prepare"][0]["status"] == "no_topic"
 
 
 def test_schedule_real_wiring_prepare_prepared(tmp_path, capsys, config_file, monkeypatch):
@@ -1514,7 +1514,7 @@ def test_schedule_real_wiring_prepare_prepared(tmp_path, capsys, config_file, mo
     ])
     out = capsys.readouterr().out
     assert code == EXIT_OK
-    assert "明日待发   = deepparser-s01" in out
+    assert "明日待发   = 1 篇：deepparser-s01（S01）" in out
     (item,) = json.loads((data_dir / "queue.json").read_text(encoding="utf-8"))["items"]
     assert item["slug"] == "deepparser-s01" and item["query_id"] == "S01"
     assert item["queued_at"].startswith("2026-10-26")

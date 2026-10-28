@@ -15,7 +15,7 @@ T-22 的 hold/edit/pause 干预窗口就靠这一天。
 
 ## 不静默失败（R16 验收第 2 条）
 
-- 每次运行（含周末跳过）都落 `data/reports/<date>.json` —— finally 保证，
+- 每次运行（含周末被 workdays_only 跳过的）都落 `data/reports/<date>.json` —— finally 保证，
   进程崩了日报也在（UT-18-04）。
 - 心跳 `data/schedule/heartbeat.json` 每次运行刷新；`check_heartbeat`
   超 26h 无记录即告警 —— 「进程没跑」这种情况日报自己说不出话来，只能靠心跳。
@@ -88,6 +88,14 @@ SCHEDULE_TZ = timezone(timedelta(hours=8), name="CST")
 
 # 心跳阈值：调度每天至少跑一次（cron 含周末），超过 26h 无记录 = 进程大概率挂了
 HEARTBEAT_MAX_AGE_HOURS = 26
+
+# 每次运行（发车槽位）每个平台最多发几篇。多篇同槽连发是最像机器人的特征：
+# 一天 N 篇要靠 N 个槽位（10:00 / 15:00…）摊开，不是一个槽位全打出去。
+MAX_PER_RUN_PER_PLATFORM = 1
+
+# 同一平台两次发车间隔小于该值视为「同一次槽位的重复触发」（cron 双触发/人工重跑），
+# 直接跳过；大于该值才是下一个槽位。约束：相邻槽位间隔必须 > 3 小时（10:00/15:00 ✓）。
+SLOT_DEDUP_MINUTES = 180
 
 # prepare 产出的稿子投到哪个平台：目前取 publish_at 最早的启用平台。
 # 多平台各写一篇是后续工单的事（选题留痕按天唯一，天然一天一篇）。
@@ -207,6 +215,7 @@ class Dispatch:
     planned: int
     published: int
     skipped_reason: str = ""
+    dispatched_at: str = ""  # 本次发车的本地时刻 HH:MM，同槽去重靠它
     items: list[DispatchItemResult] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
@@ -215,6 +224,7 @@ class Dispatch:
             "publish_at": self.publish_at,
             "due": self.due,
             "dispatched": self.dispatched,
+            "dispatched_at": self.dispatched_at,
             "planned": self.planned,
             "published": self.published,
             "skipped_reason": self.skipped_reason,
@@ -231,6 +241,7 @@ class Dispatch:
             planned=int(data["planned"]),
             published=int(data["published"]),
             skipped_reason=str(data.get("skipped_reason") or ""),
+            dispatched_at=str(data.get("dispatched_at") or ""),
             items=[DispatchItemResult.from_json(i) for i in data.get("items") or []],
         )
 
@@ -282,7 +293,8 @@ class DayReport:
     updated_at: str
     dispatches: list[Dispatch] = field(default_factory=list)
     unresolved: list[Unresolved] = field(default_factory=list)
-    prepare: PrepareResult | None = None
+    # T-18b：一天多发后 prepare 是一批（每篇一条）；空列表 = 未运行
+    prepare: list[PrepareResult] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     error: str | None = None
 
@@ -305,7 +317,7 @@ class DayReport:
             "published": self.published,
             "dispatches": [d.to_json() for d in self.dispatches],
             "unresolved": [u.to_json() for u in self.unresolved],
-            "prepare": None if self.prepare is None else self.prepare.to_json(),
+            "prepare": [p.to_json() for p in self.prepare],
             "notes": list(self.notes),
             "error": self.error,
         }
@@ -317,7 +329,14 @@ class DayReport:
         for key in ("date", "workday", "generated_at", "updated_at"):
             if key not in data:
                 raise SchedulerError(f"{where} 缺字段：{key}")
+        # T-18b 前 prepare 是单对象，读旧日报时包成列表（同日重跑合并要用）
         prepare_raw = data.get("prepare")
+        if prepare_raw is None:
+            prepare = []
+        elif isinstance(prepare_raw, Mapping):
+            prepare = [PrepareResult.from_json(prepare_raw)]
+        else:
+            prepare = [PrepareResult.from_json(p) for p in prepare_raw]
         return cls(
             date=str(data["date"]),
             workday=bool(data["workday"]),
@@ -325,7 +344,7 @@ class DayReport:
             updated_at=str(data["updated_at"]),
             dispatches=[Dispatch.from_json(d) for d in data.get("dispatches") or []],
             unresolved=[Unresolved.from_json(u) for u in data.get("unresolved") or []],
-            prepare=None if prepare_raw is None else PrepareResult.from_json(prepare_raw),
+            prepare=prepare,
             notes=[str(n) for n in data.get("notes") or []],
             error=data.get("error"),
         )
@@ -482,7 +501,9 @@ def check_heartbeat(
 # publish_one 的签名：(QueueItem, PlatformConfig) -> 带 ok/url/reason/skipped_duplicate/
 # failure_kind 的对象（生产接线就是 publish_draft 的 PublishOutcome）。
 PublishOne = Callable[[QueueItem, PlatformConfig], Any]
-Prepare = Callable[[], PrepareResult]
+# prepare 的签名：() -> list[PrepareResult]（T-18b 一天多发：一次产一批；
+# 空列表等价于「今天没的可写」）。运行期输入错误抛 PickerError/PipelineError。
+Prepare = Callable[[], "list[PrepareResult]"]
 
 # 这些异常是「这次运行环境/输入的问题」，记进日报继续走；其余异常（bug）
 # 原样抛出 —— finally 保证日报照样落盘（UT-18-04）。
@@ -517,8 +538,10 @@ def run_daily(
     try:
         existing = load_report(data_root, day)
         check_stagger(cfg.enabled_platforms)
-        if not report.workday:
-            report.notes.append(f"{day.isoformat()} 是周末：非工作日不触发（R16 只工作日发车）")
+        if cfg.workdays_only and not report.workday:
+            report.notes.append(
+                f"{day.isoformat()} 是周末：workdays_only=true，非工作日不触发"
+            )
             return report
         if not cfg.enabled_platforms:
             raise SchedulerError("配置里没有启用的平台：没有平台就没有发车对象")
@@ -527,28 +550,43 @@ def run_daily(
         report.unresolved = unresolved_human(log)
 
         queue = load_queue(queue_path(data_root))
-        carried = {d.platform: d for d in existing.dispatches if d.dispatched} if existing else {}
+        # 当日已发车的记录保留（日报汇总会用到），同槽位（3h 内）的用来防重发
+        prior = list(existing.dispatches) if existing else []
+        report.dispatches = [d for d in prior if d.dispatched]
         for platform_cfg in sorted(cfg.enabled_platforms, key=lambda p: p.publish_at):
-            if platform_cfg.key in carried:
-                report.dispatches.append(carried[platform_cfg.key])
-                report.notes.append(f"{platform_cfg.key} 今日已发车，本次运行跳过（防同日重发）")
+            recent = next(
+                (
+                    d
+                    for d in report.dispatches
+                    if d.platform == platform_cfg.key and _same_slot(d.dispatched_at, local)
+                ),
+                None,
+            )
+            if recent is not None:
+                report.notes.append(
+                    f"{platform_cfg.key} {recent.dispatched_at} 已发车，本次运行跳过（同槽位防重发）"
+                )
                 continue
             dispatch, queue = _dispatch(platform_cfg, queue, log, local, tz, publish_one, clk)
             report.dispatches.append(dispatch)
         save_queue(queue_path(data_root), queue)
 
         report.prepare, fresh = _run_prepare(data_root, day, existing, prepare)
-        if fresh and report.prepare.status == "prepared":
-            queue.append(
-                QueueItem(
-                    slug=report.prepare.slug,
-                    draft_dir=report.prepare.draft_dir,
-                    platform=report.prepare.platform,
-                    query_id=report.prepare.query_id,
-                    queued_at=now,
+        if fresh:
+            for prep in report.prepare:
+                if prep.status != "prepared":
+                    continue
+                queue.append(
+                    QueueItem(
+                        slug=prep.slug,
+                        draft_dir=prep.draft_dir,
+                        platform=prep.platform,
+                        query_id=prep.query_id,
+                        queued_at=now,
+                    )
                 )
-            )
-            save_queue(queue_path(data_root), queue)
+            if any(p.status == "prepared" for p in report.prepare):
+                save_queue(queue_path(data_root), queue)
         return report
     except Exception as exc:
         # 不吞：异常照样抛给调用方（CLI 退 6），但日报先把现场钉下来
@@ -591,6 +629,7 @@ def _dispatch(
 
     dispatch.due = True
     dispatch.dispatched = True
+    dispatch.dispatched_at = local.strftime("%H:%M")
 
     keep: list[QueueItem] = []
     candidates: list[QueueItem] = []
@@ -628,8 +667,9 @@ def _dispatch(
         return dispatch, others + keep
 
     published_count = published_in_window(log, platform_cfg.key, clock=clock)
-    budget = platform_cfg.daily_limit - published_count
-    if budget <= 0:
+    # 双闸门：24h 硬顶（daily_limit，R14）× 单槽限发（MAX_PER_RUN，防同刻连发）。
+    budget = min(platform_cfg.daily_limit - published_count, MAX_PER_RUN_PER_PLATFORM)
+    if platform_cfg.daily_limit - published_count <= 0:
         # UT-18-05 / G6：调度触发同样过节奏检查，原因写进日报，不静默跳过
         dispatch.skipped_reason = (
             f"已达节奏阈值：24h 内已发 {published_count} 篇 ≥ daily_limit "
@@ -683,11 +723,23 @@ def _dispatch(
     if overflow:
         dispatch.items.extend(
             DispatchItemResult(slug=i.slug, result="deferred",
-                               reason=f"超出今日节奏预算（daily_limit {platform_cfg.daily_limit}），留到下一工作日")
+                               reason="超出本槽配额（单槽限 1 篇，防同刻连发），留到下一槽位")
             for i in overflow
         )
         keep.extend(overflow)
     return dispatch, others + keep
+
+
+def _same_slot(dispatched_at: str, local: datetime) -> bool:
+    """上次发车时刻与当前时刻是否同一槽位（间隔 < SLOT_DEDUP_MINUTES）。
+
+    解析失败按「不同槽」处理：宁可多判一次发车，幂等层（SKIPPED_DUPLICATE）兜底。
+    """
+    try:
+        hh, mm = (int(x) for x in dispatched_at.split(":"))
+    except ValueError:
+        return False
+    return abs((local.hour * 60 + local.minute) - (hh * 60 + mm)) < SLOT_DEDUP_MINUTES
 
 
 def _latest_status(log: PublishLog, platform: str, slug: str) -> Status | None:
@@ -705,35 +757,38 @@ def _run_prepare(
     day: date,
     existing: DayReport | None,
     prepare: Prepare | None,
-) -> tuple[PrepareResult, bool]:
-    """prepare 阶段（选题+成稿）。已完成过就跳过——同日重复选题比不选更难查。
+) -> tuple[list[PrepareResult], bool]:
+    """prepare 阶段（选题+成稿，T-18b 起一批多篇）。已完成过就跳过——
+    同日重复选题比不选更难查。
 
-    返回（结果, 是否本次新跑）：承接旧日报的 prepared 不算新跑，
+    返回（结果列表, 是否本次新跑）：承接旧日报的结果不算新跑，
     调用方只对「新跑成的」入队，否则同日重跑会把同一篇塞两次。
 
     判定「已完成」看两处：当日日报（库调用/测试路径）与 data/select/<date>.json
     留痕（生产路径，pick 落盘）。失败（failed）不算完成，同日重跑会重试。
     """
-    if existing is not None and existing.prepare is not None and existing.prepare.status in (
-        "prepared",
-        "no_topic",
+    if existing is not None and existing.prepare and all(
+        p.status in ("prepared", "no_topic") for p in existing.prepare
     ):
         return existing.prepare, False
     if (data_root / "select" / f"{day.isoformat()}.json").exists():
-        return PrepareResult(
+        return [PrepareResult(
             status="skipped",
             reason=f"今日选题留痕已存在（data/select/{day.isoformat()}.json），跳过 prepare",
-        ), False
+        )], False
     if prepare is None:
-        return PrepareResult(status="skipped", reason="未接线 prepare：本次运行不选题"), False
+        return [PrepareResult(status="skipped", reason="未接线 prepare：本次运行不选题")], False
     from ..select.picker import PickerError
     from ..write.pipeline import PipelineError
 
     try:
-        return prepare(), True
+        results = list(prepare())
     except (PickerError, PipelineError) as exc:
         # 选题/成稿的输入类失败是「今天的料不够」，不是进程故障：记进日报，明天再来
-        return PrepareResult(status="failed", reason=f"{type(exc).__name__}: {exc}"), True
+        return [PrepareResult(status="failed", reason=f"{type(exc).__name__}: {exc}")], True
+    if not results:
+        return [PrepareResult(status="no_topic", reason="prepare 返回空清单")], True
+    return results, True
 
 
 # 运行期可预期的操作异常：记日报、留队、继续。其余异常 = bug，原样抛（finally 出日报）。

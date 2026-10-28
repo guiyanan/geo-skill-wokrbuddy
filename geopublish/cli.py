@@ -823,12 +823,16 @@ def _schedule(args: argparse.Namespace) -> int:
         print(f"  ⚠️ 未解决 needs_human：{len(report.unresolved)} 篇（处理前不会自动重试）")
         for u in report.unresolved:
             print(f"      {u.slug}（{u.platform}，{u.since} 起）")
-    if report.prepare is not None:
-        prep = report.prepare
-        if prep.status == "prepared":
-            print(f"  明日待发   = {prep.slug}（{prep.query_id}，已入队）")
-        else:
-            print(f"  明日选题   = {prep.status}：{prep.reason}")
+    if report.prepare:
+        prepared = [p for p in report.prepare if p.status == "prepared"]
+        if prepared:
+            print(
+                f"  明日待发   = {len(prepared)} 篇："
+                + "、".join(f"{p.slug}（{p.query_id}）" for p in prepared)
+            )
+        for prep in report.prepare:
+            if prep.status != "prepared":
+                print(f"  明日选题   = {prep.status}：{prep.reason}")
     print(f"  日报       = {where}")
     return EXIT_OK
 
@@ -866,7 +870,7 @@ def _schedule_wiring(cfg: Config, args: argparse.Namespace, clock):
             retry_max=cfg.retry_max,
         )
 
-    def prepare() -> PrepareResult:
+    def prepare() -> list[PrepareResult]:
         qcfg = load_query_config(Path(args.queries))
         samples = load_samples(Path(args.samples) if args.samples else latest_samples_path())
         qa_index = load_qa_index(cfg.data_dir / "products", qcfg)
@@ -875,6 +879,7 @@ def _schedule_wiring(cfg: Config, args: argparse.Namespace, clock):
         gaps = build_gaps(
             samples, qcfg, qa_index, facts_count=lambda pid: _facts_count(cfg.data_dir, pid)
         )
+        # T-18b：一天发几篇（daily_limit）就选几题，按 prioritize 顺序取前 N 个
         result = pick_topic(
             gaps,
             query_config=qcfg,
@@ -885,25 +890,31 @@ def _schedule_wiring(cfg: Config, args: argparse.Namespace, clock):
             data_root=cfg.data_dir,
             prioritize=prioritize,
             clock=clock,
+            count=platform_cfg.daily_limit,
         )
         save_trace(cfg.data_dir, result, clock=clock)
-        if result.choice is None:
+        if not result.choices:
             reasons = "；".join(f"{e.query_id}: {e.reason}" for e in result.exclusions[:3])
-            return PrepareResult(status="no_topic", reason=reasons or "缺口清单为空")
-        written = write_article(
-            result.choice.product_id,
-            result.choice.query_id,
-            data_root=cfg.data_dir,
-            query_config=qcfg,
-            platform=platform_cfg,
-        )
-        return PrepareResult(
-            status="prepared",
-            slug=written.slug,
-            query_id=result.choice.query_id,
-            draft_dir=str(written.draft_dir),
-            platform=platform_cfg.key,
-        )
+            return [PrepareResult(status="no_topic", reason=reasons or "缺口清单为空")]
+        out: list[PrepareResult] = []
+        for choice in result.choices:
+            written = write_article(
+                choice.product_id,
+                choice.query_id,
+                data_root=cfg.data_dir,
+                query_config=qcfg,
+                platform=platform_cfg,
+            )
+            out.append(
+                PrepareResult(
+                    status="prepared",
+                    slug=written.slug,
+                    query_id=choice.query_id,
+                    draft_dir=str(written.draft_dir),
+                    platform=platform_cfg.key,
+                )
+            )
+        return out
 
     return publish_one, prepare
 
@@ -976,6 +987,7 @@ def _summary(cfg: Config, path: Path) -> list[str]:
         f"  data_dir   = {cfg.data_dir}",
         f"  retry_max  = {cfg.retry_max}",
         f"  refresh    = {cfg.refresh_days} 天",
+        f"  workdays   = {'仅工作日发车' if cfg.workdays_only else '每天发车（含周末）'}",
     ]
     return lines
 

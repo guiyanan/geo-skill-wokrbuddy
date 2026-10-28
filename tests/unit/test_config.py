@@ -269,3 +269,14 @@ def test_comment_keys_are_ignored():
     cfg = Config.from_dict(payload(_comment="给人看的说明"))
 
     assert cfg.platform("csdn")
+
+
+def test_workdays_only_defaults_true():
+    """PRD R16 默认口径：只工作日发车。"""
+    cfg = Config.from_dict(payload())
+    assert cfg.workdays_only is True
+
+
+def test_workdays_only_non_bool_rejected():
+    with pytest.raises(ConfigError, match="workdays_only"):
+        Config.from_dict(payload(workdays_only="yes"))

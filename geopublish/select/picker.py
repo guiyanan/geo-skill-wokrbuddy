@@ -162,6 +162,8 @@ class PickResult:
     gaps: tuple[Gap, ...]
     prioritized: tuple[dict[str, Any], ...]
     exclusions: tuple[Exclusion, ...]
+    # T-18b：一天多发时选前 N 个活候选；choice == choices[0]（兼容单选调用方）
+    choices: tuple[TopicChoice, ...] = ()
 
 
 # ---------------------------------------------------------------- geo-master 装载
@@ -411,11 +413,13 @@ def pick_topic(
     data_root: str | Path,
     prioritize: Callable[[list[dict]], list[dict]] | None = None,
     clock: Clock | None = None,
+    count: int = 1,
 ) -> PickResult:
     """缺口清单 → 今日选题（或 no_topic）。
 
     排序只调一次 prioritize 且**不重排**：返回顺序就是优先级顺序，
-    第一个活下来的候选就是答案（PRD §9.3：不得自建排序）。
+    前 count 个活下来的候选就是答案（PRD §9.3：不得自建排序）。
+    count=1 是 T-17 的单选行为；>1（T-18b 一天多发）按同一顺序取前 N 个。
     """
     clock = clock or SystemClock()
     platform = str(platform).strip().lower()
@@ -423,6 +427,8 @@ def pick_topic(
         raise PickerError("platform 不能为空")
     if refresh_days < 1:
         raise PickerError(f"refresh_days 必须 ≥ 1，收到 {refresh_days}")
+    if count < 1:
+        raise PickerError(f"count 必须 ≥ 1，收到 {count}")
 
     seen: set[str] = set()
     for gap in gaps:
@@ -436,7 +442,7 @@ def pick_topic(
     rows = prioritize([g.to_row() for g in gaps])
 
     exclusions: list[Exclusion] = []
-    choice: TopicChoice | None = None
+    choices: list[TopicChoice] = []
     for row in rows:
         qid = str(row.get("缺口") or "").strip().upper()
         tier = str(row.get("档位") or "").strip()
@@ -481,25 +487,29 @@ def pick_topic(
             continue
 
         gap = gap_by_id[qid]
-        choice = TopicChoice(
-            query_id=query.id,
-            query_text=query.text,
-            product_id=entry.product_id,
-            tier=tier,
-            score=float(row.get("优先级分") or 0),
-            quadrant=str(row.get("象限") or ""),
-            gap=gap.to_row() | {"evidence": dict(gap.evidence)},
+        choices.append(
+            TopicChoice(
+                query_id=query.id,
+                query_text=query.text,
+                product_id=entry.product_id,
+                tier=tier,
+                score=float(row.get("优先级分") or 0),
+                quadrant=str(row.get("象限") or ""),
+                gap=gap.to_row() | {"evidence": dict(gap.evidence)},
+            )
         )
-        break
+        if len(choices) >= count:
+            break
 
     return PickResult(
-        status="picked" if choice else "no_topic",
+        status="picked" if choices else "no_topic",
         platform=platform,
         refresh_days=refresh_days,
-        choice=choice,
+        choice=choices[0] if choices else None,
         gaps=tuple(gaps),
         prioritized=tuple(dict(r) for r in rows),
         exclusions=tuple(exclusions),
+        choices=tuple(choices),
     )
 
 
@@ -554,6 +564,19 @@ def save_trace(data_root: str | Path, result: PickResult, *, clock: Clock | None
             "quadrant": result.choice.quadrant,
             "gap": result.choice.gap,
         },
+        # T-18b：一天多发时这里是全部选中项（含第一个），choice 保留是给旧消费者
+        "choices": [
+            {
+                "query_id": c.query_id,
+                "query_text": c.query_text,
+                "product_id": c.product_id,
+                "tier": c.tier,
+                "score": c.score,
+                "quadrant": c.quadrant,
+                "gap": c.gap,
+            }
+            for c in result.choices
+        ],
         "gaps": [g.to_row() | {"evidence": dict(g.evidence)} for g in result.gaps],
         "prioritized": list(result.prioritized),
         "exclusions": [

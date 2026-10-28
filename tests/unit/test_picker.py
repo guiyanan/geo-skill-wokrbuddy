@@ -155,6 +155,7 @@ def _pick(
     reviewed=True,
     refresh_days=30,
     platform="csdn",
+    count=1,
 ):
     """装配一套最小可用的 pick 环境。返回 (PickResult, data_dir)。"""
     data_dir = tmp_path / "data"
@@ -175,6 +176,7 @@ def _pick(
         data_root=data_dir,
         prioritize=prioritize,
         clock=clock,
+        count=count,
     )
     return result, data_dir
 
@@ -867,3 +869,93 @@ def test_load_samples_validates_shape(tmp_path):
         load_samples(path)
     path.write_text(json.dumps([{"query_id": "S01"}]), encoding="utf-8")
     assert load_samples(path) == [{"query_id": "S01"}]
+
+
+# ---------------------------------------------------------------- T-18b 一次多选（count）
+
+def test_t18b_count_two_picks_top_two_in_priority_order(tmp_path):
+    """count=2：按 prioritize 返回顺序取前两个活候选，choice == choices[0]（兼容单选）。"""
+    prio = _fake_prioritize(["P0", "P0", "P2"])
+    result, _ = _pick(
+        tmp_path,
+        [_gap("S01"), _gap("C01"), _gap("D01")],
+        prioritize=prio,
+        qa_query_ids=("S01", "C01", "D01"),
+        count=2,
+    )
+    assert result.status == "picked"
+    assert [c.query_id for c in result.choices] == ["S01", "C01"]
+    assert result.choice is result.choices[0], "旧消费方读的 choice 必须还是首选"
+
+
+def test_t18b_count_larger_than_alive_degrades(tmp_path):
+    """活候选不足 N 个：有几个选几个，不硬凑。"""
+    prio = _fake_prioritize(["P0", "P2"])
+    result, _ = _pick(
+        tmp_path, [_gap("S01"), _gap("C01")], prioritize=prio,
+        qa_query_ids=("S01", "C01"), count=5,
+    )
+    assert [c.query_id for c in result.choices] == ["S01"]
+
+
+def test_t18b_count_below_one_rejected(tmp_path):
+    with pytest.raises(PickerError, match="count"):
+        _pick(tmp_path, [_gap("S01")], prioritize=_fake_prioritize(["P0"]), count=0)
+
+
+def test_t18b_trace_records_all_choices(tmp_path):
+    """留痕：choices 全量在，choice 保留给旧消费方。"""
+    prio = _fake_prioritize(["P0", "P0"])
+    result, data_dir = _pick(
+        tmp_path, [_gap("S01"), _gap("C01")], prioritize=prio,
+        qa_query_ids=("S01", "C01"), count=2,
+    )
+    trace = save_trace(data_dir, result)
+    payload = json.loads(trace.read_text(encoding="utf-8"))
+    assert [c["query_id"] for c in payload["choices"]] == ["S01", "C01"]
+    assert payload["choice"]["query_id"] == "S01"
+
+
+# ---------------------------------------------------------------- T-18b 一次多选（count）
+
+def test_t18b_count_two_picks_top_two_in_priority_order(tmp_path):
+    """count=2：按 prioritize 返回顺序取前两个活候选，choice == choices[0]（兼容单选）。"""
+    prio = _fake_prioritize(["P0", "P0", "P2"])
+    result, _ = _pick(
+        tmp_path,
+        [_gap("S01"), _gap("C01"), _gap("D01")],
+        prioritize=prio,
+        qa_query_ids=("S01", "C01", "D01"),
+        count=2,
+    )
+    assert result.status == "picked"
+    assert [c.query_id for c in result.choices] == ["S01", "C01"]
+    assert result.choice is result.choices[0], "旧消费方读的 choice 必须还是首选"
+
+
+def test_t18b_count_larger_than_alive_degrades(tmp_path):
+    """活候选不足 N 个：有几个选几个，不硬凑。"""
+    prio = _fake_prioritize(["P0", "P2"])
+    result, _ = _pick(
+        tmp_path, [_gap("S01"), _gap("C01")], prioritize=prio,
+        qa_query_ids=("S01", "C01"), count=5,
+    )
+    assert [c.query_id for c in result.choices] == ["S01"]
+
+
+def test_t18b_count_below_one_rejected(tmp_path):
+    with pytest.raises(PickerError, match="count"):
+        _pick(tmp_path, [_gap("S01")], prioritize=_fake_prioritize(["P0"]), count=0)
+
+
+def test_t18b_trace_records_all_choices(tmp_path):
+    """留痕：choices 全量在，choice 保留给旧消费方。"""
+    prio = _fake_prioritize(["P0", "P0"])
+    result, data_dir = _pick(
+        tmp_path, [_gap("S01"), _gap("C01")], prioritize=prio,
+        qa_query_ids=("S01", "C01"), count=2,
+    )
+    trace = save_trace(data_dir, result)
+    payload = json.loads(trace.read_text(encoding="utf-8"))
+    assert [c["query_id"] for c in payload["choices"]] == ["S01", "C01"]
+    assert payload["choice"]["query_id"] == "S01"

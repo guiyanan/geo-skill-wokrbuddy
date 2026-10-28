@@ -51,7 +51,7 @@ SAT = "2026-10-24T10:00:00+08:00"
 
 
 # ---------------------------------------------------------------- helpers
-def make_config(tmp_path: Path, *, platforms=None, gate="publish") -> Config:
+def make_config(tmp_path: Path, *, platforms=None, gate="publish", workdays_only=True) -> Config:
     if platforms is None:
         platforms = [{"name": "csdn", "publish_at": "10:00", "daily_limit": 1}]
     return Config.from_dict(
@@ -60,6 +60,7 @@ def make_config(tmp_path: Path, *, platforms=None, gate="publish") -> Config:
             "platforms": platforms,
             "report": {"email": "t@example.com"},
             "data_dir": str(tmp_path),
+            "workdays_only": workdays_only,
         }
     )
 
@@ -122,9 +123,9 @@ class FakePublisher:
 def fake_prepare(result: PrepareResult):
     calls = []
 
-    def _prepare() -> PrepareResult:
+    def _prepare() -> list[PrepareResult]:
         calls.append(1)
-        return result
+        return [result]
 
     _prepare.calls = calls
     return _prepare
@@ -518,7 +519,7 @@ class TestTwoPhase:
 
         assert publisher.calls == ["a-1"], "第二次运行不许重发"
         assert prep.calls == [1], "第二次运行不许重复选题"
-        assert report2.prepare is not None and report2.prepare.status == "prepared"
+        assert len(report2.prepare) == 1 and report2.prepare[0].status == "prepared"
         assert report2.published == 1  # 合并后的当日总量不丢
         # a-1 出队、b-1 入队
         assert [i.slug for i in load_queue(queue_path(tmp_path))] == ["b-1"]
@@ -538,7 +539,7 @@ class TestTwoPhase:
         assert disp.due is False and disp.dispatched is False
         assert "未到" in disp.skipped_reason
         assert prep.calls == [1]
-        assert report.prepare is not None and report.prepare.status == "no_topic"
+        assert len(report.prepare) == 1 and report.prepare[0].status == "no_topic"
         # 同日第二次运行到点了：还能发车（未到点不算「已发车」）
         report2 = run_daily(make_config(tmp_path), clock=FakeClock(MON), publish_one=publisher)
         assert publisher.calls == ["a-1"]
@@ -555,7 +556,7 @@ class TestPrepare:
         )
         report = run_daily(make_config(tmp_path), clock=FakeClock(MON), publish_one=FakePublisher(), prepare=prep)
 
-        assert report.prepare is not None and report.prepare.status == "prepared"
+        assert len(report.prepare) == 1 and report.prepare[0].status == "prepared"
         (item,) = load_queue(queue_path(tmp_path))
         assert item.slug == "a-1" and item.query_id == "C01"
         assert item.queued_at.date().isoformat() == "2026-10-26"
@@ -563,8 +564,7 @@ class TestPrepare:
     def test_no_topic_is_a_legit_result(self, tmp_path):
         prep = fake_prepare(PrepareResult(status="no_topic", reason="全部出局"))
         report = run_daily(make_config(tmp_path), clock=FakeClock(MON), publish_one=FakePublisher(), prepare=prep)
-        assert report.prepare is not None
-        assert report.prepare.status == "no_topic"
+        assert [p.status for p in report.prepare] == ["no_topic"]
         assert load_queue(queue_path(tmp_path)) == []
 
     def test_prepare_failure_recorded_not_raised(self, tmp_path):
@@ -572,8 +572,8 @@ class TestPrepare:
             raise PickerError("geo-monitor 没有任何一期 samples.json")
 
         report = run_daily(make_config(tmp_path), clock=FakeClock(MON), publish_one=FakePublisher(), prepare=boom)
-        assert report.prepare is not None and report.prepare.status == "failed"
-        assert "samples" in report.prepare.reason
+        assert len(report.prepare) == 1 and report.prepare[0].status == "failed"
+        assert "samples" in report.prepare[0].reason
 
     def test_existing_select_trace_skips_prepare(self, tmp_path):
         """生产侧防重：今日留痕已存在 = 选题已做过，prepare 不再跑。"""
@@ -584,11 +584,11 @@ class TestPrepare:
         report = run_daily(make_config(tmp_path), clock=FakeClock(MON), publish_one=FakePublisher(), prepare=prep)
 
         assert prep.calls == []
-        assert report.prepare is not None and report.prepare.status == "skipped"
+        assert len(report.prepare) == 1 and report.prepare[0].status == "skipped"
 
     def test_prepare_not_wired(self, tmp_path):
         report = run_daily(make_config(tmp_path), clock=FakeClock(MON), publish_one=FakePublisher())
-        assert report.prepare is not None and report.prepare.status == "skipped"
+        assert len(report.prepare) == 1 and report.prepare[0].status == "skipped"
 
 
 # ---------------------------------------------------------------- 队列内终态处置
@@ -684,7 +684,7 @@ class TestReportIO:
                 )
             ],
             unresolved=[Unresolved(slug="s-1", platform="csdn", note="n", since=MON)],
-            prepare=PrepareResult(status="no_topic", reason="全部出局"),
+            prepare=[PrepareResult(status="no_topic", reason="全部出局")],
             notes=["测试"],
             error=None,
         )
@@ -828,4 +828,238 @@ class TestEdgeCases:
         report = run_daily(cfg, clock=FakeClock("2026-10-26T11:00:00+08:00"),
                            publish_one=FakePublisher(), prepare=prep)
         assert prep.calls == [1], "崩溃时没跑成的 prepare，同日重跑要补上"
-        assert report.prepare is not None and report.prepare.slug == "b-1"
+        assert len(report.prepare) == 1 and report.prepare[0].slug == "b-1"
+
+
+# ---------------------------------------------------------------- T-18b：周末发车 + 单槽限 1 + 批量 prepare
+@pytest.mark.unit
+class TestWeekendAndBatch:
+    def test_weekend_publishes_when_workdays_only_false(self, tmp_path):
+        """T-18b（拾一米 2026-10-28 决策）：workdays_only=false → 周末照常发车选题。"""
+        save_queue(queue_path(tmp_path), [qi("a-1", "2026-10-23T10:00:00+08:00")])
+        publisher = FakePublisher()
+        prep = fake_prepare(
+            PrepareResult(status="prepared", slug="b-1", query_id="C02",
+                          draft_dir="data/drafts/b-1", platform="csdn")
+        )
+        cfg = make_config(tmp_path, workdays_only=False)
+        report = run_daily(cfg, clock=FakeClock(SAT), publish_one=publisher, prepare=prep)
+
+        assert publisher.calls == ["a-1"]
+        assert prep.calls == [1]
+        assert report.published == 1
+        on_disk = read_report(tmp_path, "2026-10-24")
+        assert on_disk["workday"] is False, "workday 只是事实记录，不再是闸门"
+        assert on_disk["published"] == 1
+
+    def test_per_run_cap_one_per_slot(self, tmp_path):
+        """单槽限 1 篇：daily_limit=2 + 队列两篇 → 本槽发 1 篇，另一篇留到下一槽。"""
+        cfg = make_config(
+            tmp_path, platforms=[{"name": "csdn", "publish_at": "10:00", "daily_limit": 2}]
+        )
+        save_queue(
+            queue_path(tmp_path),
+            [qi("a-1", "2026-10-25T10:00:00+08:00"), qi("a-2", "2026-10-25T11:00:00+08:00")],
+        )
+        publisher = FakePublisher()
+        report = run_daily(cfg, clock=FakeClock(MON), publish_one=publisher)
+
+        assert publisher.calls == ["a-1"], "同一槽位不许连发两篇"
+        results = {i.slug: i.result for i in report.dispatches[0].items}
+        assert results["a-2"] == "deferred"
+        assert "单槽" in [i for i in report.dispatches[0].items if i.slug == "a-2"][0].reason
+        assert [i.slug for i in load_queue(queue_path(tmp_path))] == ["a-2"]
+
+    def test_prepare_batch_of_two_queues_two(self, tmp_path):
+        """prepare 一次产两篇 → 两篇都入队，明天起按槽位分别发出。"""
+        prep = fake_prepare_batch(
+            [
+                PrepareResult(status="prepared", slug="a-1", query_id="C01",
+                              draft_dir="data/drafts/a-1", platform="csdn"),
+                PrepareResult(status="prepared", slug="a-2", query_id="C02",
+                              draft_dir="data/drafts/a-2", platform="csdn"),
+            ]
+        )
+        report = run_daily(make_config(tmp_path), clock=FakeClock(MON),
+                           publish_one=FakePublisher(), prepare=prep)
+
+        assert [p.slug for p in report.prepare] == ["a-1", "a-2"]
+        assert [i.slug for i in load_queue(queue_path(tmp_path))] == ["a-1", "a-2"]
+
+    def test_prepare_empty_list_means_no_topic(self, tmp_path):
+        report = run_daily(make_config(tmp_path), clock=FakeClock(MON),
+                           publish_one=FakePublisher(), prepare=lambda: [])
+        assert [p.status for p in report.prepare] == ["no_topic"]
+
+    def test_two_slots_drain_two_items_same_day(self, tmp_path):
+        """10:00 槽发 a-1，15:00 槽发 a-2：一天两篇、间隔 5 小时、各自落日报。"""
+        cfg = make_config(
+            tmp_path, platforms=[{"name": "csdn", "publish_at": "10:00", "daily_limit": 2}]
+        )
+        save_queue(
+            queue_path(tmp_path),
+            [qi("a-1", "2026-10-25T10:00:00+08:00"), qi("a-2", "2026-10-25T11:00:00+08:00")],
+        )
+        publisher = FakePublisher()
+        run_daily(cfg, clock=FakeClock("2026-10-26T10:00:00+08:00"), publish_one=publisher)
+        report2 = run_daily(cfg, clock=FakeClock("2026-10-26T15:05:00+08:00"), publish_one=publisher)
+
+        assert publisher.calls == ["a-1", "a-2"]
+        assert report2.published == 2, "当日日报合并两个槽位的实发"
+        assert load_queue(queue_path(tmp_path)) == []
+
+
+def fake_prepare_batch(results):
+    calls = []
+
+    def _prepare():
+        calls.append(1)
+        return list(results)
+
+    _prepare.calls = calls
+    return _prepare
+
+
+# ---------------------------------------------------------------- T-18b：周末发车 + 单槽限 1 + 批量 prepare
+@pytest.mark.unit
+class TestWeekendAndBatch:
+    def test_weekend_publishes_when_workdays_only_false(self, tmp_path):
+        """T-18b（拾一米 2026-10-28 决策）：workdays_only=false → 周末照常发车选题。"""
+        save_queue(queue_path(tmp_path), [qi("a-1", "2026-10-23T10:00:00+08:00")])
+        publisher = FakePublisher()
+        prep = fake_prepare(
+            PrepareResult(status="prepared", slug="b-1", query_id="C02",
+                          draft_dir="data/drafts/b-1", platform="csdn")
+        )
+        cfg = make_config(tmp_path, workdays_only=False)
+        report = run_daily(cfg, clock=FakeClock(SAT), publish_one=publisher, prepare=prep)
+
+        assert publisher.calls == ["a-1"]
+        assert prep.calls == [1]
+        assert report.published == 1
+        on_disk = read_report(tmp_path, "2026-10-24")
+        assert on_disk["workday"] is False, "workday 只是事实记录，不再是闸门"
+        assert on_disk["published"] == 1
+
+    def test_per_run_cap_one_per_slot(self, tmp_path):
+        """单槽限 1 篇：daily_limit=2 + 队列两篇 → 本槽发 1 篇，另一篇留到下一槽。"""
+        cfg = make_config(
+            tmp_path, platforms=[{"name": "csdn", "publish_at": "10:00", "daily_limit": 2}]
+        )
+        save_queue(
+            queue_path(tmp_path),
+            [qi("a-1", "2026-10-25T10:00:00+08:00"), qi("a-2", "2026-10-25T11:00:00+08:00")],
+        )
+        publisher = FakePublisher()
+        report = run_daily(cfg, clock=FakeClock(MON), publish_one=publisher)
+
+        assert publisher.calls == ["a-1"], "同一槽位不许连发两篇"
+        results = {i.slug: i.result for i in report.dispatches[0].items}
+        assert results["a-2"] == "deferred"
+        assert "单槽" in [i for i in report.dispatches[0].items if i.slug == "a-2"][0].reason
+        assert [i.slug for i in load_queue(queue_path(tmp_path))] == ["a-2"]
+
+    def test_prepare_batch_of_two_queues_two(self, tmp_path):
+        """prepare 一次产两篇 → 两篇都入队，明天起按槽位分别发出。"""
+        prep = fake_prepare_batch(
+            [
+                PrepareResult(status="prepared", slug="a-1", query_id="C01",
+                              draft_dir="data/drafts/a-1", platform="csdn"),
+                PrepareResult(status="prepared", slug="a-2", query_id="C02",
+                              draft_dir="data/drafts/a-2", platform="csdn"),
+            ]
+        )
+        report = run_daily(make_config(tmp_path), clock=FakeClock(MON),
+                           publish_one=FakePublisher(), prepare=prep)
+
+        assert [p.slug for p in report.prepare] == ["a-1", "a-2"]
+        assert [i.slug for i in load_queue(queue_path(tmp_path))] == ["a-1", "a-2"]
+
+    def test_prepare_empty_list_means_no_topic(self, tmp_path):
+        report = run_daily(make_config(tmp_path), clock=FakeClock(MON),
+                           publish_one=FakePublisher(), prepare=lambda: [])
+        assert [p.status for p in report.prepare] == ["no_topic"]
+
+    def test_two_slots_drain_two_items_same_day(self, tmp_path):
+        """10:00 槽发 a-1，15:00 槽发 a-2：一天两篇、间隔 5 小时、各自落日报。"""
+        cfg = make_config(
+            tmp_path, platforms=[{"name": "csdn", "publish_at": "10:00", "daily_limit": 2}]
+        )
+        save_queue(
+            queue_path(tmp_path),
+            [qi("a-1", "2026-10-25T10:00:00+08:00"), qi("a-2", "2026-10-25T11:00:00+08:00")],
+        )
+        publisher = FakePublisher()
+        run_daily(cfg, clock=FakeClock("2026-10-26T10:00:00+08:00"), publish_one=publisher)
+        report2 = run_daily(cfg, clock=FakeClock("2026-10-26T15:05:00+08:00"), publish_one=publisher)
+
+        assert publisher.calls == ["a-1", "a-2"]
+        assert report2.published == 2, "当日日报合并两个槽位的实发"
+        assert load_queue(queue_path(tmp_path)) == []
+
+
+def fake_prepare_batch(results):
+    calls = []
+
+    def _prepare():
+        calls.append(1)
+        return list(results)
+
+    _prepare.calls = calls
+    return _prepare
+
+
+@pytest.mark.unit
+class TestReportCompatAndSlotEdge:
+    def test_report_without_prepare_reads_as_empty(self, tmp_path):
+        """更老的日报（连 prepare 键都没有）读起来不炸，按空列表处理。"""
+        path = report_path(tmp_path, date(2026, 10, 26))
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "schema": 1, "date": "2026-10-26", "workday": True,
+                    "generated_at": MON, "updated_at": MON,
+                    "dispatches": [], "unresolved": [], "notes": [], "error": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        loaded = load_report(tmp_path, date(2026, 10, 26))
+        assert loaded is not None and loaded.prepare == []
+
+    def test_legacy_single_object_prepare_wrapped(self, tmp_path):
+        """T-18b 前的日报格式（prepare 是单对象）读起来不炸，包成列表。"""
+        path = report_path(tmp_path, date(2026, 10, 26))
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "schema": 1, "date": "2026-10-26", "workday": True,
+                    "generated_at": MON, "updated_at": MON,
+                    "dispatches": [], "unresolved": [],
+                    "prepare": {"status": "no_topic", "reason": "旧格式"},
+                    "notes": [], "error": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        loaded = load_report(tmp_path, date(2026, 10, 26))
+        assert loaded is not None
+        assert len(loaded.prepare) == 1 and loaded.prepare[0].status == "no_topic"
+
+    def test_malformed_dispatched_at_allows_redispatch(self, tmp_path):
+        """同槽去重的时间串坏了：宁可再发一次（幂等层兜底），不许卡住不发。"""
+        from geopublish.schedule.scheduler import DayReport
+
+        save_queue(queue_path(tmp_path), [qi("a-1", "2026-10-25T10:00:00+08:00")])
+        existing = DayReport(
+            date="2026-10-26", workday=True, generated_at=MON, updated_at=MON,
+            dispatches=[Dispatch(platform="csdn", publish_at="10:00", due=True,
+                                 dispatched=True, planned=0, published=0,
+                                 dispatched_at="坏数据")],
+        )
+        save_report(tmp_path, existing, FakeClock(MON))
+        publisher = FakePublisher()
+        run_daily(make_config(tmp_path), clock=FakeClock(MON), publish_one=publisher)
+        assert publisher.calls == ["a-1"]

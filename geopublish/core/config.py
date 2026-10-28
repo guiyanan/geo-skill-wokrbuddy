@@ -35,7 +35,7 @@ DEFAULT_CONFIG_PATH = Path("config/geopublish.json")
 # 架构文档里「单次运行 ≤ 2」是旧口径，T-12 起以实现方案的 UT 为准（3 次）。
 MAX_RETRY = 3
 
-_TOP_LEVEL_KEYS = {"gate", "platforms", "report", "data_dir", "retry_max", "refresh_days"}
+_TOP_LEVEL_KEYS = {"gate", "platforms", "report", "data_dir", "retry_max", "refresh_days", "workdays_only"}
 
 
 class ConfigError(ValueError):
@@ -137,6 +137,8 @@ class Config:
     data_dir: Path = Path("data")
     retry_max: int = MAX_RETRY
     refresh_days: int = 30
+    # T-18b：PRD 默认工作日发车；拾一米 2026-10-28 明确周末也要自动发 → 配置关成 false
+    workdays_only: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.gate, Gate):
@@ -157,6 +159,8 @@ class Config:
         _text(str(self.data_dir), "data_dir")
         _int(self.retry_max, "retry_max", minimum=0, maximum=MAX_RETRY)
         _int(self.refresh_days, "refresh_days", minimum=1)
+        if not isinstance(self.workdays_only, bool):
+            raise ConfigError(f"workdays_only 必须是 true/false，收到 {self.workdays_only!r}")
 
     def platform(self, name: str) -> PlatformConfig:
         wanted = str(name).strip().lower()
@@ -222,6 +226,7 @@ class Config:
             data_dir=Path(_text(str(data.get("data_dir", "data")), "data_dir")),
             retry_max=data.get("retry_max", MAX_RETRY),
             refresh_days=data.get("refresh_days", 30),
+            workdays_only=data.get("workdays_only", True),
         )
 
 

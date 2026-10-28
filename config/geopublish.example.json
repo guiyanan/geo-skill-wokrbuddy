@@ -18,5 +18,7 @@
   },
   "data_dir": "data",
   "retry_max": 2,
-  "refresh_days": 30
+  "refresh_days": 30,
+  "workdays_only": true,
+  "_workdays_only": "PRD 默认 true（只工作日发车）；周末也要发就改成 false"
 }
